@@ -155,6 +155,27 @@ filtered_notes = system.filter_accompaniment_conflicts(
 )
 ```
 
+## ⚡ GPU Acceleration
+
+The system automatically detects and uses available GPU acceleration:
+
+- **CUDA** (NVIDIA GPUs): Automatically detected on systems with CUDA-compatible GPUs
+- **MPS** (Apple Silicon): Automatically detected on M1/M2/M3 Macs with PyTorch 1.12+
+- **CPU**: Falls back to CPU if no GPU is available
+
+**For Mac users with Apple Silicon:**
+- The system will automatically use MPS (Metal Performance Shaders) for GPU acceleration
+- This provides significant speed improvements over CPU processing
+- No additional configuration needed - just install PyTorch with MPS support:
+  ```bash
+  pip install torch torchvision torchaudio
+  ```
+
+**Performance tips:**
+- GPU acceleration is primarily used in Stage 2 (Source Separation)
+- Expected speedup: 3-10x faster than CPU depending on your hardware
+- First run may be slower due to model loading and compilation
+
 ## 🐛 Troubleshooting
 
 ### Common Issues
@@ -163,9 +184,10 @@ filtered_notes = system.filter_accompaniment_conflicts(
    - Make sure ffmpeg is installed and in your PATH
    - Test with: `ffmpeg -version`
 
-2. **"CUDA out of memory"**
-   - Demucs will automatically fall back to CPU if CUDA fails
-   - For large files, ensure sufficient RAM (4GB+ recommended)
+2. **"GPU out of memory" or "MPS/CUDA out of memory"**
+   - The system will automatically fall back to CPU if GPU fails
+   - For large files, ensure sufficient RAM (4GB+ recommended for CPU, 8GB+ for GPU)
+   - On Mac, you can monitor memory usage in Activity Monitor
 
 3. **"No MIDI file generated"**
    - Check that vocal separation produced valid output

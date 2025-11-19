@@ -189,7 +189,18 @@ class MusicTranscriptionSystem:
         # Load the htdemucs model
         logger.info("  Loading htdemucs model...")
         model = get_model('htdemucs')
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        # Select device: CUDA (NVIDIA) > MPS (Apple Silicon) > CPU
+        if torch.cuda.is_available():
+            device = 'cuda'
+            logger.info("  Using CUDA (NVIDIA GPU) acceleration")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = 'mps'
+            logger.info("  Using MPS (Apple Silicon GPU) acceleration")
+        else:
+            device = 'cpu'
+            logger.info("  Using CPU (no GPU acceleration available)")
+
         model.to(device)
 
         # Load audio
