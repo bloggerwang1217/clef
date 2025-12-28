@@ -1,4 +1,4 @@
-# Clef - Audio-to-Score Transcription via Vision-Language Models
+# Clef: Audio-to-Score Transcription via Vision-Language Models
 
 > **Hearing as Seeing**: Polyphonic Music Transcription as a Vision-Language Task
 
