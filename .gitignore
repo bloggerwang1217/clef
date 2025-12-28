@@ -59,3 +59,46 @@ htmlcov/
 
 # Logs
 *.log
+
+# Environment
+.env
+.env.local
+
+# Poetry local config (not the lock file)
+poetry.toml
+
+# AI instructions
+CLAUDE.md
+
+# PyTorch / ML
+*.pt
+*.pth
+*.onnx
+checkpoints/
+runs/
+wandb/
+
+# Audio data (keep samples small)
+data/
+*.mp3
+*.flac
+*.ogg
+
+# SoundFonts
+*.sf2
+*.sf3
+
+# Hugging Face cache
+.huggingface/
+
+# mypy
+.mypy_cache/
+
+# ruff
+.ruff_cache/
+
+
+# Paper, legacy plans, and ai interaction
+docs/legacy/
+docs/ai-interaction/
+paper/

@@ -1,239 +1,227 @@
-# Piano Harmony Harvester
+# Clef - Audio-to-Score Transcription via Vision-Language Models
 
-An automated music transcription system that extracts singing melody and harmony parts from audio files using MusicXML reference scores.
+> **Hearing as Seeing**: Polyphonic Music Transcription as a Vision-Language Task
 
-## 🎯 Project Overview
+## Project Overview
 
-This system processes two input files:
-- **MusicXML score** (piano accompaniment)
-- **MP3 audio file** (vocals + accompaniment)
-
-And produces a new **MusicXML score** containing:
-- **Singing Melody** part (main vocal line)
-- **Harmony** part (background vocals)
-
-## 🔧 Technical Stack
-
-| Component | Library | Purpose |
-|-----------|---------|---------|
-| **Audio Separation** | `demucs` | Separates vocals from accompaniment using htdemucs model |
-| **Audio Conversion** | `ffmpeg` | Converts MP3 to WAV format |
-| **Audio Processing** | `librosa`, `soundfile` | Audio I/O and processing |
-| **Music Transcription** | `Basic Pitch` | Converts vocals to MIDI |
-| **Score Processing** | `music21` | MusicXML parsing and generation |
-
-## 🚀 Installation
-
-### Prerequisites
-
-1. **Python 3.9 or higher**
-
-2. **ffmpeg** (required system dependency)
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install ffmpeg
-
-   # macOS
-   brew install ffmpeg
-
-   # Windows
-   # Download from https://ffmpeg.org/
-   ```
-
-### Install Python Dependencies
+Clef aims to be the "Whisper of music transcription" — a state-of-the-art system that directly converts audio recordings into human-readable sheet music.
 
 ```bash
-pip install -r requirements.txt
+clef -i chopin.mp3 -o chopin.musicxml
 ```
 
-This will install:
-- demucs (audio source separation)
-- librosa & soundfile (audio processing)
-- basic-pitch (music transcription)
-- music21 (score processing)
-- numpy & scipy (numerical computing)
+The core innovation is treating audio spectrograms as "images" and leveraging Vision Transformer (ViT) architectures pre-trained on ImageNet.
 
-## 📋 Usage
+### Research Hypothesis
 
-### Command Line
+Based on neuroscience evidence (Sur's ferret rewiring experiments, STRFs in auditory cortex), we hypothesize that:
+- The brain uses a **universal geometric algorithm** for both visual and auditory processing
+- A frozen ViT encoder can capture **long-range harmonic relationships** in spectrograms
+- **Timbre Domain Randomization (TDR)** forces the model to learn pitch geometry, not timbre texture
 
-```bash
-python music_transcription.py <input.musicxml> <input.mp3> [output.musicxml]
+### Three Innovation Pillars
+
+1. **Architectural Innovation**: ViT encoder (frozen ImageNet weights) + Autoregressive Transformer decoder
+2. **Data Innovation**: Timbre Domain Randomization (TDR) - extreme timbre variation during training
+3. **Task Innovation**: Implicit Quantization - model learns music grammar, not physical time
+
+## Project Structure
+
+```
+clef/
+├── src/                      # Reusable utility modules
+│   ├── audio/                # Audio processing
+│   │   ├── converter.py      # Format conversion (MP3→WAV)
+│   │   └── separator.py      # Demucs vocal separation
+│   ├── score/                # Score handling
+│   │   ├── parser.py         # MusicXML parsing
+│   │   └── generator.py      # MusicXML generation
+│   └── utils/                # Common utilities
+│       ├── device.py         # GPU/MPS/CPU auto-detection
+│       └── temp.py           # Temp file management
+├── docs/                     # Research planning documents
+│   ├── clef-plan.md          # Main research proposal (READ THIS FIRST)
+│   ├── decision-record.md    # Why **Kern over ABC notation
+│   ├── experiment-design.md  # Study 1 & Study 2 design
+│   ├── data-pipeline-implementation.md  # TDR data generation pipeline
+│   ├── model-comparison.md   # Whisper vs VLM vs Clef
+│   ├── A1-V1-comparison.md   # Auditory vs Visual cortex evidence
+│   └── legacy/               # Archived drafts
+├── paper/                    # Reference papers (PDFs)
+├── tests/                    # Unit tests
+│   ├── test_audio.py
+│   └── test_score.py
+└── README.md
 ```
 
-**Example:**
-```bash
-python music_transcription.py piano_score.musicxml song.mp3 output_score.musicxml
+## Architecture
+
+```
+Input: Audio Waveform
+    ↓
+Log-Mel Spectrogram (2D "image")
+    ↓
+┌─────────────────────────────────────┐
+│  Frozen ViT Encoder (ImageNet)      │  ← Cross-modal transfer
+│  - 16x16 patches                    │
+│  - Global self-attention            │
+└─────────────────────────────────────┘
+    ↓
+Visual Feature Sequence
+    ↓
+┌─────────────────────────────────────┐
+│  Autoregressive Transformer Decoder │  ← Implicit Quantization
+│  - Predicts **Kern tokens           │
+│  - Uses <coc> for multi-track       │
+└─────────────────────────────────────┘
+    ↓
+**Kern Notation → MusicXML → Sheet Music
 ```
 
-### Python API
+## Data Strategy
+
+### Training Data (Synthetic-to-Real)
+
+| Dataset | Purpose | Size | Role |
+|---------|---------|------|------|
+| **PDMX** | Pre-training | 254K+ | Massive score variety |
+| **KernScores** | Pre-training | 108K+ | Musicologically accurate |
+| **ASAP** | Real-world test (Piano) | ~50h | Primary benchmark |
+| **URMP** | Real-world test (Multi-instrument) | 44 pieces | Generalization test |
+
+### Augmentation Pyramid (TDR)
+
+```
+Level 3: Timbre Domain Randomization (CRITICAL)
+├── Piano → Violin → 8-bit Chiptune → Sawtooth Synth
+└── Forces pitch geometry learning, not timbre memorization
+
+Level 2: Source-Level
+├── Multi-SoundFont (Steinway, Yamaha, Upright)
+├── Detuning (±10 cents)
+└── Timing jitter (humanize)
+
+Level 1: Signal-Level
+├── Impulse Response convolution (reverb)
+├── Additive noise (white, pink, ambient)
+└── Frequency cutoff (lo-fi simulation)
+```
+
+## Evaluation
+
+### Metrics
+
+- **MV2H**: Music evaluation (pitch F_p, harmony F_harm, rhythm F_val)
+- **TEDn**: Tree Edit Distance on MusicXML (structural correctness)
+- NOT using WER (lacks musical semantics understanding)
+
+### Target Benchmarks
+
+| Study | Dataset | Target | Baseline to Beat |
+|-------|---------|--------|------------------|
+| Study 1 | ASAP | MV2H > 78% | Zeng et al. (2024): 74.2% |
+| Study 2 | URMP | Zero-shot MV2H > 60% | MT3: ~40% |
+
+## Output Format
+
+Using **\*\*Kern notation** (not ABC or MusicXML):
+- Native multi-track support (Tab-separated Spines)
+- Explicit time alignment (same row = simultaneous)
+- Serializable with `<coc>` (Change of Column) token
+- Musicological standard (Humdrum Toolkit)
+
+Example:
+```
+4c    <coc>    2C    <coc>    4e    <coc>    .
+(C4 quarter, C3 half, E4 quarter, rest/sustain)
+```
+
+## Development Guidelines
+
+### Code Style
+- Comments in English
+- Documentation in Traditional Chinese (Taiwan style)
+- Prefer maintainable, automated solutions
+
+### Tech Stack
+- **Audio Rendering**: FluidSynth + diverse SoundFonts
+- **Synth Timbres**: pyo / csound (sawtooth, FM, 8-bit)
+- **Signal Processing**: Spotify Pedalboard / TorchAudio
+- **Spectrogram**: nnAudio (GPU-accelerated)
+- **Model**: PyTorch, Hugging Face Transformers
+
+### Key Dependencies (managed by Poetry)
+```
+# Core ML
+torch ^2.5          # GPU support (CUDA/MPS)
+transformers ^4.51  # ViT, Transformer decoder
+nnAudio ^0.3        # GPU-accelerated spectrogram
+
+# Audio Processing
+librosa ^0.10       # Audio analysis
+soundfile ^0.12     # Audio I/O
+pedalboard ^0.9     # Spotify audio effects
+
+# Music Score
+music21 ^9.1        # MusicXML handling
+
+# Optional Groups
+[separation] demucs ^4.0      # Source separation
+[synthesis]  pyfluidsynth     # MIDI → Audio rendering
+```
+
+## Current Status
+
+### Completed
+- [x] Research proposal and literature review
+- [x] Architecture decision (ViT + Transformer)
+- [x] Output format decision (**Kern)
+- [x] Data augmentation strategy (TDR)
+- [x] Evaluation metrics selection (MV2H + TEDn)
+- [x] Reusable utility modules (src/audio, src/score, src/utils)
+
+### In Progress / TODO
+- [ ] Implement ViT encoder with frozen ImageNet weights
+- [ ] Implement **Kern tokenizer with <coc> support
+- [ ] Build autoregressive Transformer decoder
+- [ ] Create TDR data generation pipeline
+- [ ] Preprocess PDMX/KernScores datasets
+- [ ] Implement MV2H and TEDn evaluation
+- [ ] Run Study 1 experiments (ASAP)
+- [ ] Run Study 2 experiments (URMP)
+
+## Key Papers
+
+| Paper | Relevance |
+|-------|-----------|
+| Zeng et al. (2024) | CNN-based SOTA, MV2H baseline |
+| Zhang & Sun (2024) | Whisper-based approach (ABC notation for melody + chords) |
+| Gong et al. (2021) AST | ViT for audio classification |
+| Alfaro-Contreras (2024) | **Kern + <coc> serialization |
+| Mayer et al. (2024) | TEDn metric justification |
+
+**Footnote on Zhang & Sun (2024):** This entry hypothesizes that Whisper's optimization for speech recognition may inherit acoustic biases from speech data that could limit its generalization to music with different timbral and pitch distributions. This is an assumption about architectural inductive biases rather than an explicit claim in the paper.
+
+## Usage Examples
 
 ```python
-from music_transcription import MusicTranscriptionSystem
+# Audio processing
+from src.audio import convert_to_wav, VocalSeparator
+from src.utils import get_device
 
-# Create system instance
-system = MusicTranscriptionSystem()
+wav_path = convert_to_wav("input.mp3", "output.wav")
+separator = VocalSeparator(device=get_device())
+vocals = separator.extract_vocals(audio, sample_rate=44100)
 
-# Process files
-system.process_music(
-    xml_path="piano_score.musicxml",
-    mp3_path="song.mp3",
-    output_path="output_score.musicxml"
-)
+# Score handling
+from src.score import parse_musicxml, extract_notes_from_score
+
+score = parse_musicxml("input.musicxml")
+notes = extract_notes_from_score(score)
 ```
-
-## 🔄 Processing Pipeline
-
-The system performs five stages of processing:
-
-### Stage 1: Input & Preprocessing
-- **A. MusicXML Parsing**: Extracts accompaniment notes from reference score
-- **B. Audio Conversion**: Converts MP3 to mono WAV (44.1kHz)
-
-### Stage 2: Source Separation
-- Uses Demucs `htdemucs` model to separate vocals from accompaniment
-- Extracts clean vocal track for transcription
-
-### Stage 3: Automatic Music Transcription (AMT)
-- Transcribes separated vocals to MIDI using Basic Pitch
-- Generates note-level representation of vocal performance
-
-### Stage 4: Post-Processing & Refinement
-- **A. Quantization**: Aligns notes to 16th note grid for readability
-- **B. Conflict Filtering**: Removes vocal notes that overlap >80% with accompaniment
-- **C. Melody/Harmony Division**: Splits notes into melody (highest) and harmony (others)
-
-### Stage 5: MusicXML Generation
-- Creates output score with two parts: "Singing Melody" and "Harmony"
-- Exports as standard MusicXML format
-- Cleans up all temporary files
-
-## 📊 Output Structure
-
-The generated MusicXML contains:
-
-```
-Score
-├── Part 1: "Singing Melody"
-│   └── Main vocal line (highest notes at each time point)
-└── Part 2: "Harmony"
-    └── Background vocals (remaining notes)
-```
-
-## 🔍 Key Features
-
-### Intelligent Conflict Resolution
-- Compares transcribed vocals with piano accompaniment
-- Filters out notes that are likely "leaked" accompaniment
-- Uses 80% temporal overlap threshold with pitch matching
-
-### Rhythm Quantization
-- Quantizes all notes to 16th note grid (0.25 quarter notes)
-- Ensures score readability and consistency
-- Preserves musical structure while cleaning timing
-
-### Heuristic Melody Extraction
-- At each time point, assigns highest note to melody
-- Remaining simultaneous notes become harmony
-- Simple but effective for most vocal arrangements
-
-## ⚙️ Configuration Options
-
-You can customize the system by modifying parameters:
-
-```python
-system = MusicTranscriptionSystem(temp_dir="./custom_temp")
-
-# Custom quantization (8th notes instead of 16th)
-quantized_stream = system.quantize_notes(midi_path, quantize_to=0.5)
-
-# Custom overlap threshold (90% instead of 80%)
-filtered_notes = system.filter_accompaniment_conflicts(
-    vocal_stream,
-    accompaniment_ref,
-    overlap_threshold=0.9
-)
-```
-
-## ⚡ GPU Acceleration
-
-The system automatically detects and uses available GPU acceleration:
-
-- **CUDA** (NVIDIA GPUs): Automatically detected on systems with CUDA-compatible GPUs
-- **MPS** (Apple Silicon): Automatically detected on M1/M2/M3 Macs with PyTorch 1.12+
-- **CPU**: Falls back to CPU if no GPU is available
-
-**For Mac users with Apple Silicon:**
-- The system will automatically use MPS (Metal Performance Shaders) for GPU acceleration
-- This provides significant speed improvements over CPU processing
-- No additional configuration needed - just install PyTorch with MPS support:
-  ```bash
-  pip install torch torchvision torchaudio
-  ```
-
-**Performance tips:**
-- GPU acceleration is primarily used in Stage 2 (Source Separation)
-- Expected speedup: 3-10x faster than CPU depending on your hardware
-- First run may be slower due to model loading and compilation
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **"ffmpeg not found"**
-   - Make sure ffmpeg is installed and in your PATH
-   - Test with: `ffmpeg -version`
-
-2. **"GPU out of memory" or "MPS/CUDA out of memory"**
-   - The system will automatically fall back to CPU if GPU fails
-   - For large files, ensure sufficient RAM (4GB+ recommended for CPU, 8GB+ for GPU)
-   - On Mac, you can monitor memory usage in Activity Monitor
-
-3. **"No MIDI file generated"**
-   - Check that vocal separation produced valid output
-   - Ensure input audio contains audible vocals
-
-4. **Empty output score**
-   - All vocal notes may have been filtered as accompaniment conflicts
-   - Try lowering `overlap_threshold` parameter
-
-## 📝 File Formats
-
-### Input Files
-- **MusicXML**: `.musicxml` or `.xml` (MusicXML 3.0 or higher recommended)
-- **Audio**: `.mp3` (any bitrate, mono or stereo)
-
-### Output Files
-- **MusicXML**: Standard MusicXML 3.0 format
-- Compatible with: MuseScore, Finale, Sibelius, Dorico, etc.
-
-## 🧪 Testing
-
-To test the system with sample files:
 
 ```bash
-# Ensure you have test files in the project directory
-python music_transcription.py sample_score.musicxml sample_audio.mp3 test_output.musicxml
+# Future: Run Clef model (TBD)
+# python -m clef.transcribe input.wav --output output.kern
 ```
 
-## 📚 Dependencies Documentation
-
-- [Demucs](https://github.com/facebookresearch/demucs) - Music source separation
-- [Basic Pitch](https://github.com/spotify/basic-pitch) - Audio-to-MIDI transcription
-- [music21](https://web.mit.edu/music21/) - Music score analysis and generation
-- [librosa](https://librosa.org/) - Audio processing
-- [ffmpeg](https://ffmpeg.org/) - Multimedia processing
-
-## 🤝 Contributing
-
-This project is part of the Piano Harmony Harvester initiative. Contributions are welcome!
-
-## 📄 License
-
-See LICENSE file for details.
-
-## 🙏 Acknowledgments
-
-- **Demucs** by Facebook Research for state-of-the-art source separation
-- **Basic Pitch** by Spotify for robust pitch detection
-- **music21** by MIT for comprehensive music theory support
