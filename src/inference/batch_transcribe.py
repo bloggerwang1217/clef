@@ -11,11 +11,10 @@ Usage:
         --input-file /data/test/test.mp3 \
         --output-dir /data/test_output
 
-    # ASAP batch
+    # ASAP batch (scans all WAV files in directory)
     python -m src.inference.batch_transcribe \
         --mode asap_batch \
         --input-dir /data/asap_test_set \
-        --metadata-csv /data/asap_test_set/metadata.csv \
         --output-dir /data/asap_midi_output
 """
 
@@ -24,7 +23,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import pandas as pd
 import requests
 
 
@@ -45,15 +43,9 @@ DEFAULT_TIMEOUT = 600  # 10 minutes
 # File Collection
 # =============================================================================
 
-def collect_asap_files(input_dir: Path, metadata_csv: Path) -> list[Path]:
-    """Read ASAP metadata and return list of audio paths."""
-    df = pd.read_csv(metadata_csv)
-    files = []
-    for _, row in df.iterrows():
-        rel = row.get("audio_performance")
-        if pd.notna(rel) and str(rel).endswith(".wav"):
-            files.append(input_dir / rel)
-    return files
+def collect_asap_files(input_dir: Path) -> list[Path]:
+    """Scan directory recursively for all WAV files."""
+    return sorted(input_dir.rglob("*.wav"))
 
 
 def collect_single_file(input_file: Path) -> list[Path]:
@@ -142,7 +134,6 @@ def parse_args() -> argparse.Namespace:
     # Input paths (container paths)
     p.add_argument("--input-dir", type=Path, help="Input directory (for asap_batch)")
     p.add_argument("--input-file", type=Path, help="Input file path (for single_file)")
-    p.add_argument("--metadata-csv", type=Path, help="ASAP metadata.csv path")
 
     # Output
     p.add_argument("--output-dir", type=Path, required=True, help="Output directory")
@@ -164,9 +155,9 @@ def main():
 
     # Collect files based on mode
     if args.mode == "asap_batch":
-        if not args.input_dir or not args.metadata_csv:
-            raise ValueError("asap_batch requires --input-dir and --metadata-csv")
-        audio_files = collect_asap_files(args.input_dir, args.metadata_csv)
+        if not args.input_dir:
+            raise ValueError("asap_batch requires --input-dir")
+        audio_files = collect_asap_files(args.input_dir)
     else:
         if not args.input_file:
             raise ValueError("single_file requires --input-file")

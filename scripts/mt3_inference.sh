@@ -74,7 +74,6 @@ case "$1" in
     python3 -m src.inference.batch_transcribe \
       --mode asap_batch \
       --input-dir /data/asap_test_set \
-      --metadata-csv "$DATA_DIR/asap_test_set/metadata.csv" \
       --output-dir /data/asap_midi_output \
       --api-url "$API_URL" \
       --model piano
