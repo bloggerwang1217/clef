@@ -172,12 +172,44 @@ def main():
             raise ValueError("single_file requires --input-file")
         audio_files = collect_single_file(args.input_file)
 
-    # Build and send jobs
+    # Build jobs
     jobs = build_jobs(audio_files, args.output_dir, args.mode)
-    print(f"[info] sending {len(jobs)} jobs to {args.api_url} (model={args.model})")
 
-    result = send_batch_request(args.api_url, args.model, jobs)
-    print_results(result.get("results", []))
+    # Skip already completed files (resume from interruption)
+    original_count = len(jobs)
+    jobs = [j for j in jobs if not Path(j["midi_path"]).exists()]
+    skipped = original_count - len(jobs)
+
+    if skipped > 0:
+        print(f"[info] skipping {skipped} already completed files")
+
+    total_jobs = len(jobs)
+
+    if total_jobs == 0:
+        print("[info] all files already processed, nothing to do")
+        return
+
+    # Process in batches to avoid timeout (max 20 files per batch)
+    batch_size = 20
+    all_results = []
+
+    for i in range(0, total_jobs, batch_size):
+        batch = jobs[i:i+batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (total_jobs + batch_size - 1) // batch_size
+
+        print(f"[info] batch {batch_num}/{total_batches}: processing {len(batch)} files")
+
+        result = send_batch_request(args.api_url, args.model, batch)
+        batch_results = result.get("results", [])
+        all_results.extend(batch_results)
+
+        # Show batch summary
+        successes = sum(1 for r in batch_results if r.get("status") == "success")
+        print(f"      → {successes}/{len(batch)} succeeded")
+
+    print(f"\n[overall]")
+    print_results(all_results)
 
 
 if __name__ == "__main__":
