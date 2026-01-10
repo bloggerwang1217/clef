@@ -94,6 +94,69 @@ Stage 2: Fine-tuning (Real Recordings)
 
 ---
 
+## 頻譜表示的神經科學基礎
+
+本章節探討為何選擇 VQT 而非 Log-Mel Spectrogram，從神經科學角度提供理論依據。
+
+### VQT vs Log-Mel 的數學差異
+
+| 特性 | **Log-Mel Spectrogram** | **VQT (Variable-Q Transform)** |
+|------|------------------------|-------------------------------|
+| **設計目的** | 模擬人類聽覺感知（語音） | 專為音樂設計 |
+| **「Log」作用位置** | 能量的對數 (dB scale) | 頻率軸的對數 |
+| **頻率尺度** | Mel scale（心理聲學） | 對數頻率（音樂學） |
+| **每八度解析度** | **不固定**（低頻多、高頻少） | **固定**（如 60 bins/octave） |
+| **音高對齊** | 不對齊 MIDI 音高 | **完美對齊** 12 音階 |
+| **常見應用** | 語音識別、聲音分類 | 音樂轉譜、和聲分析 |
+
+**關鍵差異**：VQT 保證每個半音有固定的 bins 數（如 60/12 = 5 bins），模型更容易學習「音程是固定的幾何距離」。Log-Mel 在不同音域的半音間隔不同。
+
+### 神經科學對應
+
+#### 耳蝸層級（Cochlea）：對數頻率
+
+基底膜（Basilar Membrane）的 tonotopic organization 是**對數頻率**排列：
+- 每移動固定距離 ≈ 一個八度
+- 這支持 VQT 的設計理念
+
+#### 聽覺皮層（Auditory Cortex）：更複雜
+
+1. **A1 (Primary Auditory Cortex)**：保留 tonotopic map，接近對數
+2. **更高層級**：開始出現「範疇知覺（Categorical Perception）」，這是 Mel scale 的理論基礎
+
+#### Mel Scale 的來源
+
+Mel scale 來自 1937 年的心理聲學實驗（Stevens, Volkmann & Newman）：
+- 受試者判斷「這兩個音高差距是否相等」
+- 結果：**低於 1000 Hz 接近線性，高於 1000 Hz 接近對數**
+
+```
+Mel(f) = 2595 × log₁₀(1 + f/700)
+```
+
+### 音樂家 vs 非音樂家的認知差異
+
+| 聽眾類型 | 可能的頻率感知 | 對應表示 |
+|---------|--------------|---------|
+| **一般人聽語音** | Mel scale（formants 集中在 300-3000 Hz） | Log-Mel |
+| **音樂家聽音樂** | 對數（八度等價性、音程不變性） | VQT |
+
+研究顯示**音樂訓練會改變大腦的頻率表徵**：
+- 音樂家對「八度」和「純五度」的神經反應更強
+- 暗示他們的表徵更接近**對數/音程結構**
+
+### 設計決策
+
+**核心假設**：如果要訓練一個「懂音樂的」模型，VQT（模擬訓練過的大腦）可能比 Log-Mel 更有效率。
+
+| 設定 | 輸入 | 理由 |
+|------|------|------|
+| **Clef-base** | VQT | 與 Zeng 一致，公平比較架構差異 |
+| **Clef-full** | VQT | 保持一致性 |
+| **Ablation** | VQT vs Log-Mel | 實證驗證哪種表示更適合複音音樂轉譜 |
+
+---
+
 ## 資料集下載
 
 ### ASAP Dataset（Study 1 - 鋼琴）
@@ -270,14 +333,43 @@ Clef (Study 2) 訓練流程：
 
 ## Study 1: Depth (深度) — ASAP Dataset
 
+### Clef 變體設計
+
+為了區分「架構貢獻」與「前處理貢獻」，我們設計兩個 Clef 變體：
+
+| 變體 | Input | Preprocessing | 目的 |
+|------|-------|---------------|------|
+| **Zeng (2024)** | Mono VQT | 無 normalization | Baseline |
+| **Clef-base** | Mono VQT | 無 normalization | **證明架構優勢**（ViT vs CNN） |
+| **Clef-full** | Stereo 3-ch | + Loudness norm + L/R flip | **最佳性能** |
+
+**Clef-base**：與 Zeng 使用完全相同的輸入設定，唯一差異是架構（ViT + Transformer vs CNN + RNN）。這確保了公平比較。
+
+**Clef-full**：加入所有前處理改進，展示系統的最佳性能。
+
 ### Table 1: Comparison of A2S Systems on Real-World Recordings
 
 | Approach | System | Role | MV2H | $F_p$ (音高) | $F_{harm}$ (和聲) | 弱點分析 |
 |----------|--------|------|------|-------------|------------------|----------|
 | Pipeline | MT3 + music21 | Industry Std. | ~58.0% | ~80.0% | ~40.0% | **量化災難**：music21 的啟發式算法無法處理 Rubato |
 | Pipeline | Transkun + Beyer | SOTA Combo | ~68.0% | ~92.0% | ~50.0% | **語義鴻溝**：Beyer 模型仍無法完美修復 MIDI 的語義缺失 |
-| End-to-End | Zeng et al. (2024) | E2E Baseline | 74.2% | 63.3% | 54.5% | **聽覺失聰**：CNN 架構無法處理真實錄音 |
-| End-to-End | **Clef (Ours)** | Proposed | **> 78.0%** | **> 85.0%** | **> 65.0%** | Sim2Real + ViT 全面勝出 |
+| End-to-End | Zeng et al. (2024) | E2E Baseline | 74.2% | 63.3% | 54.5% | **聽覺失聰**：CNN 架構無法捕捉長距離和聲 |
+| End-to-End | **Clef-base** | 架構比較 | **~78%** | **~75%** | **~60%** | 純架構改進 |
+| End-to-End | **Clef-full** | 最佳性能 | **~82%** | **~85%** | **~65%** | 架構 + 前處理改進 |
+
+### 貢獻分解
+
+```
+總提升 = Clef-full - Zeng = ~7.8%
+
+├── 架構貢獻 = Clef-base - Zeng = ~3.8%
+│   └── ViT + Transformer vs CNN + RNN
+│
+└── 前處理貢獻 = Clef-full - Clef-base = ~4.0%
+    ├── Stereo 3-channel input
+    ├── Loudness normalization
+    └── L/R flip augmentation
+```
 
 > **註**：Transkun 的 $F_p$ 設為 92% 是參考其 MAESTRO 數據，但轉成 XML 後 MV2H 通常會掉下來。Zeng 的數據來自其論文中的 ASAP 實測。
 
@@ -300,6 +392,144 @@ Clef (Study 2) 訓練流程：
 
 ---
 
+## Ablation Study 設計
+
+本節設計系統性的消融實驗，量化各設計決策的貢獻。
+
+### 1. 架構 Ablation
+
+驗證 ViT + Transformer 架構的優勢：
+
+| 實驗 | Encoder | Decoder | Input | 預期 MV2H |
+|------|---------|---------|-------|-----------|
+| Zeng (baseline) | CNN | Hierarchical RNN | Mono VQT | 74.2% |
+| **Clef-base** | **ViT** | **Transformer** | Mono VQT | ~78% |
+
+**預期結論**：相同輸入下，ViT 的全域注意力機制比 CNN 的局部感受野更能捕捉和聲結構。
+
+### 2. 前處理 Ablation
+
+逐步加入前處理改進，量化各自貢獻：
+
+| 實驗 | Input | Normalization | Augmentation | 預期 MV2H |
+|------|-------|---------------|--------------|-----------|
+| Clef-base | Mono VQT | ❌ | ❌ | ~78% |
+| + Loudness | Mono VQT | ✅ | ❌ | ~79% |
+| + Stereo | Stereo 3-ch | ✅ | ❌ | ~80% |
+| + L/R Flip | Stereo 3-ch | ✅ | ✅ | ~82% |
+
+### 3. 頻譜表示 Ablation
+
+驗證 VQT vs Log-Mel 的影響：
+
+| 實驗 | 頻譜類型 | Bins | 預期 MV2H | 備註 |
+|------|---------|------|-----------|------|
+| **Clef + VQT** | VQT | 60/octave × 8 oct | ~78% | 音樂優化 |
+| Clef + Mel-128 | Log-Mel | 128 | ~75% | 語音標準 |
+| Clef + Mel-256 | Log-Mel | 256 | ~76% | 高解析度能否彌補？ |
+
+**科學問題**：「對於複音音樂轉譜，VQT 是否真的優於 Log-Mel？」
+
+### Ablation 總結表
+
+| 設計決策 | 預期貢獻 | 驗證方式 |
+|---------|---------|---------|
+| ViT vs CNN | +3~4% | Clef-base vs Zeng |
+| Transformer vs RNN | (含在架構貢獻中) | - |
+| Loudness Norm | +1% | 逐步加入實驗 |
+| Stereo 3-ch | +1~2% | 逐步加入實驗 |
+| L/R Flip | +1% | 逐步加入實驗 |
+| VQT vs Mel | +2~3% | 頻譜表示實驗 |
+
+---
+
+## 音訊前處理策略
+
+本節詳述音訊前處理的實作細節，基於對 ASAP 資料集的深入分析。
+
+### 1. Loudness Normalization
+
+**問題**：ASAP 中同一首曲子不同演奏者的音量差異巨大。
+
+**解決方案**：
+- 統一標準化到 **-20 dBFS** 或 **-14 LUFS**（串流平台標準）
+- 訓練時加入輕微 **Gain Jitter (±3dB)** 作為 augmentation
+
+```python
+# 前處理：標準化
+audio = loudness_normalize(audio, target_lufs=-14)
+
+# 訓練時：加入抖動
+if training:
+    gain_db = random.uniform(-3, 3)
+    audio = audio * (10 ** (gain_db / 20))
+```
+
+### 2. Stereo 3-Channel Input
+
+**設計理念**：模擬人類大腦的雙耳整合（Binaural Summation）機制。
+
+| Channel | 來源 | 神經科學對應 |
+|---------|------|-------------|
+| **Ch 1 (Red)** | Left spectrogram | 左耳訊號 |
+| **Ch 2 (Green)** | Right spectrogram | 右耳訊號 |
+| **Ch 3 (Blue)** | Mid = (L+R)/2 | 大腦疊加後的「幻象中心」|
+
+**處理 Mono/Stereo 混合資料**：
+
+```python
+if audio.shape[0] == 1:  # Mono
+    L = R = Mid = audio[0]
+else:  # Stereo
+    L, R = audio[0], audio[1]
+    Mid = (L + R) * 0.5
+
+input_tensor = torch.stack([spec(L), spec(R), spec(Mid)], dim=0)
+```
+
+**優點**：
+- Mid channel 提供冗餘：即使一個聲道壞掉（如 ASAP 的 YeZ02M.wav），仍有訊號
+- 符合 ImageNet 預訓練的 RGB 期望（3 channels）
+
+### 3. Spatial Augmentation: L/R Flip
+
+**物理意義**：演奏者視角（低音在左）vs 觀眾視角（低音在右）。
+
+**實作**：50% 機率交換 L/R channel（**不是** Horizontal Flip！）
+
+```python
+def stereo_flip_augmentation(input_tensor):
+    """
+    input_tensor shape: (3, H, W) -> (L, R, Mid)
+    注意：只交換 Ch1/Ch2，Ch3 (Mid) 不變！
+    因為 L+R = R+L，Mid 是不動點 (invariant)
+    """
+    if random.random() > 0.5:
+        flipped = input_tensor.clone()
+        flipped[0] = input_tensor[1]  # New L = Old R
+        flipped[1] = input_tensor[0]  # New R = Old L
+        # flipped[2] 保持不變 (Mid)
+        return flipped
+    return input_tensor
+```
+
+**重要警告**：不要使用 `torchvision.transforms.RandomHorizontalFlip`，那會翻轉時間軸！
+
+### 4. ASAP 資料品質問題處理
+
+基於對 ASAP test set 的人工聆聽分析：
+
+| 問題 | 範例檔案 | 處理策略 |
+|------|---------|---------|
+| 音量不一致 | 多個演奏者 | Loudness Normalization |
+| 聲道偏移 | YeZ02M.wav | Mid channel 提供冗餘 |
+| 殘響截斷 | GalantM02M.wav | 視為 outlier，Error Analysis 標註 |
+
+**Error Analysis 寫法範例**：
+> "In file *GalantM02M*, the audio recording contains an abrupt cutoff that contradicts the score duration, leading to unavoidable alignment errors."
+
+---
+
 ## Study 2: Breadth (廣度) — URMP Dataset
 
 ### 設計理念
@@ -316,17 +546,24 @@ Study 2 的目標不是「換個戰場繼續卷分數」，而是 **「廣度的
 | Alfaro-Contreras (2024) 弦樂四重奏 | 變成「另一個做特定樂器轉譜的人」 | 邊際效應遞減 |
 | Zhang (2024) 流行歌 | 指標不同 (WER vs MV2H) | 難以直接比較 |
 
+### Study 2 的音訊設定
+
+Study 2 同樣使用 **Stereo 3-channel input**，理由：
+- URMP 有真實的空間資訊（不同樂器位置不同）
+- **L/R Flip** 在多樂器場景更有意義（小提琴在左、大提琴在右的標準座位安排）
+- 保持與 Study 1 Clef-full 的一致性
+
 ### Table 2: Zero-Shot Generalization on Unseen Instruments
 
 **Dataset**: URMP (University of Rochester Multi-Modal Musical Performance)
 - 包含多種樂器（小提琴、長笛、單簧管...）的真實錄音
 - Zeng 沒測過，MT3 測過但效果普普
 
-| Model Strategy | Training Data | Piano | Strings | Winds | Ensemble |
-|----------------|---------------|-------|---------|-------|----------|
-| MT3 + music21 | MAESTRO + Slakh | ~75% (MV2H) | ~35% (MV2H) | ~30% (MV2H) | ~25% (MV2H) |
-| Clef (Study 1) | Piano Only | **> 78% (MV2H)** | < 20% (Fail) | < 20% (Fail) | < 20% (Fail) |
-| Clef (Study 2) | **Universal (TDR)** | **> 76% (MV2H)** | **> 60% (MV2H)** | **> 60% (MV2H)** | **> 55% (MV2H)** |
+| Model Strategy | Training Data | Input | Piano | Strings | Winds | Ensemble |
+|----------------|---------------|-------|-------|---------|-------|----------|
+| MT3 + music21 | MAESTRO + Slakh | Mono | ~75% | ~35% | ~30% | ~25% |
+| Clef (Study 1) | Piano Only | Stereo 3-ch | **> 78%** | < 20% | < 20% | < 20% |
+| Clef (Study 2) | **Universal (TDR)** | Stereo 3-ch | **> 76%** | **> 60%** | **> 60%** | **> 55%** |
 
 > **註**：MT3 + music21 的 MV2H 預估值基於 Study 1 的「量化災難」現象。實際數據需實驗驗證。
 
