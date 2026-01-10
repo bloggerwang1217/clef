@@ -331,6 +331,205 @@ Clef (Study 2) 訓練流程：
 
 ---
 
+## 評估流程設計
+
+本節說明如何確保與 Zeng et al. (2024) 的公平比較。
+
+### Zeng 的評估流程分析
+
+基於對 [piano-a2s repo](https://github.com/wei-zeng98/piano-a2s) 的完整探索，發現 Zeng 的評估流程為：
+
+```
+模型輸出 (Logits)
+    ↓
+Argmax 取得 tokens
+    ↓
+LabelsMultiple.decode() → **Kern 格式字串
+    ↓
+get_xml_from_target() 轉換流程：
+    ├── tiefix (Humdrum 工具) → 修正連音線
+    ├── hum2xml (Humdrum 工具) → 轉換為 MusicXML
+    └── music21 → 加入譜號、調性、拍號
+    ↓
+MusicXML 檔案
+    ↓
+    ├─→ 轉成 MIDI → MV2H 評估 (音樂內容)
+    └─→ 直接使用 XML → ER 評估 (編輯距離)
+```
+
+**關鍵發現**：
+- MV2H 評估**不是**直接在 **Kern 上進行
+- 實際流程是 `**Kern → XML → MIDI → MV2H`
+- Zeng 使用 Humdrum Toolkit (`tiefix`, `hum2xml`) + `music21` 進行轉換
+
+### Clef 的評估策略
+
+為確保公平比較，我們在 **MusicXML 層級**統一評估所有系統，而不是強制統一中間格式：
+
+```
+評估流程總覽：
+
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│    MT3      │     │  Transkun   │     │    Zeng     │     │    Clef     │
+│ + music21   │     │  + Beyer    │     │   (2024)    │     │   (Ours)    │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                   │                    │                   │
+       ▼                   ▼                    ▼                   ▼
+  MIDI (raw)          MIDI (raw)           **Kern              **Kern
+  Performance         Performance          Symbolic            Symbolic
+       │                   │                    │                   │
+       ▼                   ▼                    ▼                   ▼
+  ┌─────────┐       ┌──────────┐       ┌───────────────┐   ┌───────────────┐
+  │music21  │       │  Beyer   │       │ tiefix        │   │ tiefix        │
+  │quantize │       │Transform.│       │ + hum2xml     │   │ + hum2xml     │
+  └────┬────┘       └────┬─────┘       │ + music21     │   │ + music21     │
+       │                 │              └───────┬───────┘   └───────┬───────┘
+       ▼                 ▼                      ▼                   ▼
+   MusicXML          MusicXML              MusicXML            MusicXML
+       │                 │                      │                   │
+       └─────────────────┴──────────────────────┴───────────────────┘
+                                 ▼
+                    ┌────────────────────────────┐
+                    │  統一的 XML → MIDI 轉換     │
+                    │  (music21.write('midi'))   │
+                    └─────────────┬──────────────┘
+                                  ▼
+                          MIDI (symbolic)
+                                  │
+                         ┌────────┴────────┐
+                         ▼                 ▼
+                    MV2H 評估         STEPn 評估
+                 (音樂內容正確性)    (樂譜結構正確性)
+```
+
+**關鍵設計原則**：
+
+1. **不強制統一到 **Kern 格式**
+   - **Kern 只是 Zeng/Clef 的原生輸出，不是通用標準
+   - 強制 Pipeline 系統轉 **Kern 會引入額外轉換誤差
+   - 沒有標準的 MIDI → **Kern 轉換工具
+
+2. **統一在 MusicXML 層級評估**
+   - MusicXML 是所有系統都能產生的格式
+   - 各系統使用其原生的符號化流程
+   - 在 symbolic representation 層級確保公平比較
+
+3. **尊重系統設計哲學**
+   - Pipeline 系統：MIDI (performance) → XML (score)
+   - End-to-End 系統：Audio → **Kern (symbolic) → XML (score)
+   - 評估焦點：最終符號化結果的品質，而非中間步驟的一致性
+
+4. **統一的最終評估**
+   - 所有系統的 XML 都用相同的 `music21.write('midi')` 轉換
+   - 確保 MV2H 和 STEPn 評估的公平性
+
+### Baseline 系統配置
+
+#### 1. Weak Baseline: MT3 + music21
+
+**系統組成**：
+- **Audio-to-MIDI**: MT3 (Google Magenta, ICLR 2022)
+- **MIDI-to-Score**: music21 (Rule-based quantization + heuristic hand separation)
+
+**轉換流程**：
+```python
+# Step 1: MT3 推論
+midi_output = mt3.transcribe(audio)
+
+# Step 2: music21 量化
+# quarterLengthDivisors=(4, 3) = sixteenth notes + eighth-note triplets
+score = music21.converter.parse(midi_output, quarterLengthDivisors=(4, 3))
+
+# Step 3: 分手（pitch-based heuristic at Middle C）
+# Reference: Hadjakos et al. "Detecting Hands from Piano MIDI Data" (2019)
+right_hand, left_hand = separate_by_pitch(score, split_point=60)
+
+# Step 4: 輸出 MusicXML
+score.write('musicxml', fp=output_path)
+```
+
+**實作腳本**: `evaluation/zeng_baseline/mt3_to_musicxml.py`
+
+**學術依據**：
+
+| 步驟 | 方法 | 學術參考 |
+|------|------|---------|
+| 量化 | `quarterLengthDivisors=(4, 3)` | music21 default (Cuthbert & Ariza, 2010) |
+| 分手 | Pitch split at MIDI 60 | Hadjakos et al. (2019) baseline method |
+| 輸出 | MusicXML | W3C Music Notation Community Group |
+
+**已知限制（論文需說明）**：
+1. **Hand crossing**: 右手彈低音會被誤判給左手
+2. **Overlapping range**: 中音區音符分配模糊
+3. **No voice separation**: 同手的複音被壓成和弦
+
+> 這些限制是 **intentional**，用以展示 rule-based post-processing 的局限性。
+
+**代表性**：工業界最常用的 Pipeline 方法
+
+#### 2. Strong Baseline: Transkun + Beyer
+
+**系統組成**：
+- **Audio-to-MIDI**: Transkun (ISMIR 2023, Piano transcription SOTA)
+- **MIDI-to-Score**: Beyer Transformer (ISMIR 2024, Performance-to-Score SOTA)
+
+**轉換流程**：
+```python
+# Step 1: Transkun 推論
+midi_output = transkun.transcribe(audio)
+
+# Step 2: Beyer Transformer 符號化
+xml_output = beyer.performance_to_score(midi_output)
+```
+
+**代表性**：Pipeline 方法的天花板（SOTA combination）
+
+**參考文獻**：
+- Transkun: Kong et al. "High-resolution Piano Transcription with Pedals by Regressing Onsets and Offsets Times", ISMIR 2023
+- Beyer: Beyer & Dai "End-to-End Piano Performance-MIDI to Score Conversion with Transformers", ISMIR 2024, arXiv:2410.00210
+
+### 延伸閱讀
+
+**完整評估流程文件**：
+- 📊 [evaluation-flow-diagram.md](./evaluation-flow-diagram.md) - 詳細的評估流程圖與說明
+- 🛡️ [reviewer-response-template.md](./reviewer-response-template.md) - 針對評估設計的防守範本
+
+這些文件提供：
+- 完整的視覺化評估流程
+- 每個轉換步驟的詳細說明
+- 針對 reviewer 可能質疑的完整防守論述
+- 可重現性檢查清單
+
+### 評估工具來源
+
+| 工具 | 來源 | 用途 | License |
+|------|------|------|---------|
+| `evaluate.py` | [piano-a2s/evaluate.py](https://github.com/wei-zeng98/piano-a2s/blob/main/evaluate.py) | MV2H/WER/F1/ER 評估 | Apache-2.0 |
+| `evaluate_midi_mv2h.sh` | [piano-a2s/evaluate_midi_mv2h.sh](https://github.com/wei-zeng98/piano-a2s/blob/main/evaluate_midi_mv2h.sh) | MV2H Shell 執行腳本 | Apache-2.0 |
+| `humdrum.py` | [piano-a2s/data_processing/humdrum.py](https://github.com/wei-zeng98/piano-a2s/blob/main/data_processing/humdrum.py) | **Kern ↔ 符號轉換 | Apache-2.0 |
+| Humdrum Toolkit | [humdrum-tools](https://github.com/humdrum-tools/humdrum-tools) | `tiefix`, `hum2xml` | BSD License |
+| MV2H 評估器 | [music-voice-separation](https://github.com/cheriell/music-voice-separation) | 符號層級評估 | MIT License |
+
+**使用說明**：
+- ✅ 可以直接使用 Zeng 的 `evaluate.py` 和相關腳本（Apache-2.0 License 允許）
+- ✅ 已下載至 `evaluation/zeng_baseline/` 目錄，包含完整的 LICENSE 檔案
+- ✅ 需要在論文 Acknowledgments 中註記：
+  > "We thank Wei Zeng, Xian He, and Ye Wang for open-sourcing their evaluation scripts, which we adapted for our experiments."
+- ✅ 在 repo README 的 Citation 區塊加入：
+  ```bibtex
+  @misc{zeng2024endtoendrealworldpolyphonicpiano,
+    title={End-to-End Real-World Polyphonic Piano Audio-to-Score Transcription with Hierarchical Decoding},
+    author={Wei Zeng and Xian He and Ye Wang},
+    year={2024},
+    eprint={2405.13527},
+    archivePrefix={arXiv},
+    primaryClass={cs.SD},
+    url={https://arxiv.org/abs/2405.13527}
+  }
+  ```
+
+---
+
 ## Study 1: Depth (深度) — ASAP Dataset
 
 ### Clef 變體設計
@@ -349,13 +548,18 @@ Clef (Study 2) 訓練流程：
 
 ### Table 1: Comparison of A2S Systems on Real-World Recordings
 
-| Approach | System | Role | MV2H | $F_p$ (音高) | $F_{harm}$ (和聲) | 弱點分析 |
-|----------|--------|------|------|-------------|------------------|----------|
-| Pipeline | MT3 + music21 | Industry Std. | ~58.0% | ~80.0% | ~40.0% | **量化災難**：music21 的啟發式算法無法處理 Rubato |
-| Pipeline | Transkun + Beyer | SOTA Combo | ~68.0% | ~92.0% | ~50.0% | **語義鴻溝**：Beyer 模型仍無法完美修復 MIDI 的語義缺失 |
-| End-to-End | Zeng et al. (2024) | E2E Baseline | 74.2% | 63.3% | 54.5% | **聽覺失聰**：CNN 架構無法捕捉長距離和聲 |
-| End-to-End | **Clef-base** | 架構比較 | **~78%** | **~75%** | **~60%** | 純架構改進 |
-| End-to-End | **Clef-full** | 最佳性能 | **~82%** | **~85%** | **~65%** | 架構 + 前處理改進 |
+| Approach | System | Audio Model | Score Model | MV2H | $F_p$ | $F_{harm}$ | 關鍵弱點 |
+|----------|--------|-------------|-------------|------|-------|-----------|----------|
+| Pipeline | MT3 + music21 | MT3 (CNN) | music21 (Rule) | ~58% | ~80% | ~40% | **量化災難**：啟發式演算法無法處理 Rubato 與複雜節奏 |
+| Pipeline | Transkun + Beyer | Transkun (Trans.) | Beyer (Trans.) | ~68% | ~92% | ~50% | **誤差傳播**：MIDI 層級的小誤差在符號化時被放大 |
+| E2E | Zeng (2024) | - | CNN + H-RNN | 74.2% | 63.3% | 54.5% | **局部感受野**：CNN 無法捕捉長距離和聲結構 |
+| E2E | **Clef-base** | - | ViT + Transformer | **~78%** | **~75%** | **~60%** | 僅架構改進（與 Zeng 相同輸入） |
+| E2E | **Clef-full** | - | ViT + Transformer | **~82%** | **~85%** | **~65%** | 架構 + 前處理改進 |
+
+**評估設定**：
+- 資料集：ASAP test split (25 首 / 80 段錄音)
+- 評估指標：MV2H (Non-aligned, McLeod 2019)
+- 統一評估流程：所有系統 → MusicXML → MIDI → MV2H
 
 ### 貢獻分解
 
