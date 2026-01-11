@@ -61,6 +61,13 @@ def collect_single_file(input_file: Path) -> list[Path]:
     return [input_file]
 
 
+def collect_zeng_5bar_files(input_dir: Path) -> list[Path]:
+    """Collect all Zeng 5-bar WAV chunks from workspace/feature.asap/test/wav/"""
+    wav_files = sorted(input_dir.glob("*.wav"))
+    print(f"[info] found {len(wav_files)} 5-bar chunks in {input_dir}")
+    return wav_files
+
+
 # =============================================================================
 # Job Building
 # =============================================================================
@@ -70,6 +77,9 @@ def get_output_path(audio_path: Path, output_dir: Path, mode: str) -> Path:
     if mode == "asap_batch":
         # Preserve ASAP structure: Composer/Type/Movement/file.mid
         rel = extract_asap_relative(audio_path)
+    elif mode == "zeng_5bar":
+        # Flat structure: Bach#Prelude#bwv_875#Ahfat01M.0.wav -> Bach#Prelude#bwv_875#Ahfat01M.0.mid
+        rel = Path(audio_path.name)
     else:
         # Just use filename
         rel = Path(audio_path.name)
@@ -85,15 +95,22 @@ def extract_asap_relative(audio_path: Path) -> Path:
     return Path(audio_path.name)
 
 
-def build_jobs(audio_files: list[Path], output_dir: Path, mode: str) -> list[dict]:
+def build_jobs(audio_files: list[Path], output_dir: Path, mode: str,
+               input_dir_host: Path = None, input_dir_container: Path = None) -> list[dict]:
     """Build job list for API request."""
-    return [
-        {
-            "audio_path": str(audio),
+    jobs = []
+    for audio in audio_files:
+        audio_path = str(audio)
+
+        # Convert host path to container path if mapping provided
+        if input_dir_host and input_dir_container:
+            audio_path = audio_path.replace(str(input_dir_host), str(input_dir_container))
+
+        jobs.append({
+            "audio_path": audio_path,
             "midi_path": str(get_output_path(audio, output_dir, mode)),
-        }
-        for audio in audio_files
-    ]
+        })
+    return jobs
 
 
 # =============================================================================
@@ -134,15 +151,16 @@ def parse_args() -> argparse.Namespace:
     # Mode
     p.add_argument(
         "--mode",
-        choices=["asap_batch", "single_file"],
+        choices=["asap_batch", "single_file", "zeng_5bar"],
         required=True,
-        help="asap_batch: process ASAP test set; single_file: process one file",
+        help="asap_batch: process ASAP test set; single_file: process one file; zeng_5bar: process Zeng 5-bar chunks",
     )
 
     # Input paths (container paths)
-    p.add_argument("--input-dir", type=Path, help="Input directory (for asap_batch)")
+    p.add_argument("--input-dir", type=Path, help="Input directory (for asap_batch/zeng_5bar)")
     p.add_argument("--input-file", type=Path, help="Input file path (for single_file)")
     p.add_argument("--metadata-csv", type=Path, help="ASAP metadata.csv path")
+    p.add_argument("--container-path", type=Path, help="Container path for input-dir (if different from host)")
 
     # Output
     p.add_argument("--output-dir", type=Path, required=True, help="Output directory")
@@ -167,13 +185,19 @@ def main():
         if not args.input_dir or not args.metadata_csv:
             raise ValueError("asap_batch requires --input-dir and --metadata-csv")
         audio_files = collect_asap_files(args.input_dir, args.metadata_csv)
+    elif args.mode == "zeng_5bar":
+        if not args.input_dir:
+            raise ValueError("zeng_5bar requires --input-dir")
+        audio_files = collect_zeng_5bar_files(args.input_dir)
     else:
         if not args.input_file:
             raise ValueError("single_file requires --input-file")
         audio_files = collect_single_file(args.input_file)
 
     # Build jobs
-    jobs = build_jobs(audio_files, args.output_dir, args.mode)
+    jobs = build_jobs(audio_files, args.output_dir, args.mode,
+                      input_dir_host=args.input_dir if args.container_path else None,
+                      input_dir_container=args.container_path)
 
     # Skip already completed files (resume from interruption)
     original_count = len(jobs)
