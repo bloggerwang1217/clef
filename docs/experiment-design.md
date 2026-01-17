@@ -96,7 +96,7 @@ Stage 2: Fine-tuning (Real Recordings)
 
 ## 頻譜表示的神經科學基礎
 
-本章節探討為何選擇 VQT 而非 Log-Mel Spectrogram，從神經科學角度提供理論依據。
+本章節探討為何選擇 Log-Mel Spectrogram 而非 VQT，從頻譜特性與模型遷移的角度提供理論依據。
 
 ### VQT vs Log-Mel 的數學差異
 
@@ -107,9 +107,26 @@ Stage 2: Fine-tuning (Real Recordings)
 | **頻率尺度** | Mel scale（心理聲學） | 對數頻率（音樂學） |
 | **每八度解析度** | **不固定**（低頻多、高頻少） | **固定**（如 60 bins/octave） |
 | **音高對齊** | 不對齊 MIDI 音高 | **完美對齊** 12 音階 |
+| **音色保留** | **保留共振峰** | **破壞共振峰** |
 | **常見應用** | 語音識別、聲音分類 | 音樂轉譜、和聲分析 |
 
-**關鍵差異**：VQT 保證每個半音有固定的 bins 數（如 60/12 = 5 bins），模型更容易學習「音程是固定的幾何距離」。Log-Mel 在不同音域的半音間隔不同。
+### 為何選擇 Log-Mel？
+
+**核心論點**：VQT 的「音高對齊」優勢在多聲部音樂轉譜中不值一提，因為：
+
+1. **音色扭曲問題（Critical）**：
+   - VQT 為了讓 C4 和 C5 看起來一樣，對頻譜進行非線性扭曲
+   - 這導致**固定的共振峰特徵被扭曲**，小提琴的泛音結構在高低音域看起來不同
+   - 這對 **Instrument Auxiliary Loss** 是毀滅性的打擊（無法區分樂器）
+
+2. **ImageNet 遷移相容性**：
+   - Log-Mel 頻譜圖的「雲霧狀」紋理與自然圖像相似
+   - Swin V2 在 ImageNet 上訓練的淺層特徵（邊緣、紋理）可直接遷移
+   - VQT 的「橫線狀」紋理是 ImageNet 模型從未見過的
+
+3. **分類任務驗證**：
+   - AST 論文證明 Log-Mel + ImageNet Pretrain 在 AudioSet 分類任務上擊敗所有 CNN
+   - 我們的轉錄任務需要「看見」音樂結構，而非「測量」音高頻率
 
 ### 神經科學對應
 
@@ -117,43 +134,36 @@ Stage 2: Fine-tuning (Real Recordings)
 
 基底膜（Basilar Membrane）的 tonotopic organization 是**對數頻率**排列：
 - 每移動固定距離 ≈ 一個八度
-- 這支持 VQT 的設計理念
+- 這支持 VQT 的設計理念（但僅限於耳蝸層級）
 
 #### 聽覺皮層（Auditory Cortex）：更複雜
 
 1. **A1 (Primary Auditory Cortex)**：保留 tonotopic map，接近對數
-2. **更高層級**：開始出現「範疇知覺（Categorical Perception）」，這是 Mel scale 的理論基礎
-
-#### Mel Scale 的來源
-
-Mel scale 來自 1937 年的心理聲學實驗（Stevens, Volkmann & Newman）：
-- 受試者判斷「這兩個音高差距是否相等」
-- 結果：**低於 1000 Hz 接近線性，高於 1000 Hz 接近對數**
-
-```
-Mel(f) = 2595 × log₁₀(1 + f/700)
-```
-
-### 音樂家 vs 非音樂家的認知差異
-
-| 聽眾類型 | 可能的頻率感知 | 對應表示 |
-|---------|--------------|---------|
-| **一般人聽語音** | Mel scale（formants 集中在 300-3000 Hz） | Log-Mel |
-| **音樂家聽音樂** | 對數（八度等價性、音程不變性） | VQT |
-
-研究顯示**音樂訓練會改變大腦的頻率表徵**：
-- 音樂家對「八度」和「純五度」的神經反應更強
-- 暗示他們的表徵更接近**對數/音程結構**
+2. **更高層級**：開始出現「範疇知覺（Categorical Perception）」與**音色感知**
+   - 共振峰（Formant）是區分樂器的關鍵
+   - Log-Mel 保留頻譜包絡，更接近皮層處理方式
 
 ### 設計決策
 
-**核心假設**：如果要訓練一個「懂音樂的」模型，VQT（模擬訓練過的大腦）可能比 Log-Mel 更有效率。
+**核心假設**：對於多聲部音樂轉譜（需要區分樂器），Log-Mel 比 VQT 更適合。
 
 | 設定 | 輸入 | 理由 |
 |------|------|------|
-| **Clef-base** | VQT | 與 Zeng 一致，公平比較架構差異 |
-| **Clef-full** | VQT | 保持一致性 |
-| **Ablation** | VQT vs Log-Mel | 實證驗證哪種表示更適合複音音樂轉譜 |
+| **Clef** | Log-Mel (128 bins) | 音色保留佳、ImageNet 相容 |
+| **Ablation** | Log-Mel vs VQT | 實證驗證 Log-Mel 優勢 |
+
+### Ablation 驗證
+
+我們將進行消融實驗來驗證此決策：
+
+| 實驗 | 頻譜類型 | 預期 MV2H | 樂器 F1 | 預期結論 |
+|------|---------|-----------|---------|---------|
+| Clef + VQT | VQT (60 bins/oct) | ~83% | ~75% | 音高高解析，但音色辨識差 |
+| **Clef + Log-Mel** | Log-Mel (128 bins) | **~86%** | **~90%** | **音色保留佳，ImageNet 相容** |
+
+**科學問題**：「對於多聲部音樂轉譜，Log-Mel 是否比 VQT 更適合？」
+
+**預期結果**：Log-Mel 在 Overall MV2H 上勝出，特別是在 $F_{harm}$（和聲）與 Instrument F1 上顯著優於 VQT。
 
 ---
 
@@ -534,17 +544,21 @@ xml_output = beyer.performance_to_score(midi_output)
 
 ### Clef 變體設計
 
-為了區分「架構貢獻」與「前處理貢獻」，我們設計兩個 Clef 變體：
+為了區分各設計決策的貢獻，我們設計一系列 Clef 變體：
 
-| 變體 | Input | Preprocessing | 目的 |
-|------|-------|---------------|------|
-| **Zeng (2024)** | Mono VQT | 無 normalization | Baseline |
-| **Clef-base** | Mono VQT | 無 normalization | **證明架構優勢**（ViT vs CNN） |
-| **Clef-full** | Stereo 3-ch | + Loudness norm + L/R flip | **最佳性能** |
+| 變體 | Input | Encoder | Bridge | Aux Loss | 目的 |
+|------|-------|---------|--------|----------|------|
+| **Zeng (2024)** | Mono VQT | CNN | N/A | ❌ | Baseline |
+| **Clef-ViT** | Log-Mel | ViT | N/A | ❌ | **證明 Transformer > RNN** |
+| **Clef-Swin** | Log-Mel | Swin-V2 | N/A | ❌ | **證明 Swin > ViT** |
+| **Clef-Swin + Bridge** | Log-Mel | Swin-V2 | 2 layers | ❌ | **證明 Bridge 的必要性** |
+| **Clef-Full** | Stereo 3-ch | Swin-V2 | 2 layers | ✅ | **最佳性能** |
 
-**Clef-base**：與 Zeng 使用完全相同的輸入設定，唯一差異是架構（ViT + Transformer vs CNN + RNN）。這確保了公平比較。
-
-**Clef-full**：加入所有前處理改進，展示系統的最佳性能。
+**Clef 變體說明**：
+- **Clef-ViT**：與 Zeng 使用相同輸入（Log-Mel），驗證 Transformer Decoder 優於 Hierarchical RNN
+- **Clef-Swin**：驗證 Swin-V2 優於 ViT（相對位置編碼 vs 絕對位置插值）
+- **Clef-Swin + Bridge**：驗證 Global Transformer Bridge 對段落結構理解的貢獻
+- **Clef-Full**：加入所有改進（Stereo 3-ch + Loudness norm + L/R flip + Aux Loss）
 
 ### Table 1: Comparison of A2S Systems on Real-World Recordings
 
@@ -552,9 +566,11 @@ xml_output = beyer.performance_to_score(midi_output)
 |----------|--------|-------------|-------------|------|-------|-----------|----------|
 | Pipeline | MT3 + music21 | MT3 (CNN) | music21 (Rule) | ~58% | ~80% | ~40% | **量化災難**：啟發式演算法無法處理 Rubato 與複雜節奏 |
 | Pipeline | Transkun + Beyer | Transkun (Trans.) | Beyer (Trans.) | ~68% | ~92% | ~50% | **誤差傳播**：MIDI 層級的小誤差在符號化時被放大 |
-| E2E | Zeng (2024) | - | CNN + H-RNN | 74.2% | 63.3% | 54.5% | **局部感受野**：CNN 無法捕捉長距離和聲結構 |
-| E2E | **Clef-base** | - | ViT + Transformer | **~78%** | **~75%** | **~60%** | 僅架構改進（與 Zeng 相同輸入） |
-| E2E | **Clef-full** | - | ViT + Transformer | **~82%** | **~85%** | **~65%** | 架構 + 前處理改進 |
+| E2E | Zeng (2024) | CNN | H-RNN | 74.2% | 63.3% | 54.5% | **局部感受野**：CNN 無法捕捉長距離和聲結構 |
+| E2E | Clef-ViT | ViT | Transformer | ~77% | 70% | 58% | **絕對位置**：ViT 對變長輸入支援不佳 |
+| E2E | **Clef-Swin** | **Swin-V2** | Transformer | **~80%** | **75%** | **62%** | **缺 Bridge**：無全域段落結構理解 |
+| E2E | **Clef-Swin + Bridge** | **Swin-V2** | **Transformer + Bridge** | **~84%** | **79%** | **68%** | **最佳架構** |
+| E2E | **Clef-Full** | **Swin-V2** | **Transformer + Bridge** | **~86%** | **82%** | **72%** | **完整系統** |
 
 **評估設定**：
 - 資料集：ASAP test split (25 首 / 80 段錄音)
@@ -564,15 +580,19 @@ xml_output = beyer.performance_to_score(midi_output)
 ### 貢獻分解
 
 ```
-總提升 = Clef-full - Zeng = ~7.8%
+總提升 = Clef-Full - Zeng = ~12%
 
-├── 架構貢獻 = Clef-base - Zeng = ~3.8%
-│   └── ViT + Transformer vs CNN + RNN
+├── ViT + Transformer vs CNN + RNN: ~3%
 │
-└── 前處理貢獻 = Clef-full - Clef-base = ~4.0%
+├── ViT → Swin-V2: ~3%
+│
+├── Swin-V2 → +Bridge: ~4%
+│
+└── 前處理 + Aux Loss: ~2%
     ├── Stereo 3-channel input
     ├── Loudness normalization
-    └── L/R flip augmentation
+    ├── L/R flip augmentation
+    └── Instrument Auxiliary Loss
 ```
 
 > **註**：Transkun 的 $F_p$ 設為 92% 是參考其 MAESTRO 數據，但轉成 XML 後 MV2H 通常會掉下來。Zeng 的數據來自其論文中的 ASAP 實測。
@@ -598,52 +618,115 @@ xml_output = beyer.performance_to_score(midi_output)
 
 ## Ablation Study 設計
 
-本節設計系統性的消融實驗，量化各設計決策的貢獻。
+本節設計系統性的消融實驗，量化各設計決策的貢獻。我們的架構包含三個關鍵創新：**Swin-V2 編碼器**、**Global Bridge** 與 **Auxiliary Loss**，以下實驗逐一驗證它們的必要性。
 
-### 1. 架構 Ablation
+### 1. 編碼器 Ablation（Swin-V2 vs ViT vs CNN）
 
-驗證 ViT + Transformer 架構的優勢：
+驗證 Swin Transformer V2 相較於 ViT 與 CNN 的優勢：
 
-| 實驗 | Encoder | Decoder | Input | 預期 MV2H |
-|------|---------|---------|-------|-----------|
-| Zeng (baseline) | CNN | Hierarchical RNN | Mono VQT | 74.2% |
-| **Clef-base** | **ViT** | **Transformer** | Mono VQT | ~78% |
+| 實驗 | Encoder | Decoder | Input | 預期 MV2H | $F_p$ | $F_{harm}$ |
+|------|---------|---------|-------|-----------|-------|------------|
+| Zeng (baseline) | CNN | Hierarchical RNN | Mono VQT | 74.2% | 63.3% | 54.5% |
+| Clef-ViT | ViT | Transformer | Log-Mel | ~77% | ~70% | ~58% |
+| **Clef-Swin** | **Swin-V2** | Transformer | Log-Mel | **~80%** | **~75%** | **~62%** |
 
-**預期結論**：相同輸入下，ViT 的全域注意力機制比 CNN 的局部感受野更能捕捉和聲結構。
+**預期結論**：Swin-V2 的相對位置偏差與階層式結構使其在捕捉和聲結構上優於 ViT 與 CNN。
 
-### 2. 前處理 Ablation
+### 2. Global Bridge Ablation
+
+驗證 Bridge 層數對效能的影響：
+
+| 實驗 | Encoder | Bridge 層數 | Decoder | 預期 MV2H | TEDn |
+|------|---------|-------------|---------|-----------|------|
+| Clef-Swin (無 Bridge) | Swin-V2 | 0 | Transformer | ~80% | ~0.75 |
+| Clef-Swin + Bridge-1 | Swin-V2 | 1 | Transformer | ~82% | ~0.78 |
+| **Clef-Swin + Bridge-2** | Swin-V2 | **2** | Transformer | **~84%** | **~0.80** |
+| Clef-Swin + Bridge-4 | Swin-V2 | 4 | Transformer | ~84% | ~0.80 |
+| Clef-Swin + Bridge-6 | Swin-V2 | 6 | Transformer | ~83% | ~0.79 |
+
+**預期結論**：
+- 0 層 Bridge：缺乏全域上下文，無法捕捉段落呼應
+- 1 層 Bridge：改善有限，全域資訊傳遞不足
+- 2 層 Bridge：最佳平衡點，有效實現跨段落資訊傳遞
+- 4-6 層 Bridge：開始出現過擬合，收益遞減
+
+**研究問題**：「Bridge 的最佳層數是多少？」
+
+### 3. Auxiliary Loss Ablation
+
+驗證樂器分類輔助任務對主任務的貢獻：
+
+| 實驗 | Encoder + Bridge | Aux Loss | λ | 預期 MV2H | 樂器 F1 |
+|------|------------------|----------|---|-----------|---------|
+| Clef-Swin + Bridge | Swin-V2 + Bridge | ❌ | - | ~84% | N/A |
+| Clef-Swin + Bridge + Aux | Swin-V2 + Bridge | ✅ | 0.1 | ~85% | ~85% |
+| Clef-Swin + Bridge + Aux | Swin-V2 + Bridge | ✅ | 0.3 | **~86%** | **~90%** |
+| Clef-Swin + Bridge + Aux | Swin-V2 + Bridge | ✅ | 0.5 | ~85% | ~88% |
+
+**預期結論**：
+- λ = 0.3 為最佳權重，輔助任務有效但不搶走主任務的梯度
+- Auxiliary Loss 帶來的效能提升主要來自：
+  1. **加速收斂**：分類任務比序列生成簡單，提供穩定梯度
+  2. **特徵解耦**：強迫編碼器保留音色資訊
+  3. **結構理解**：樂器分布與曲式結構相關
+
+### 4. 頻譜表示 Ablation（VQT vs Log-Mel）
+
+驗證 Log-Mel 對音色保留的優勢：
+
+| 實驗 | 頻譜類型 | 解析度 | 預期 MV2H | 樂器 F1 | 備註 |
+|------|---------|--------|-----------|---------|------|
+| Clef-Swin + VQT | VQT | 60 bins/oct | ~83% | ~75% | 音高解析度高，但音色扭曲 |
+| **Clef-Swin + Log-Mel** | Log-Mel | 128 bins | **~86%** | **~90%** | 音色保留佳，ImageNet 相容 |
+| Clef-Swin + Log-Mel-256 | Log-Mel | 256 bins | ~85% | ~88% | 邊際效益遞減 |
+
+**科學問題**：「對於多聲部音樂轉譜，Log-Mel 是否比 VQT 更適合？」
+
+**理論基礎**：
+- VQT 會對頻譜進行非線性扭曲，破壞共振峰（Formant）位置
+- 共振峰是區分小提琴 vs 中提琴的關鍵特徵
+- Log-Mel 保留頻譜包絡，有利於 Instrument Auxiliary Loss
+
+### 5. 前處理 Ablation
 
 逐步加入前處理改進，量化各自貢獻：
 
 | 實驗 | Input | Normalization | Augmentation | 預期 MV2H |
 |------|-------|---------------|--------------|-----------|
-| Clef-base | Mono VQT | ❌ | ❌ | ~78% |
-| + Loudness | Mono VQT | ✅ | ❌ | ~79% |
-| + Stereo | Stereo 3-ch | ✅ | ❌ | ~80% |
-| + L/R Flip | Stereo 3-ch | ✅ | ✅ | ~82% |
+| Clef-base | Mono Log-Mel | ❌ | ❌ | ~80% |
+| + Loudness | Mono Log-Mel | ✅ | ❌ | ~81% |
+| + Stereo | Stereo 3-ch | ✅ | ❌ | ~83% |
+| + L/R Flip | Stereo 3-ch | ✅ | ✅ | ~84% |
 
-### 3. 頻譜表示 Ablation
-
-驗證 VQT vs Log-Mel 的影響：
-
-| 實驗 | 頻譜類型 | Bins | 預期 MV2H | 備註 |
-|------|---------|------|-----------|------|
-| **Clef + VQT** | VQT | 60/octave × 8 oct | ~78% | 音樂優化 |
-| Clef + Mel-128 | Log-Mel | 128 | ~75% | 語音標準 |
-| Clef + Mel-256 | Log-Mel | 256 | ~76% | 高解析度能否彌補？ |
-
-**科學問題**：「對於複音音樂轉譜，VQT 是否真的優於 Log-Mel？」
-
-### Ablation 總結表
+### 6. 完整 Ablation 總結表
 
 | 設計決策 | 預期貢獻 | 驗證方式 |
 |---------|---------|---------|
-| ViT vs CNN | +3~4% | Clef-base vs Zeng |
-| Transformer vs RNN | (含在架構貢獻中) | - |
-| Loudness Norm | +1% | 逐步加入實驗 |
-| Stereo 3-ch | +1~2% | 逐步加入實驗 |
-| L/R Flip | +1% | 逐步加入實驗 |
-| VQT vs Mel | +2~3% | 頻譜表示實驗 |
+| ViT → Swin-V2 | +2~3% | 編碼器 Ablation |
+| Swin → +Bridge | +2~3% | Bridge Ablation |
+| Bridge-0 → Bridge-2 | +2% | Bridge Ablation |
+| 無 Aux → +Aux (λ=0.3) | +1~2% | Aux Loss Ablation |
+| VQT → Log-Mel | +2~3% | 頻譜 Ablation |
+| Loudness Norm | +1% | 前處理 Ablation |
+| Stereo 3-ch | +1~2% | 前處理 Ablation |
+| L/R Flip | +1% | 前處理 Ablation |
+
+### 7. 消融實驗預期結果表
+
+| Model Configuration | MV2H | $F_p$ | $F_{voi}$ | $F_{val}$ | $F_{harm}$ | TEDn | 樂器 F1 |
+|---------------------|------|-------|-----------|-----------|------------|------|---------|
+| Zeng (2024) | 74.2 | 63.3 | 88.4 | 90.7 | 54.5 | 0.72 | N/A |
+| Clef-ViT + Transformer | 77.0 | 70.0 | 86.0 | 89.0 | 58.0 | 0.75 | N/A |
+| Clef-Swin + Transformer | 80.0 | 75.0 | 87.0 | 90.0 | 62.0 | 0.77 | N/A |
+| Clef-Swin + Bridge-0 | 80.0 | 75.0 | 87.0 | 90.0 | 62.0 | 0.77 | N/A |
+| Clef-Swin + Bridge-1 | 82.0 | 77.0 | 88.0 | 91.0 | 65.0 | 0.78 | N/A |
+| **Clef-Swin + Bridge-2** | **84.0** | **79.0** | **89.0** | **92.0** | **68.0** | **0.80** | N/A |
+| Clef-Swin + Bridge-2 + Aux (λ=0.1) | 85.0 | 80.0 | 90.0 | 93.0 | 70.0 | 0.81 | 85% |
+| **Clef-Swin + Bridge-2 + Aux (λ=0.3)** | **86.0** | **82.0** | **91.0** | **94.0** | **72.0** | **0.82** | **90%** |
+| Clef-Swin + Bridge-2 + Aux (λ=0.5) | 85.0 | 81.0 | 90.0 | 93.0 | 71.0 | 0.81 | 88% |
+| Clef-Swin + Bridge-2 + Aux + TDR | **88.0** | **85.0** | **92.0** | **95.0** | **75.0** | **0.85** | **92%** |
+
+> **註**：TDR（Timbre Domain Randomization）在 Study 2 中啟用，驗證跨音色泛化能力。
 
 ---
 
@@ -763,18 +846,22 @@ Study 2 同樣使用 **Stereo 3-channel input**，理由：
 - 包含多種樂器（小提琴、長笛、單簧管...）的真實錄音
 - Zeng 沒測過，MT3 測過但效果普普
 
-| Model Strategy | Training Data | Input | Piano | Strings | Winds | Ensemble |
-|----------------|---------------|-------|-------|---------|-------|----------|
-| MT3 + music21 | MAESTRO + Slakh | Mono | ~75% | ~35% | ~30% | ~25% |
-| Clef (Study 1) | Piano Only | Stereo 3-ch | **> 78%** | < 20% | < 20% | < 20% |
-| Clef (Study 2) | **Universal (TDR)** | Stereo 3-ch | **> 76%** | **> 60%** | **> 60%** | **> 55%** |
+| Model Strategy | Training Data | Architecture | Piano | Strings | Winds | Ensemble |
+|----------------|---------------|--------------|-------|---------|-------|----------|
+| MT3 + music21 | MAESTRO + Slakh | CNN + Rule | ~75% | ~35% | ~30% | ~25% |
+| Clef (Study 1) | Piano Only | Swin + Bridge | **> 80%** | < 20% | < 20% | < 20% |
+| Clef (Study 2) | Universal (TDR) | Swin + Bridge + Aux | **> 82%** | **> 65%** | **> 65%** | **> 60%** |
 
 > **註**：MT3 + music21 的 MV2H 預估值基於 Study 1 的「量化災難」現象。實際數據需實驗驗證。
 
 ### 表格亮點
 
-1. **Clef (Study 1)**：證明「專用模型」的侷限性（只練鋼琴，遇到小提琴就掛了）
-2. **Clef (Study 2)**：Big Data + TDR 展現 **Zero-Shot 能力**
+1. **Clef (Study 1)**：證明「專用模型」的侷限性（只練鋼琴，遇到非鋼琴樂器就掛了）
+2. **Clef (Study 2)**：Swin + Bridge + Aux + TDR 展現 **Zero-Shot 能力**
+   - Swin 的階層式結構學習音色紋理
+   - Bridge 捕捉跨樂器的和聲關係
+   - Aux Loss 強迫特徵解耦
+   - TDR 提供音色不變性
 3. **對比 MT3 + music21**：Pipeline 在非鋼琴樂器上的「量化災難」更嚴重
 
 ---

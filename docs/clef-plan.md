@@ -99,16 +99,109 @@ Clef，中文譯為「譜號」，是定義樂譜音高系統的關鍵符號。�
 
 本研究提出的 **Clef** 模型，本質上是一個**專為音樂理解設計的 Vision Language Model （VLM）**，將傳統的音訊處理問題重新框架為視覺與語言之間的轉譯。該模型是一個基於認知仿生設計（Bio-inspired Architecture）的端對端轉譜系統，其核心架構直接受到 **AST （Audio Spectrogram Transformer）** 論文（Gong et al., 2021）的啟發，該論文證明了純 Transformer 架構在音訊任務上的優越性。我們將 AST 的理念從「分類」任務延伸至「轉錄生成」任務。
 
-#### 3.1.1 輸入處理：將聲音視為圖像
-如同 AST，我們將聲音的二維 Log-Mel 頻譜圖視為一張圖像。此頻譜圖會被切分成一系列 16x16 的 Patches（ImageNet 上使用 16×16 的 patch size 訓練），並展平為一個嵌入向量序列。透過加入可學習的位置編碼，模型能理解每個區塊在原始頻譜圖中的時頻位置。
+#### 3.1.1 輸入處理：Log-Mel 頻譜圖
 
-#### 3.1.2 編碼器 （Encoder）：遷移 ImageNet 知識的純視覺 Transformer
-本研究的核心假設是，辨識頻譜圖中的音樂結構（如和聲、節奏）與辨識一般圖像中的幾何結構，在本質上是相通的。因此，我們的編碼器是一個**完全不使用卷積、純粹基於注意力機制的 Vision Transformer （ViT）**。
+我們採用 **Log-Mel Spectrogram** 作為輸入表示。此選擇基於以下考量：
 
-*   **關鍵策略（跨模態遷移學習）**：為了讓模型具備強大的通用視覺特徵提取能力，我們直接採用在 **ImageNet** 上預訓練好的 ViT 權重。正如 AST 所證明的，這種跨模態遷移能極大提升模型對頻譜圖的理解能力，使模型如同經驗豐富的指揮家，能綜觀全局，瞬間捕捉到頻譜圖上長距離的諧波關係（和聲），而非像傳統 CNN 一樣僅用放大鏡檢視局部。
-*   **凍結權重 （Frozen Weights）**：我們將凍結 ViT 編碼器的權重。此策略不僅利用了 ImageNet 預訓練帶來的強大先驗知識，更是一種有效的正規化手段，強迫後端解碼器學會如何「解讀」這些通用的視覺特徵，而非讓編碼器去過擬合訓練資料中的特定音色，從而提升模型的泛化能力。至於是否需要在後期進行微調（Fine-tuning），將作為消融實驗的一部分進行探索，以量化凍結策略對模型泛化能力的影響。
+1. **保留音色特徵**：相較於 VQT（會對頻譜進行非線性扭曲），Log-Mel 保留了較好的頻譜包絡（Spectral Envelope），使小提琴、大提琴等樂器的共振峰（Formant）位置得以保留，有利於後續的樂器分類任務。
 
-#### 3.1.3 解碼器 （Decoder）：自回歸的音樂語言生成器
+2. **ImageNet 遷移相容性**：Log-Mel 頻譜圖的「雲霧狀」紋理與自然圖像相似，使 Swin V2 在 ImageNet 上訓練的淺層特徵提取能力得以有效遷移。
+
+3. **預處理流程**：
+   - 採樣率：16 kHz
+   - Mel 濾波器組：128 bins
+   - FFT 窗口：2048 samples
+   - 跳躍長度：160 samples
+   - 動態範圍壓縮：Log 壓縮（+1dB 防止 log(0)）
+
+#### 3.1.2 編碼器 （Encoder）：Swin Transformer V2 + Global Bridge
+
+本研究採用 **Swin Transformer V2** 作為前端特徵提取器，並在頂端加入 **Global Transformer Bridge**，形成一個能同時捕捉局部紋理與全域結構的混合架構。此設計克服了標準 ViT 在長序列上的局限性，同時解決了 Swin 缺乏全局注意力機制的問題。
+
+**核心架構：**
+
+```
+Log-Mel Spectrogram (H × W)
+        ↓
+┌─────────────────────────────────────────────────────────┐
+│  Swin Transformer V2 (Front-end)                         │
+│  ├── Stage 1: Window Attention (7×7)                     │
+│  ├── Stage 2: Shifted Window Attention                   │
+│  ├── Stage 3: Hierarchical Patch Merging                 │
+│  └── Stage 4: Global Feature Map                         │
+└─────────────────────────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────────────────────────┐
+│  Global Transformer Bridge (2-4 Layers)                  │
+│  ├── Learnable Positional Embedding                      │
+│  ├── Full Self-Attention (Global Context)                │
+│  └── Output: Contextualized Sequence                     │
+└─────────────────────────────────────────────────────────┘
+        ↓
+        ↓→ Cross-Attention → Decoder
+```
+
+**為何選擇 Swin Transformer V2？**
+
+1. **相對位置編碼（Relative Position Bias）**：Swin 內建相對位置偏差機制，無需像 ViT 那樣依賴絕對位置插值。這使得 Swin 能自然處理任意長度的音訊頻譜圖，而不會在長序列上出現效能衰減。
+
+2. **階層式結構（Hierarchical Architecture）**：Swin 的 Stage 1-4 過程模擬了人類對音樂的認知層級：
+   - **Stage 1（淺層）**：捕捉音符起音（Onset）與音色紋理
+   - **Stage 2（中層）**：識別短樂句與和弦進行
+   - **Stage 3-4（深層）**：理解段落結構與曲式輪廓
+
+3. **Shifted Window 機制**：此機制完美對應音樂中的**圓滑奏（Legato）**與**連結線（Tie）**，讓模型能理解跨越視窗邊界的連續音符關係。
+
+4. **ImageNet 預訓練相容性**：Swin V2 在 ImageNet 上訓練的權重可直接遷移至頻譜圖任務，其淺層的邊緣/紋理檢測能力對應頻譜圖上的音符起音與泛音結構。
+
+**Global Transformer Bridge（關鍵創新）**
+
+標準的 Swin Transformer 僅具有局部視窗注意力（Window Attention），缺乏捕捉全曲結構呼應的能力（如 Intro 與 Outro 的相似性）。我們在 Swin 輸出後加入 2-4 層標準 Transformer Encoder：
+
+- **Learnable Positional Embedding**：不同於 Swin 的相對偏差，Bridge 使用可學習的位置編碼來建模整首曲目的時間依賴關係。
+- **Full Self-Attention**：讓第一秒的特徵直接與第一百八十秒的特徵互動，實現跨段落的信息傳遞。
+- **解決方案**：這使得模型能夠識別重複出現的副歌主題，而非僅僅將它們視為獨立的片段。
+
+**凍結權重策略**
+
+Swin Transformer V2 的相對位置偏差機制使其非常適合凍結預訓練權重：
+
+- Swin 的 `relative_position_bias_table` 只與視窗大小（Window Size）有關，與輸入長度無關
+- 這意味著即使輸入頻譜圖長度從 224 frames 擴展到 3000 frames，預訓練的相對位置權重依然完全有效
+- 我們將凍結 Swin V2 的所有權重，僅訓練 Bridge 與 Decoder，形成一個**固定特徵提取器 + 可學習上下文建模器**的分工架構
+
+#### 3.1.3 輔助損失函數（Auxiliary Loss）：音色分類
+
+為了解決多聲部音樂中的**音色解耦（Timbre Disentanglement）**問題，我們在編碼器頂端加入一個樂器分類輔助任務。此設計基於認知心理學的**聽覺場景分析（Auditory Scene Analysis）**理論，強迫模型在生成樂譜前先理解「聽見了什麼聲音」。
+
+**任務設計：**
+
+輸入為 Swin-Bridge 輸出的全局特徵序列，經過 Global Average Pooling 後送入線性分類器，預測當前曲目中出現的樂器組合（多標籤分類）。
+
+**損失函數：**
+
+```python
+L_total = L_seq (CrossEntropy, 主任務) + λ * L_aux (BCEWithLogitsLoss, 輔助任務)
+λ = 0.1 ~ 0.5
+```
+
+- **L_seq**：標準的序列生成損失（預測 Kern Tokens）
+- **L_aux**：二元交叉熵損失（Multi-label Classification）
+- 選擇 BCE 而非 CrossEntropy 是因為**多種樂器可同時出現**（如小提琴+大提琴），而非互斥的單分類問題
+
+**Ground Truth 來源：**
+
+Kern 格式中的 Tandem Interpretation（如 `*Ivioln` 表示小提琴，`*Icello` 表示大提琴）提供了樂器標籤，無需額外標註。
+
+**理論依據：**
+
+1. **加速收斂**：分類任務比序列生成簡單，模型可在訓練初期快速學會區分樂器音色，為後續的音高預測提供穩定的特徵空間。
+
+2. **特徵解耦**：Aux Loss 強迫編碼器保留音色資訊，避免其被壓縮遺失。這使得模型能夠區分「相同音高、不同樂器」的頻譜差異（如小提琴的泛音結構 vs 鋼琴的泛音結構）。
+
+3. **符合人類認知**：人類聽音樂時會先進行**原始分群（Primitive Segregation）**，根據音色將混合聲音拆分成不同「串流（Stream）」，再追蹤每個串流的旋律走向。
+
+#### 3.1.4 解碼器 （Decoder）：自回歸的音樂語言生成器
 *   **任務**：解碼器是一個標準的自回歸 Autoregressive Transformer，其任務是將編碼器提取出的視覺特徵序列，「翻譯」成符合音樂語法的 `**Kern 記譜法`文字序列。
 *   **多軌序列化策略**：採用 Alfaro-Contreras et al. (2024) 提出的 `<coc>` (Change of Column) Token 機制，將多軌並行的 **Kern Spine 結構攤平為單一序列。例如：`4c <coc> 2C <coc> 4e <coc> .` 代表上聲部四分音符 C，下聲部二分音符 C，然後上聲部四分音符 E，下聲部延續前音。
 *   **核心機制：隱性量化 （Implicit Quantization）**：模型並非計算絕對的物理時間，而是基於音樂上下文學習預測下一個最可能的音樂符號（如在 4/4 拍的強拍上，模型會傾向於生成小節線或時值較長的音符）。這使其能自動修正演奏中的微小節奏誤差（Rubato，指演奏者為表達情感而做的彈性速度處理，不嚴格遵循拍點），生成結構工整的樂譜。
@@ -195,8 +288,10 @@ Clef，中文譯為「譜號」，是定義樂譜音高系統的關鍵符號。�
     *   **結構性（Structure） - TEDn**：該指標由 Calvo-Zaragoza et al. （2020） 提出並由 Mayer et al. （2024） 確立其重要性，用以評估輸出的 MusicXML 在語法結構上的正確性。相較於無法理解 XML 樹狀結構的 WER，TEDn 能有效衡量樂譜是否「語法正確」以致能被 MuseScore 等打譜軟體順利開啟與編輯，這對應了最終的產品可用性。
     
 *   **泛化能力驗證**：在合成資料上訓練後，將在 **ASAP Dataset**（真實人類鋼琴演奏資料）上進行 **Zero-shot** 測試，即模型在**未見過任何真實錄音資料**的情況下直接進行轉譜。此設計旨在驗證資料增強金字塔是否能讓模型具備跨領域泛化能力。測試結果將與 Zeng （CNN-based） 與 Zhang （Whisper-based） 進行對比，以驗證 ViT 架構的優越性。
-*   **消融實驗（Ablation Study）**：為釐清模型效能提升的來源，本研究將設計一系列對照組。透過比較不同編碼器架構（**ViT vs. CNN vs. Whisper**）與不同資料增強策略（基礎 vs. 強化）的組合表現，量化編碼器架構選擇與資料增強金字塔各自的貢獻，並驗證兩者結合的協同效應。具體而言，實驗將包含：
-    *   **架構對比**：在相同資料與訓練設定下，比較 ViT（視覺編碼器）、CNN（傳統音訊編碼器）與 Whisper（語音編碼器）在 **MV2H** 與 **TEDn** 指標上的表現差異，特別關注 MV2H 中的音高（$F_p$）與和聲（$F_{harm}$）子指標，以驗證 ViT 在捕捉長距離諧波關係上的優勢。
+*   **消融實驗（Ablation Study）**：為釐清模型效能提升的來源，本研究將設計一系列對照組。透過比較不同編碼器架構（**Swin V2 + Bridge vs. ViT vs. CNN vs. Whisper**）與不同資料增強策略（基礎 vs. 強化）的組合表現，量化各設計決策的貢獻，並驗證兩者結合的協同效應。具體而言，實驗將包含：
+    *   **架構對比**：在相同資料與訓練設定下，比較 Swin V2 + Bridge（我們的設計）、ViT（視覺編碼器）、CNN（傳統音訊編碼器）與 Whisper（語音編碼器）在 **MV2H** 與 **TEDn** 指標上的表現差異，特別關注 MV2H 中的音高（$F_p$）與和聲（$F_{harm}$）子指標，以驗證 Swin V2 + Bridge 在捕捉長距離諧波關係與段落結構上的優勢。
+    *   **Bridge 層數實驗**：驗證 2-4 層 Global Transformer 的效果，找出架構複雜度與效能的最佳平衡點。
+    *   **Auxiliary Loss 實驗**：驗證樂器分類輔助任務對主任務（序列生成）的貢獻，量化特徵解耦帶來的效能提升。
     *   **資料增強效應**：針對每種架構，分別測試「基礎增強」（僅 Level 1 訊號層）與「完整增強」（Level 1-3 含 TDR）的效果，以驗證 **Timbre Domain Randomization** 對跨音色泛化能力的貢獻。
 
 *   **模型可解釋性分析（Model Interpretability Analysis）**：為「Hearing as Seeing」的核心論點提供直接證據，我們將進行視覺化分析。具體而言，將繪製 ViT 編碼器的注意力熱圖（Attention Map），檢視模型在生成特定音高或和弦時，其注意力是否確實聚焦於頻譜圖上對應的諧波結構與特徵線，從而驗證其「看見」音樂結構的能力。
@@ -205,9 +300,9 @@ Clef，中文譯為「譜號」，是定義樂譜音高系統的關鍵符號。�
 
 ## 4. 預期貢獻 （Expected Contributions）
 
-1.  **驗證跨模態遷移 （Cross-Modal Transfer）**：首度驗證預訓練的視覺模型（ViT）可以有效處理聽覺頻譜訊號，且在捕捉和聲結構（Global Harmony）上優於傳統的 CNN 與 Speech Transformer 架構。這挑戰了傳統認為「聲音應該用語音模型處理」的直覺。
+1.  **驗證跨模態遷移與混合架構設計 （Cross-Modal Transfer & Hybrid Architecture）**：首度驗證 Swin Transformer V2 配合 Global Bridge 可以有效處理聽覺頻譜訊號，且在捕捉和聲結構（Global Harmony）與段落呼應（Structural Correspondence）上優於傳統的 CNN 與 Speech Transformer 架構。這挑戰了傳統認為「聲音應該用語音模型處理」的直覺，並證明 Vision Domain 的預訓練知識（相對位置編碼、階層式特徵）可以直接遷移至 Audio Domain。
 
-2.  **提出 Timbre Domain Randomization（音色領域隨機化）**：首次將 Domain Randomization 原則從機器人學引入音樂轉譜領域，透過極端音色變異（鋼琴、小提琴、8-bit 合成器）強迫模型學習音色不變的音高表徵。實證端對端模型具備「隱性量化 （Implicit Quantization）」能力，學會的是音樂的「統計規律」而非物理測量，為音樂認知模型提供計算學上的證據。同時，展示透過「凍結視覺編碼器」策略，能在不依賴大量真實標記資料的情況下，訓練出具備跨音色泛化能力的轉譜模型。
+2.  **提出 Timbre Domain Randomization（音色領域隨機化）與 Auxiliary Loss（輔助損失）**：首次將 Domain Randomization 原則從機器人學引入音樂轉譜領域，透過極端音色變異（鋼琴、小提琴、8-bit 合成器）強迫模型學習音色不變的音高表徵。同時，提出 Instrument Auxiliary Loss 來實現特徵解耦，加速收斂並提升多聲部辨識能力。實證端對端模型具備「隱性量化 （Implicit Quantization）」能力，學會的是音樂的「統計規律」而非物理測量，為音樂認知模型提供計算學上的證據。
 
 3.  **重新定義轉譜任務與實用價值**：將自動採譜從「訊號處理」問題重新框架為「視覺-語言翻譯」問題，為未來的音樂 AI 研究提供新的典範。最終，**Clef** 將解決長期以來「AI 轉出的樂譜無法閱讀」的痛點，為音樂教育、創作與保存提供一個真正可用的「聽寫工具」。
 
@@ -223,15 +318,18 @@ Clef，中文譯為「譜號」，是定義樂譜音高系統的關鍵符號。�
 
 **（Architectural Innovation: Reframing Auditory Cognition as a Vision-Language Task）**
 
-- **痛點（Gap）**：現有 SOTA（如 Zeng et al.）使用 CNN 處理音訊，受限於局部感受野，難以捕捉長距離的和聲結構；或使用 Whisper（如 Zhang & Sun），受限於語音偏見，對音高不敏感。
+- **痛點（Gap）**：現有 SOTA（如 Zeng et al.）使用 CNN 處理音訊，受限於局部感受野，難以捕捉長距離的和聲結構；或使用 Whisper（如 Zhang & Sun），受限於語音偏見，對音高不敏感。標準 ViT 雖然提供全域注意力，但缺乏對音頻頻譜圖的結構適配性（長度變化、頻率軸特徵）。
 
 - **本研究解法（Solution）**：
 
-  - 提出**「Hearing as Seeing」** 理論架構，引用神經科學證據（如 Sur et al. 的雪貂實驗），假設大腦皮層具備通用幾何運算能力。
+  - 提出 **Swin Transformer V2 + Global Bridge** 混合架構：
+    - **Swin V2 前端**：利用相對位置偏差（Relative Position Bias）與階層式視窗機制，自然適配任意長度的音訊頻譜圖，其 Shifted Window 機制完美對應音樂中的圓滑奏與連結線。
+    - **Global Transformer Bridge**：在 Swin 輸出後加入 2-4 層標準 Transformer Encoder，提供跨段落的全域注意力機制，使模型能識別 Intro 與 Outro 的結構呼應。
+    - 凍結 Swin V2 預訓練權重，僅訓練 Bridge 與 Decoder，實現「固定特徵提取器 + 可學習上下文建模器」的分工。
 
-  - 首創將 **Vision Transformer（ViT）** 應用於複音音樂轉譜，利用 ViT 的 **Global Attention** 機制來模擬人類對音樂結構的「完形感知（Gestalt Perception）」。
+  - 提出 **Instrument Auxiliary Loss**：在編碼器頂端加入樂器分類任務，強迫模型學習音色解耦（Timbre Disentanglement），加速收斂並提升多聲部辨識能力。
 
-- **科學價值（Impact）**：驗證跨模態的皮質可塑性（Cortical Plasticity），證明視覺預訓練模型可以遷移至聽覺任務，實現對音樂幾何結構的深度理解。
+- **科學價值（Impact）**：此架構設計驗證了「相對位置編碼」與「階層式特徵提取」對音樂結構認知的優勢，同時證明 Audio Domain 可以有效利用 Vision Domain 的預訓練知識遷移。
 
 #### 創新點二：資料創新 — Timbre Domain Randomization (TDR)
 
