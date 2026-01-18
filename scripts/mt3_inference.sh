@@ -25,9 +25,9 @@ API_URL="http://localhost:$API_PORT/batch-transcribe"
 case "$1" in
   start)
     echo "Starting MT3 Docker container..."
-    mkdir -p "$DATA_DIR/test_output"
-    mkdir -p "$DATA_DIR/asap_midi_output"
-    mkdir -p "$DATA_DIR/zeng_5bar_midi"
+    mkdir -p "$DATA_DIR/backups/test_scratchpad/test_output"
+    mkdir -p "$DATA_DIR/experiments/mt3/full_midi"
+    mkdir -p "$DATA_DIR/backups/zeng_5bar_midi"
 
     # Stop existing container if running
     docker stop $CONTAINER_NAME 2>/dev/null || true
@@ -58,14 +58,14 @@ case "$1" in
     python3 -m src.inference.batch_transcribe \
       --mode single_file \
       --input-dir /data \
-      --input-file "/data/test/test.mp3" \
-      --output-dir /data/test_output \
+      --input-file "/data/backups/test_scratchpad/test/test.mp3" \
+      --output-dir /data/backups/test_scratchpad/test_output \
       --api-url "$API_URL" \
       --model piano
 
     echo ""
-    echo "Done! Output: $DATA_DIR/test_output/"
-    ls -la "$DATA_DIR/test_output/" 2>/dev/null || echo "(no output yet)"
+    echo "Done! Output: $DATA_DIR/backups/test_scratchpad/test_output/"
+    ls -la "$DATA_DIR/backups/test_scratchpad/test_output/" 2>/dev/null || echo "(no output yet)"
     ;;
 
   asap)
@@ -74,22 +74,22 @@ case "$1" in
 
     python3 -m src.inference.batch_transcribe \
       --mode asap_batch \
-      --input-dir /data/asap_test_set \
-      --metadata-csv "$DATA_DIR/asap_test_set/metadata.csv" \
-      --output-dir /data/asap_midi_output \
+      --input-dir /data/datasets/asap_test_set \
+      --metadata-csv "$DATA_DIR/datasets/asap_test_set/metadata.csv" \
+      --output-dir /data/experiments/mt3/full_midi \
       --api-url "$API_URL" \
       --model piano
 
     echo ""
-    echo "Done! Output: $DATA_DIR/asap_midi_output/"
+    echo "Done! Output: $DATA_DIR/experiments/mt3/full_midi/"
     ;;
 
   zeng5bar)
     echo "=========================================="
     echo "MT3 Inference: Zeng 5-bar Test Chunks"
     echo "=========================================="
-    echo "Input:  $DATA_DIR/zeng_5bar_test/ (13,335 files)"
-    echo "Output: $DATA_DIR/zeng_5bar_midi/"
+    echo "Input:  $DATA_DIR/backups/zeng_5bar_audio/ (13,335 files)"
+    echo "Output: $DATA_DIR/backups/zeng_5bar_midi/"
     echo "GPU:    $GPU_DEVICE"
     echo "Estimated time: 3-5 hours"
     echo ""
@@ -98,16 +98,16 @@ case "$1" in
     # Use host path for glob, container path for API
     python3 -m src.inference.batch_transcribe \
       --mode zeng_5bar \
-      --input-dir "$DATA_DIR/zeng_5bar_test" \
-      --container-path /data/zeng_5bar_test \
-      --output-dir /data/zeng_5bar_midi \
+      --input-dir "$DATA_DIR/backups/zeng_5bar_audio" \
+      --container-path /data/backups/zeng_5bar_audio \
+      --output-dir /data/backups/zeng_5bar_midi \
       --api-url "$API_URL" \
       --model piano
 
     echo ""
     echo "=========================================="
-    echo "Done! Output: $DATA_DIR/zeng_5bar_midi/"
-    total_files=$(ls $DATA_DIR/zeng_5bar_midi/*.mid 2>/dev/null | wc -l)
+    echo "Done! Output: $DATA_DIR/backups/zeng_5bar_midi/"
+    total_files=$(ls $DATA_DIR/backups/zeng_5bar_midi/*.mid 2>/dev/null | wc -l)
     echo "Total MIDI files: $total_files / 13335"
     echo "=========================================="
     ;;
@@ -150,11 +150,11 @@ case "$1" in
     echo "  Data:    $DATA_DIR"
     echo ""
     echo "Data structure:"
-    echo "  data/test/test.mp3          - Single file test"
-    echo "  data/asap_test_set/         - ASAP dataset"
-    echo "  data/zeng_5bar_test/        - Zeng 5-bar chunks (13,335 files, 8.5GB)"
-    echo "  data/test_output/           - Single file output"
-    echo "  data/asap_midi_output/      - ASAP batch output"
-    echo "  data/zeng_5bar_midi/        - Zeng 5-bar MIDI output"
+    echo "  data/datasets/asap_test_set/         - ASAP dataset (Raw Input)"
+    echo "  data/backups/test_scratchpad/test/   - Single file test input"
+    echo "  data/backups/test_scratchpad/test_output/ - Single file test output"
+    echo "  data/experiments/mt3/full_midi/      - MT3 Full Song Inference Output"
+    echo "  data/backups/zeng_5bar_audio/        - Zeng 5-bar chunks (Backups)"
+    echo "  data/backups/zeng_5bar_midi/         - Zeng 5-bar MIDI output (Backups)"
     ;;
 esac
