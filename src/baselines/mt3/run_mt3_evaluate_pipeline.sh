@@ -37,14 +37,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Script is now at src/baselines/mt3/, go up 3 levels to project root
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-# Paths
-AUDIO_DIR=""
-PRED_DIR=""
-GT_DIR=""
-OUTPUT_DIR="${PROJECT_ROOT}/results/mt3_baseline"
-MSCORE_BIN="${PROJECT_ROOT}/tools/mscore"
-MV2H_BIN="${PROJECT_ROOT}/MV2H/bin"
-CHUNK_CSV=""
+# Config file
+CONFIG_FILE="${PROJECT_ROOT}/configs/mt3_evaluate.yaml"
+
+# Load defaults from config file if it exists
+if [[ -f "$CONFIG_FILE" ]]; then
+    # Parse YAML using grep/sed (simple key: value format)
+    _get_yaml_value() {
+        grep "^$1:" "$CONFIG_FILE" 2>/dev/null | sed "s/^$1:[[:space:]]*//" | tr -d '"' | tr -d "'"
+    }
+    PRED_DIR_DEFAULT=$(_get_yaml_value "pred_dir")
+    GT_DIR_DEFAULT=$(_get_yaml_value "gt_dir")
+    CHUNK_CSV_DEFAULT=$(_get_yaml_value "chunk_csv")
+    MV2H_BIN_DEFAULT=$(_get_yaml_value "mv2h_bin")
+    MSCORE_BIN_DEFAULT=$(_get_yaml_value "mscore_bin")
+    OUTPUT_DIR_DEFAULT=$(_get_yaml_value "output_dir")
+fi
+
+# Paths (use config defaults if available, otherwise use hardcoded defaults)
+PRED_DIR="${PRED_DIR_DEFAULT:-${PROJECT_ROOT}/data/experiments/mt3/full_midi}"
+GT_DIR="${GT_DIR_DEFAULT:-}"
+OUTPUT_DIR="${OUTPUT_DIR_DEFAULT:-${PROJECT_ROOT}/results/mt3_baseline}"
+MSCORE_BIN="${MSCORE_BIN_DEFAULT:-${PROJECT_ROOT}/tools/mscore}"
+MV2H_BIN="${MV2H_BIN_DEFAULT:-${PROJECT_ROOT}/MV2H/bin}"
+CHUNK_CSV="${CHUNK_CSV_DEFAULT:-}"
 
 # Processing
 WORKERS=$(nproc 2>/dev/null || echo 4)
@@ -55,7 +71,7 @@ MODE="full"
 
 # Flags
 SKIP_SETUP=false
-SKIP_INFERENCE=false
+SKIP_VALIDATION=false
 SKIP_EVALUATION=false
 VERBOSE=false
 
@@ -69,17 +85,14 @@ Usage: $(basename "$0") [options]
 
 MT3 + MuseScore Studio 4.6.5 Baseline Evaluation Pipeline
 
-Required (one of):
-  --audio_dir DIR       Directory containing audio files for MT3 inference
-  --pred_dir DIR        Directory containing MT3 MIDI outputs (skip inference)
-
 Required:
   --gt_dir DIR          ASAP dataset base directory
 
 Options:
+  --pred_dir DIR        MT3 MIDI outputs directory (default: data/experiments/mt3/full_midi)
   --output_dir DIR      Output directory (default: results/mt3_baseline)
   --mode MODE           Evaluation mode: 'full' or 'chunks' (default: full)
-  --chunk_csv FILE      Chunk CSV file (required for 'chunks' mode)
+  --chunk_csv FILE      Chunk CSV file (default for chunks: src/evaluation/test_chunk_set.csv)
 
 Processing:
   -j, --workers N       Number of parallel workers (default: $WORKERS)
@@ -93,30 +106,26 @@ Paths:
 
 Flags:
   --skip_setup          Skip MuseScore/MV2H setup
-  --skip_inference      Skip MT3 inference (use existing MIDI files)
-  --skip_evaluation     Skip MV2H evaluation (only run conversion)
+  --skip_validation     Skip MT3 MIDI file validation
+  --skip_evaluation     Skip MV2H evaluation (only run setup and validation)
   -v, --verbose         Enable verbose output
   -h, --help            Show this help message
 
 Examples:
-  # Full pipeline
-  $(basename "$0") --audio_dir data/audio --gt_dir data/asap -j 8
+  # Full song evaluation
+  $(basename "$0") --gt_dir /path/to/asap-dataset --mode full
 
-  # Evaluation only
-  $(basename "$0") --skip_inference --pred_dir data/mt3_midi --gt_dir data/asap
+  # 5-bar chunk evaluation (compare with Zeng)
+  $(basename "$0") --gt_dir /path/to/asap-dataset --mode chunks
 
-  # Chunk evaluation
-  $(basename "$0") --pred_dir data/mt3_midi --gt_dir data/asap \\
-      --mode chunks --chunk_csv data/zeng_test_chunks.csv
+  # Custom paths
+  $(basename "$0") --gt_dir /path/to/asap-dataset \\
+      --pred_dir /path/to/mt3_midi --mode chunks -j 16
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --audio_dir)
-            AUDIO_DIR="$2"
-            shift 2
-            ;;
         --pred_dir)
             PRED_DIR="$2"
             shift 2
@@ -165,8 +174,8 @@ while [[ $# -gt 0 ]]; do
             SKIP_SETUP=true
             shift
             ;;
-        --skip_inference)
-            SKIP_INFERENCE=true
+        --skip_validation)
+            SKIP_VALIDATION=true
             shift
             ;;
         --skip_evaluation)
@@ -198,9 +207,17 @@ echo "MT3 + MuseScore Studio 4.6.5 Baseline Pipeline"
 echo "=============================================="
 echo ""
 
+# Show config file status
+if [[ -f "$CONFIG_FILE" ]]; then
+    echo "Config file: $CONFIG_FILE"
+else
+    echo "Config file: (not found, using defaults)"
+fi
+echo ""
+
 # Check required arguments
 if [[ -z "$GT_DIR" ]]; then
-    echo "Error: --gt_dir is required"
+    echo "Error: --gt_dir is required (or set gt_dir in $CONFIG_FILE)"
     usage
     exit 1
 fi
@@ -210,31 +227,20 @@ if [[ ! -d "$GT_DIR" ]]; then
     exit 1
 fi
 
-# Determine prediction directory
-if [[ "$SKIP_INFERENCE" == true ]]; then
-    if [[ -z "$PRED_DIR" ]]; then
-        echo "Error: --pred_dir is required when --skip_inference is set"
-        exit 1
-    fi
-    if [[ ! -d "$PRED_DIR" ]]; then
-        echo "Error: Prediction directory not found: $PRED_DIR"
-        exit 1
-    fi
-else
-    if [[ -z "$AUDIO_DIR" ]]; then
-        echo "Error: --audio_dir is required (or use --skip_inference with --pred_dir)"
-        exit 1
-    fi
-    if [[ ! -d "$AUDIO_DIR" ]]; then
-        echo "Error: Audio directory not found: $AUDIO_DIR"
-        exit 1
-    fi
-    PRED_DIR="${OUTPUT_DIR}/midi"
+# Check prediction directory
+if [[ ! -d "$PRED_DIR" ]]; then
+    echo "Error: Prediction directory not found: $PRED_DIR"
+    exit 1
+fi
+
+# Set default chunk CSV for chunks mode
+if [[ "$MODE" == "chunks" && -z "$CHUNK_CSV" ]]; then
+    CHUNK_CSV="${PROJECT_ROOT}/src/evaluation/test_chunk_set.csv"
 fi
 
 # Check chunk mode requirements
-if [[ "$MODE" == "chunks" && -z "$CHUNK_CSV" ]]; then
-    echo "Error: --chunk_csv is required for 'chunks' mode"
+if [[ "$MODE" == "chunks" && ! -f "$CHUNK_CSV" ]]; then
+    echo "Error: Chunk CSV not found: $CHUNK_CSV"
     exit 1
 fi
 
@@ -290,40 +296,117 @@ if [[ "$SKIP_SETUP" == false ]]; then
 fi
 
 # =============================================================================
-# STEP 2: MT3 INFERENCE
+# STEP 2: VALIDATE MT3 MIDI FILES
 # =============================================================================
 
-if [[ "$SKIP_INFERENCE" == false ]]; then
+if [[ "$SKIP_VALIDATION" == false ]]; then
     echo "=============================================="
-    echo "Step 2: MT3 Inference (Audio -> MIDI)"
+    echo "Step 2: Validate MT3 MIDI Files"
     echo "=============================================="
 
-    mkdir -p "$PRED_DIR"
+echo "Checking MT3 MIDI files against test set..."
+echo "  MIDI dir:  $PRED_DIR"
+if [[ "$MODE" == "chunks" ]]; then
+    echo "  Chunk CSV: $CHUNK_CSV"
+fi
+echo ""
 
-    # Check if MT3 is available
-    if ! python -c "import t5x" 2>/dev/null; then
-        echo "Warning: t5x not found. MT3 inference requires Google's T5X library."
-        echo "Please install MT3 dependencies or use --skip_inference with existing MIDI files."
-        echo ""
-        echo "For MT3 setup, see: https://github.com/magenta/mt3"
-        exit 1
-    fi
+# Validate that MIDI files exist and align with test set
+VALIDATION_RESULT=$(python3 << PYEOF
+import sys
+import os
+from pathlib import Path
 
-    # Run MT3 inference
-    # Note: This is a placeholder. Actual MT3 inference command depends on your setup.
-    echo "Running MT3 inference..."
-    echo "  Input:  $AUDIO_DIR"
-    echo "  Output: $PRED_DIR"
+pred_dir = "$PRED_DIR"
+mode = "$MODE"
+chunk_csv = "$CHUNK_CSV"
+
+if not os.path.isdir(pred_dir):
+    print(f"ERROR: Prediction directory not found: {pred_dir}")
+    sys.exit(1)
+
+# Find all MIDI files
+midi_files = list(Path(pred_dir).rglob("*.mid")) + list(Path(pred_dir).rglob("*.midi"))
+print(f"Found {len(midi_files)} MIDI files in {pred_dir}")
+
+if len(midi_files) == 0:
+    print("ERROR: No MIDI files found!")
+    sys.exit(1)
+
+# For chunks mode, validate against chunk CSV
+if mode == "chunks" and chunk_csv:
+    import csv
+
+    # Extract unique (piece, performance) pairs from chunk CSV
+    expected_pairs = set()
+    with open(chunk_csv, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            chunk_id = row.get("chunk_id", "")
+            # chunk_id format: Bach#Prelude#bwv_875#Ahfat01M.10
+            parts = chunk_id.rsplit("#", 1)
+            if len(parts) == 2:
+                piece_id = parts[0]  # Bach#Prelude#bwv_875
+                perf_chunk = parts[1]  # Ahfat01M.10
+                performance = perf_chunk.rsplit(".", 1)[0]  # Ahfat01M
+                expected_pairs.add((piece_id, performance))
+
+    print(f"Test set requires {len(expected_pairs)} unique (piece, performance) pairs")
+
+    # Check which pairs have MIDI files
+    found_pairs = set()
+    missing_pairs = []
+
+    for piece_id, performance in expected_pairs:
+        # Convert piece_id to path: Bach#Prelude#bwv_875 -> Bach/Prelude/bwv_875
+        path_parts = piece_id.split("#")
+        search_dir = Path(pred_dir) / "/".join(path_parts)
+
+        found = False
+        if search_dir.exists():
+            for f in search_dir.iterdir():
+                if f.suffix.lower() in [".mid", ".midi"] and performance in f.stem:
+                    found = True
+                    found_pairs.add((piece_id, performance))
+                    break
+
+        if not found:
+            missing_pairs.append(f"{piece_id}#{performance}")
+
+    print(f"Found MIDI files for {len(found_pairs)}/{len(expected_pairs)} pairs")
+
+    if missing_pairs:
+        print(f"\nERROR: Missing {len(missing_pairs)} MIDI files:")
+        for p in missing_pairs[:10]:  # Show first 10
+            print(f"  - {p}")
+        if len(missing_pairs) > 10:
+            print(f"  ... and {len(missing_pairs) - 10} more")
+        sys.exit(1)
+
+    print("All required MIDI files found!")
+
+else:
+    # For full mode, just report what we found
+    print("Full mode: Will evaluate all MIDI files found")
+
+sys.exit(0)
+PYEOF
+)
+
+VALIDATION_EXIT_CODE=$?
+
+if [[ $VALIDATION_EXIT_CODE -ne 0 ]]; then
     echo ""
+    echo "Validation failed! Please ensure all required MT3 MIDI files are present."
+    echo "Expected location: $PRED_DIR/{Composer}/{Work}/{Piece}/{performance}.mid"
+    exit 1
+fi
 
-    # Example MT3 inference command (adjust based on your setup):
-    # python -m mt3.infer \
-    #     --model_path=gs://mt3/checkpoints/mt3 \
-    #     --audio_dir="$AUDIO_DIR" \
-    #     --output_dir="$PRED_DIR"
-
-    echo "Note: MT3 inference command should be customized for your setup."
-    echo "Skipping actual inference - assuming MIDI files exist in $PRED_DIR"
+echo ""
+else
+    echo "=============================================="
+    echo "Step 2: Validate MT3 MIDI Files (skipped)"
+    echo "=============================================="
     echo ""
 fi
 
@@ -419,9 +502,6 @@ fi
 echo ""
 echo "Output directory structure:"
 echo "  ${OUTPUT_DIR}/"
-if [[ "$SKIP_INFERENCE" == false ]]; then
-    echo "  ├── midi/              # MT3 MIDI outputs"
-fi
 echo "  ├── musicxml/          # MuseScore converted MusicXML"
 if [[ "$MODE" == "chunks" ]]; then
     echo "  ├── musicxml_cache/    # Cached MusicXML conversions"
