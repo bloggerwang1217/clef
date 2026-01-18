@@ -997,6 +997,154 @@ def save_results_to_csv(
     logger.info(f"Results saved to: {output_path}")
 
 
+def save_failed_tasks(
+    results: List[EvalResult],
+    output_path: str,
+    failed_statuses: Optional[List[str]] = None,
+) -> int:
+    """
+    Save failed/timeout tasks to a text file for retry.
+
+    Format: One task per line with tab-separated fields:
+        task_id\tpred_path\tgt_path\tstatus
+
+    Args:
+        results: List of evaluation results
+        output_path: Path to output file (e.g., timeout.txt)
+        failed_statuses: List of status values to consider as failed
+                        Default: ["mv2h_failed", "musescore_conversion_failed",
+                                 "midi_reconversion_failed", "error", "executor_error"]
+
+    Returns:
+        Number of failed tasks saved
+    """
+    if failed_statuses is None:
+        failed_statuses = [
+            "mv2h_failed",
+            "musescore_conversion_failed",
+            "midi_reconversion_failed",
+            "error",
+            "executor_error",
+            "zero_score",
+        ]
+
+    failed = [r for r in results if r.status in failed_statuses]
+
+    if not failed:
+        logger.info("No failed tasks to save")
+        return 0
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, "w") as f:
+        # Write header comment
+        f.write(f"# Failed tasks for retry (statuses: {', '.join(failed_statuses)})\n")
+        f.write("# Format: task_id\\tpred_path\\tgt_path\\tstatus\n")
+
+        for r in failed:
+            f.write(f"{r.task_id}\t{r.pred_path}\t{r.gt_path}\t{r.status}\n")
+
+    logger.info(f"Saved {len(failed)} failed tasks to: {output_path}")
+    return len(failed)
+
+
+def load_retry_file(
+    retry_path: str,
+    output_dir: str,
+    mscore_config: MuseScoreConfig,
+    mv2h_config: MV2HConfig,
+) -> List[EvalTask]:
+    """
+    Load tasks from a retry file.
+
+    Args:
+        retry_path: Path to retry file (e.g., timeout.txt)
+        output_dir: Output directory for intermediate files
+        mscore_config: MuseScore configuration
+        mv2h_config: MV2H configuration
+
+    Returns:
+        List of EvalTask objects
+    """
+    tasks = []
+
+    with open(retry_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            # Skip comments and empty lines
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split("\t")
+            if len(parts) < 3:
+                logger.warning(f"Invalid retry line: {line}")
+                continue
+
+            task_id = parts[0]
+            pred_path = parts[1]
+            gt_path = parts[2]
+
+            # Validate paths exist
+            if not pred_path or not Path(pred_path).exists():
+                logger.warning(f"Prediction file not found: {pred_path}")
+                continue
+            if not gt_path or not Path(gt_path).exists():
+                logger.warning(f"Ground truth file not found: {gt_path}")
+                continue
+
+            tasks.append(
+                EvalTask(
+                    task_id=task_id,
+                    pred_midi_path=pred_path,
+                    gt_midi_path=gt_path,
+                    output_dir=output_dir,
+                    mscore_config=mscore_config,
+                    mv2h_config=mv2h_config,
+                )
+            )
+
+    logger.info(f"Loaded {len(tasks)} tasks from retry file: {retry_path}")
+    return tasks
+
+
+def run_retry_evaluation(
+    retry_file: str,
+    output_dir: str,
+    output_csv: str,
+    mscore_config: MuseScoreConfig,
+    mv2h_config: MV2HConfig,
+    parallel_config: ParallelConfig,
+) -> List[EvalResult]:
+    """
+    Run evaluation on tasks loaded from retry file.
+
+    Args:
+        retry_file: Path to retry file
+        output_dir: Directory for intermediate outputs
+        output_csv: Path to output CSV file
+        mscore_config: MuseScore configuration
+        mv2h_config: MV2H configuration
+        parallel_config: Parallel processing configuration
+
+    Returns:
+        List of EvalResult objects
+    """
+    # Load tasks from retry file
+    tasks = load_retry_file(retry_file, output_dir, mscore_config, mv2h_config)
+
+    if not tasks:
+        logger.warning("No valid tasks loaded from retry file")
+        return []
+
+    # Run parallel evaluation
+    results = run_parallel_evaluation(tasks, parallel_config)
+
+    # Save results to CSV
+    save_results_to_csv(results, output_csv)
+
+    return results
+
+
 def aggregate_results(results: List[EvalResult]) -> Dict[str, Any]:
     """Aggregate MV2H results."""
     successful = [r for r in results if r.status == "success" and r.metrics]
@@ -1101,27 +1249,25 @@ Academic Note:
         """,
     )
 
-    # Required arguments
+    # Required arguments (some may be optional in retry mode)
     parser.add_argument(
         "--mode",
         type=str,
-        required=True,
         choices=["full", "chunks"],
-        help="Evaluation mode: 'full' for full song, 'chunks' for 5-bar chunks",
+        default="full",
+        help="Evaluation mode: 'full' for full song, 'chunks' for 5-bar chunks (not required in retry mode)",
     )
 
     parser.add_argument(
         "--pred_dir",
         type=str,
-        required=True,
-        help="Directory containing MT3 raw MIDI outputs",
+        help="Directory containing MT3 raw MIDI outputs (not required in retry mode)",
     )
 
     parser.add_argument(
         "--gt_dir",
         type=str,
-        required=True,
-        help="ASAP dataset base directory",
+        help="ASAP dataset base directory (not required in retry mode)",
     )
 
     parser.add_argument(
@@ -1190,23 +1336,51 @@ Academic Note:
         help="Enable verbose logging",
     )
 
+    # Retry mode
+    parser.add_argument(
+        "--retry_file",
+        type=str,
+        help="Path to retry file (e.g., timeout.txt). When specified, only retry failed tasks from this file.",
+    )
+
+    parser.add_argument(
+        "--save_failed",
+        type=str,
+        default=None,
+        help="Path to save failed tasks for retry (default: <output_dir>/failed.txt)",
+    )
+
     args = parser.parse_args()
 
     # Configure logging level
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # Determine if we're in retry mode
+    retry_mode = args.retry_file is not None
+
     # Validate arguments
-    if args.mode == "chunks" and not args.chunk_csv:
-        parser.error("--chunk_csv is required for 'chunks' mode")
+    if not retry_mode:
+        # In normal mode, pred_dir and gt_dir are required
+        if not args.pred_dir:
+            parser.error("--pred_dir is required (unless using --retry_file)")
+        if not args.gt_dir:
+            parser.error("--gt_dir is required (unless using --retry_file)")
 
-    if not Path(args.pred_dir).exists():
-        print(f"Error: Prediction directory not found: {args.pred_dir}")
-        sys.exit(1)
+        if args.mode == "chunks" and not args.chunk_csv:
+            parser.error("--chunk_csv is required for 'chunks' mode")
 
-    if not Path(args.gt_dir).exists():
-        print(f"Error: Ground truth directory not found: {args.gt_dir}")
-        sys.exit(1)
+        if not Path(args.pred_dir).exists():
+            print(f"Error: Prediction directory not found: {args.pred_dir}")
+            sys.exit(1)
+
+        if not Path(args.gt_dir).exists():
+            print(f"Error: Ground truth directory not found: {args.gt_dir}")
+            sys.exit(1)
+    else:
+        if not Path(args.retry_file).exists():
+            print(f"Error: Retry file not found: {args.retry_file}")
+            sys.exit(1)
 
     if not Path(args.mv2h_bin).exists():
         print(f"Error: MV2H bin not found: {args.mv2h_bin}")
@@ -1241,22 +1415,37 @@ Academic Note:
     print("=" * 70)
     print("MT3 + MuseScore Studio 4.6.5 Baseline | MV2H Evaluation")
     print("=" * 70)
-    print(f"Mode:                {args.mode}")
-    print(f"Prediction dir:      {args.pred_dir}")
-    print(f"Ground truth:        {args.gt_dir}")
+    if retry_mode:
+        print(f"Mode:                RETRY")
+        print(f"Retry file:          {args.retry_file}")
+    else:
+        print(f"Mode:                {args.mode}")
+        print(f"Prediction dir:      {args.pred_dir}")
+        print(f"Ground truth:        {args.gt_dir}")
     print(f"MuseScore:           {args.mscore_bin}")
     print(f"MV2H bin:            {args.mv2h_bin}")
     print(f"Output:              {args.output}")
     print(f"Workers:             {args.workers}")
     print(f"MV2H timeout:        {args.timeout}s")
     print(f"MuseScore timeout:   {args.mscore_timeout}s")
-    if args.mode == "chunks":
+    if not retry_mode and args.mode == "chunks":
         print(f"Chunk CSV:           {args.chunk_csv}")
     print("=" * 70)
     print()
 
     # Run evaluation
-    if args.mode == "full":
+    if retry_mode:
+        # Retry mode: load tasks from retry file
+        results = run_retry_evaluation(
+            retry_file=args.retry_file,
+            output_dir=args.output_dir,
+            output_csv=args.output,
+            mscore_config=mscore_config,
+            mv2h_config=mv2h_config,
+            parallel_config=parallel_config,
+        )
+        eval_mode = "retry"
+    elif args.mode == "full":
         results = run_full_song_evaluation(
             pred_dir=args.pred_dir,
             gt_dir=args.gt_dir,
@@ -1266,6 +1455,7 @@ Academic Note:
             mv2h_config=mv2h_config,
             parallel_config=parallel_config,
         )
+        eval_mode = "full"
     else:  # chunks mode
         results = run_chunk_evaluation(
             pred_dir=args.pred_dir,
@@ -1277,10 +1467,25 @@ Academic Note:
             mv2h_config=mv2h_config,
             parallel_config=parallel_config,
         )
+        eval_mode = "chunks"
+
+    # Save failed tasks for retry
+    failed_path = args.save_failed
+    if failed_path is None:
+        failed_path = str(Path(args.output_dir) / "failed.txt")
+
+    n_failed = save_failed_tasks(results, failed_path)
+    if n_failed > 0:
+        print(f"\nFailed tasks saved to: {failed_path}")
+        print(f"To retry with longer timeout:")
+        print(f"  python mt3_evaluate.py --retry_file {failed_path} \\")
+        print(f"      --mv2h_bin {args.mv2h_bin} --mscore_bin {args.mscore_bin} \\")
+        print(f"      --output {args.output.replace('.csv', '_retry.csv')} \\")
+        print(f"      --timeout 300  # or longer")
 
     # Aggregate and print summary
     summary = aggregate_results(results)
-    print_summary(summary, args.mode)
+    print_summary(summary, eval_mode)
 
     # Save summary JSON
     summary_path = Path(args.output).with_suffix(".summary.json")
