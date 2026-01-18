@@ -55,7 +55,7 @@ case "$1" in
     cd "$PROJECT_ROOT"
 
     # Paths use /data prefix (container mount point)
-    python3 -m src.inference.batch_transcribe \
+    python3 -m src.baselines.mt3.mt3_inference \
       --mode single_file \
       --input-dir /data \
       --input-file "/data/backups/test_scratchpad/test/test.mp3" \
@@ -72,7 +72,7 @@ case "$1" in
     echo "Running ASAP test set batch inference..."
     cd "$PROJECT_ROOT"
 
-    python3 -m src.inference.batch_transcribe \
+    python3 -m src.baselines.mt3.mt3_inference \
       --mode asap_batch \
       --input-dir /data/datasets/asap_test_set \
       --metadata-csv "$DATA_DIR/datasets/asap_test_set/metadata.csv" \
@@ -96,7 +96,7 @@ case "$1" in
     cd "$PROJECT_ROOT"
 
     # Use host path for glob, container path for API
-    python3 -m src.inference.batch_transcribe \
+    python3 -m src.baselines.mt3.mt3_inference \
       --mode zeng_5bar \
       --input-dir "$DATA_DIR/backups/zeng_5bar_audio" \
       --container-path /data/backups/zeng_5bar_audio \
