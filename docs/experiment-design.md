@@ -18,9 +18,38 @@
 
 ---
 
-## Zeng et al. (2024) 實驗設定參考
+## 統一評估標準 (Unified Evaluation Protocol)
 
-為確保公平比較，本研究採用與 Zeng et al. (2024) 相同的實驗設定。
+為了確保與 SOTA (Zeng et al., 2024) 進行嚴格且公平的比較，我們制定了以下標準化評估流程：
+
+### 核心原則：Train Big, Test Small
+
+我們採用 **「大格局訓練，小格局評估」** 的策略，既發揮 VLM 的長序列優勢，又符合 Baseline 的評分規則。
+
+| 階段 | Zeng (Baseline) | Clef (Ours) | MT3 (Straw Man) | 說明 |
+|---|---|---|---|---|
+| **Training** | 5-bar segments | **Full Song** (或長序列) | (Pre-trained) | Clef 利用 Global Context 學習結構 |
+| **Inference** | 5-bar segments | **Full Song** | **Full Song** | 讓模型展現處理整首曲子的能力 |
+| **Evaluation** | 5-bar Average | **Slice to 5-bar** | **Slice to 5-bar** | **統一在 5-bar Level 算分**，確保公平 |
+
+### 評估流程細節
+
+1.  **Zeng (Baseline)**:
+    - 依循其原論文設定，對 5-bar 片段進行推論。
+    - 計算所有片段的平均 MV2H。
+    - **強化點**：我們使用優化過的 Data Pipeline (Converter21) 重新訓練 Zeng 的模型，確保比較對象是 "Stronger Baseline"。
+
+2.  **Clef (Ours)**:
+    - 輸入整首音訊，輸出整首 MusicXML。
+    - 使用後處理腳本 (`slice_xml.py`)，根據 Ground Truth 的時間點，將整首 XML 切割成對應的 5-bar 片段。
+    - 計算切片後的平均 MV2H。
+    - **優勢**：Clef 的第 N 個片段是基於上下文推論的，準確度應高於孤立推論。
+
+3.  **MT3 + music21**:
+    - 輸入整首音訊，輸出整首 MusicXML。
+    - 同樣切割成 5-bar 片段進行評分。
+    - **目的**：給予 Pipeline 方法最大的優勢（消除長距離累積誤差），若分數依然低落，則證明其量化機制存在根本缺陷。
+
 
 ### ASAP Dataset Split
 
@@ -575,7 +604,7 @@ xml_output = beyer.performance_to_score(midi_output)
 **評估設定**：
 - 資料集：ASAP test split (25 首 / 80 段錄音)
 - 評估指標：MV2H (Non-aligned, McLeod 2019)
-- 統一評估流程：所有系統 → MusicXML → MIDI → MV2H
+- 統一評估流程：所有系統 → (Slice to 5-bar if needed) → MusicXML → MIDI → MV2H
 
 ### 貢獻分解
 
