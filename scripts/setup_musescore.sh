@@ -1,21 +1,28 @@
 #!/bin/bash
 # =============================================================================
-# MuseScore 4.4.2 Setup Script for Headless Server
+# MuseScore Studio 4.6.5 Setup Script for Headless Server
 # =============================================================================
 #
-# This script downloads and configures MuseScore 4.4.2 AppImage for use
+# This script downloads and configures MuseScore Studio 4.6.5 AppImage for use
 # as an "Industry Standard Baseline" for MIDI to MusicXML conversion.
 #
 # Academic Justification:
-# MuseScore 4.4.2 represents the state-of-the-art rule-based notation system.
-# Unlike naive quantization libraries (e.g., music21), MuseScore 4 utilizes
-# a sophisticated heuristic-based import engine that performs:
+# MuseScore Studio 4.6.5 (released Dec 18, 2025) is the latest stable release,
+# incorporating critical stability fixes for Linux environments. Unlike naive
+# quantization libraries (e.g., music21), MuseScore 4 utilizes a sophisticated
+# heuristic-based import engine that performs:
 # - Voice separation
 # - Tuplet detection
 # - Smart quantization
+# - Reworked chord symbol handling (SMuFL Compliant)
 #
-# Reference: MuseScore GitHub Release v4.4.2
-# https://github.com/musescore/MuseScore/releases/tag/v4.4.2
+# Why 4.6.5 over 4.6.4?
+# - Crash fixes critical for parallel processing (64+ workers)
+# - Linux VST3 support optimization (better AppImage stability with Xvfb)
+# - Reworked chord symbol handling for cleaner XML output
+#
+# Reference: MuseScore GitHub Release v4.6.5
+# https://github.com/musescore/MuseScore/releases/tag/v4.6.5
 #
 # Usage:
 #   ./setup_musescore.sh [--install-dir /path/to/dir]
@@ -25,8 +32,8 @@
 set -e
 
 # Configuration
-MUSESCORE_VERSION="4.4.2"
-MUSESCORE_URL="https://github.com/musescore/MuseScore/releases/download/v${MUSESCORE_VERSION}/MuseScore-${MUSESCORE_VERSION}.242570931-x86_64.AppImage"
+MUSESCORE_VERSION="4.6.5"
+MUSESCORE_URL="https://github.com/musescore/MuseScore/releases/download/v${MUSESCORE_VERSION}/MuseScore-Studio-${MUSESCORE_VERSION}-253530512-x86_64.AppImage"
 DEFAULT_INSTALL_DIR="$(dirname "$(realpath "$0")")/../tools"
 
 # Parse arguments
@@ -137,7 +144,7 @@ echo "[4/4] Creating wrapper script..."
 WRAPPER_PATH="${INSTALL_DIR}/mscore"
 cat > "${WRAPPER_PATH}" << 'WRAPPER_EOF'
 #!/bin/bash
-# MuseScore 4.4.2 Headless Wrapper
+# MuseScore Studio 4.6.5 Headless Wrapper
 # Automatically uses xvfb-run for headless operation
 
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"

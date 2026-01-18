@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-MT3 Baseline MV2H Evaluation Pipeline (MuseScore 4.4.2 Edition)
+MT3 Baseline MV2H Evaluation Pipeline (MuseScore Studio 4.6.5 Edition)
 
 This script provides comprehensive MV2H evaluation for MT3 baseline using
-MuseScore 4.4.2 as the "Industry Standard Baseline" for MIDI to MusicXML
+MuseScore Studio 4.6.5 as the "Industry Standard Baseline" for MIDI to MusicXML
 conversion, with full parallel processing support.
 
 Evaluation Modes:
@@ -13,17 +13,25 @@ Evaluation Modes:
 Academic Justification:
 =======================
 
-1. MUSESCORE 4.4.2 AS INDUSTRY STANDARD BASELINE
+1. MUSESCORE STUDIO 4.6.5 AS INDUSTRY STANDARD BASELINE
+   We utilize MuseScore Studio 4.6.5 (released Dec 18, 2025), the latest stable
+   release incorporating critical stability fixes for Linux environments.
    Unlike naive quantization libraries (e.g., music21), MuseScore 4 utilizes
    a sophisticated heuristic-based import engine that performs:
    - Voice separation
    - Tuplet detection
    - Smart quantization
+   - Reworked chord symbol handling (SMuFL Compliant)
 
    Reference: MuseScore 4.0+ MIDI Import Algorithm
    "MuseScore 4.0 introduced a new MIDI import logic that automatically
     analyzes whether the MIDI segment is 'melody' or 'accompaniment',
     and decides stem direction and multi-voice splitting accordingly."
+
+   Why 4.6.5 over 4.6.4?
+   - Crash fixes critical for parallel processing (64+ workers)
+   - Linux VST3 support optimization (better AppImage stability with Xvfb)
+   - Reworked chord symbol handling for cleaner XML output
 
    This represents the pinnacle of rule-based notation systems and serves
    as a rigorous "Standard Industry Baseline" for neural A2S comparison.
@@ -95,16 +103,16 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MuseScoreConfig:
     """
-    MuseScore 4.4.2 configuration for MIDI to MusicXML conversion.
+    MuseScore Studio 4.6.5 configuration for MIDI to MusicXML conversion.
 
     Academic Justification:
-    MuseScore 4.4.2 is chosen as the "Industry Standard Baseline" because:
+    MuseScore Studio 4.6.5 is chosen as the "Industry Standard Baseline" because:
     1. It uses mature "Smart Import" algorithm for voice separation
     2. It performs automatic tuplet detection
     3. It represents the state-of-the-art for rule-based notation
 
-    Reference: MuseScore GitHub Release v4.4.2
-    https://github.com/musescore/MuseScore/releases/tag/v4.4.2
+    Reference: MuseScore GitHub Release v4.6.5
+    https://github.com/musescore/MuseScore/releases/tag/v4.6.5
     """
 
     # Path to MuseScore binary (wrapper script or AppImage)
@@ -199,7 +207,7 @@ def convert_midi_to_musicxml_musescore(
     config: Optional[MuseScoreConfig] = None,
 ) -> bool:
     """
-    Convert MIDI to MusicXML using MuseScore 4.4.2 (Industry Standard Baseline).
+    Convert MIDI to MusicXML using MuseScore Studio 4.6.5 (Industry Standard Baseline).
 
     This is the critical conversion step that transforms raw MT3 MIDI output
     into properly quantized, voice-separated MusicXML notation.
@@ -1032,7 +1040,7 @@ def aggregate_results(results: List[EvalResult]) -> Dict[str, Any]:
 def print_summary(summary: Dict[str, Any], mode: str) -> None:
     """Print formatted evaluation summary."""
     print("\n" + "=" * 70)
-    print(f"MT3 + MuseScore 4.4.2 Baseline | MV2H Evaluation ({mode} mode)")
+    print(f"MT3 + MuseScore Studio 4.6.5 Baseline | MV2H Evaluation ({mode} mode)")
     print("=" * 70)
     print(f"Total samples:       {summary['n_total']}")
     print(f"Successful:          {summary['n_success']}")
@@ -1064,7 +1072,7 @@ def print_summary(summary: Dict[str, Any], mode: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MT3 + MuseScore 4.4.2 Baseline MV2H Evaluation",
+        description="MT3 + MuseScore Studio 4.6.5 Baseline MV2H Evaluation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1087,7 +1095,7 @@ Examples:
       --workers 16
 
 Academic Note:
-  This script uses MuseScore 4.4.2 as the "Industry Standard Baseline" for
+  This script uses MuseScore Studio 4.6.5 as the "Industry Standard Baseline" for
   MIDI to MusicXML conversion. Unlike naive quantization (music21), MuseScore
   employs sophisticated heuristic-based voice separation and tuplet detection.
         """,
@@ -1231,7 +1239,7 @@ Academic Note:
 
     # Print configuration
     print("=" * 70)
-    print("MT3 + MuseScore 4.4.2 Baseline | MV2H Evaluation")
+    print("MT3 + MuseScore Studio 4.6.5 Baseline | MV2H Evaluation")
     print("=" * 70)
     print(f"Mode:                {args.mode}")
     print(f"Prediction dir:      {args.pred_dir}")

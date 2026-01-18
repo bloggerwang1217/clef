@@ -1,16 +1,16 @@
 #!/bin/bash
 # =============================================================================
-# MT3 + MuseScore 4.4.2 Baseline Pipeline
+# MT3 + MuseScore Studio 4.6.5 Baseline Pipeline
 # =============================================================================
 #
 # This script runs the complete MT3 baseline evaluation pipeline:
-# 1. Setup: Install MuseScore 4.4.2 and MV2H (if needed)
+# 1. Setup: Install MuseScore Studio 4.6.5 and MV2H (if needed)
 # 2. Inference: Run MT3 audio-to-MIDI transcription
 # 3. Conversion: Convert MIDI to MusicXML using MuseScore
 # 4. Evaluation: Run MV2H evaluation against ASAP ground truth
 #
 # Academic Justification:
-# This pipeline uses MuseScore 4.4.2 as the "Industry Standard Baseline" for
+# This pipeline uses MuseScore Studio 4.6.5 as the "Industry Standard Baseline" for
 # MIDI to MusicXML conversion. Unlike naive quantization libraries (music21),
 # MuseScore 4 employs sophisticated heuristic-based voice separation and
 # tuplet detection, representing the state-of-the-art for rule-based notation.
@@ -65,7 +65,7 @@ usage() {
     cat << EOF
 Usage: $(basename "$0") [options]
 
-MT3 + MuseScore 4.4.2 Baseline Evaluation Pipeline
+MT3 + MuseScore Studio 4.6.5 Baseline Evaluation Pipeline
 
 Required (one of):
   --audio_dir DIR       Directory containing audio files for MT3 inference
@@ -187,7 +187,7 @@ done
 # =============================================================================
 
 echo "=============================================="
-echo "MT3 + MuseScore 4.4.2 Baseline Pipeline"
+echo "MT3 + MuseScore Studio 4.6.5 Baseline Pipeline"
 echo "=============================================="
 echo ""
 
@@ -256,7 +256,7 @@ if [[ "$SKIP_SETUP" == false ]]; then
 
     # Setup MuseScore
     if [[ ! -f "$MSCORE_BIN" ]]; then
-        echo "Setting up MuseScore 4.4.2..."
+        echo "Setting up MuseScore Studio 4.6.5..."
         bash "${SCRIPT_DIR}/setup_musescore.sh" --install-dir "${PROJECT_ROOT}/tools"
     else
         echo "MuseScore already installed: $MSCORE_BIN"
@@ -329,7 +329,7 @@ echo "=============================================="
 MUSICXML_DIR="${OUTPUT_DIR}/musicxml"
 mkdir -p "$MUSICXML_DIR"
 
-echo "Converting MIDI files to MusicXML using MuseScore 4.4.2..."
+echo "Converting MIDI files to MusicXML using MuseScore Studio 4.6.5..."
 echo "  Input:  $PRED_DIR"
 echo "  Output: $MUSICXML_DIR"
 echo ""
