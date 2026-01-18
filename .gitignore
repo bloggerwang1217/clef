@@ -79,7 +79,7 @@ runs/
 wandb/
 
 # Audio data (keep samples small)
-data/
+data*/
 *.mp3
 *.flac
 *.ogg
