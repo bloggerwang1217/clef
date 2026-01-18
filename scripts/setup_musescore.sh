@@ -16,13 +16,12 @@
 # - Smart quantization
 # - Reworked chord symbol handling (SMuFL Compliant)
 #
-# Why 4.6.5 over 4.6.4?
-# - Crash fixes critical for parallel processing (64+ workers)
-# - Linux VST3 support optimization (better AppImage stability with Xvfb)
-# - Reworked chord symbol handling for cleaner XML output
-#
 # Reference: MuseScore GitHub Release v4.6.5
 # https://github.com/musescore/MuseScore/releases/tag/v4.6.5
+#
+# Prerequisites:
+#   - xvfb (xvfb-run command)
+#   - libfuse2 (for AppImage)
 #
 # Usage:
 #   ./setup_musescore.sh [--install-dir /path/to/dir]
@@ -33,12 +32,11 @@ set -e
 
 # Configuration
 MUSESCORE_VERSION="4.6.5"
-MUSESCORE_URL="https://github.com/musescore/MuseScore/releases/download/v${MUSESCORE_VERSION}/MuseScore-Studio-${MUSESCORE_VERSION}-253530512-x86_64.AppImage"
+MUSESCORE_URL="https://github.com/musescore/MuseScore/releases/download/v${MUSESCORE_VERSION}/MuseScore-Studio-${MUSESCORE_VERSION}.253511702-x86_64.AppImage"
 DEFAULT_INSTALL_DIR="$(dirname "$(realpath "$0")")/../tools"
 
 # Parse arguments
 INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
-SKIP_DEPS=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -46,18 +44,17 @@ while [[ $# -gt 0 ]]; do
             INSTALL_DIR="$2"
             shift 2
             ;;
-        --skip-deps)
-            SKIP_DEPS=true
-            shift
-            ;;
         -h|--help)
-            echo "Usage: $0 [--install-dir /path/to/dir] [--skip-deps]"
+            echo "Usage: $0 [--install-dir /path/to/dir]"
             echo ""
             echo "Downloads and configures MuseScore ${MUSESCORE_VERSION} for headless operation."
             echo ""
             echo "Options:"
             echo "  --install-dir DIR   Installation directory (default: ${DEFAULT_INSTALL_DIR})"
-            echo "  --skip-deps         Skip system dependency installation (for HPC without sudo)"
+            echo ""
+            echo "Prerequisites (install manually before running):"
+            echo "  - xvfb:     sudo apt-get install xvfb"
+            echo "  - libfuse2: sudo apt-get install libfuse2"
             exit 0
             ;;
         *)
@@ -67,10 +64,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Create install directory
-mkdir -p "${INSTALL_DIR}"
-cd "${INSTALL_DIR}"
-
 echo "=============================================="
 echo "MuseScore ${MUSESCORE_VERSION} Setup"
 echo "=============================================="
@@ -78,43 +71,58 @@ echo "Install directory: ${INSTALL_DIR}"
 echo ""
 
 # -----------------------------------------------------------------------------
-# Step 1: Install system dependencies
+# Step 1: Check system dependencies
 # -----------------------------------------------------------------------------
 echo "[1/4] Checking system dependencies..."
 
-install_deps() {
-    if command -v apt-get &> /dev/null; then
-        echo "  Installing dependencies via apt-get..."
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq xvfb libfuse2 2>/dev/null || {
-            echo "  Note: libfuse2 may not be available, trying libfuse2t64..."
-            sudo apt-get install -y -qq xvfb libfuse2t64 2>/dev/null || true
-        }
-    elif command -v yum &> /dev/null; then
-        echo "  Installing dependencies via yum..."
-        sudo yum install -y xorg-x11-server-Xvfb fuse-libs
-    elif command -v pacman &> /dev/null; then
-        echo "  Installing dependencies via pacman..."
-        sudo pacman -S --noconfirm xorg-server-xvfb fuse2
-    else
-        echo "  Warning: Could not detect package manager."
-        echo "  Please manually install: xvfb, libfuse2"
-    fi
-}
+MISSING_DEPS=false
 
-if [[ "$SKIP_DEPS" == true ]]; then
-    echo "  Skipping dependency installation (--skip-deps)"
-    echo "  Make sure xvfb-run and libfuse2 are available on your system."
-    echo "  On HPC, try: module load xvfb  (or similar)"
+# Check xvfb-run
+if command -v xvfb-run &> /dev/null; then
+    echo "  [OK] xvfb-run: $(which xvfb-run)"
 else
-    # Check if xvfb-run exists
-    if ! command -v xvfb-run &> /dev/null; then
-        echo "  xvfb-run not found, installing dependencies..."
-        install_deps
-    else
-        echo "  xvfb-run found: $(which xvfb-run)"
-    fi
+    echo "  [MISSING] xvfb-run"
+    MISSING_DEPS=true
 fi
+
+# Check libfuse2 (needed for AppImage)
+if ldconfig -p 2>/dev/null | grep -q libfuse.so.2; then
+    echo "  [OK] libfuse2: found"
+elif [[ -f /usr/lib/x86_64-linux-gnu/libfuse.so.2 ]] || [[ -f /usr/lib64/libfuse.so.2 ]]; then
+    echo "  [OK] libfuse2: found"
+else
+    echo "  [MISSING] libfuse2"
+    MISSING_DEPS=true
+fi
+
+if [[ "$MISSING_DEPS" == true ]]; then
+    echo ""
+    echo "=============================================="
+    echo "ERROR: Missing dependencies"
+    echo "=============================================="
+    echo ""
+    echo "Please install the missing dependencies before running this script:"
+    echo ""
+    echo "  Ubuntu/Debian:"
+    echo "    sudo apt-get install xvfb libfuse2"
+    echo ""
+    echo "  RHEL/CentOS:"
+    echo "    sudo yum install xorg-x11-server-Xvfb fuse-libs"
+    echo ""
+    echo "  Arch Linux:"
+    echo "    sudo pacman -S xorg-server-xvfb fuse2"
+    echo ""
+    echo "  HPC (ask admin or use module):"
+    echo "    module load xvfb  # if available"
+    echo ""
+    exit 1
+fi
+
+echo "  All dependencies satisfied!"
+
+# Create install directory
+mkdir -p "${INSTALL_DIR}"
+cd "${INSTALL_DIR}"
 
 # -----------------------------------------------------------------------------
 # Step 2: Download MuseScore AppImage
@@ -193,7 +201,4 @@ echo "  ${WRAPPER_PATH} input.mid -o output.musicxml --force"
 echo ""
 echo "  # From Python"
 echo "  subprocess.run(['${WRAPPER_PATH}', 'input.mid', '-o', 'output.musicxml', '--force'])"
-echo ""
-echo "Environment variable (add to your shell profile):"
-echo "  export MUSESCORE_BIN=\"${WRAPPER_PATH}\""
 echo ""
