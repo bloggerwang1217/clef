@@ -1,0 +1,76 @@
+# =============================================================================
+# MT3 Baseline Evaluation Configuration
+# =============================================================================
+#
+# This YAML config centralizes all paths and parameters for MT3 baseline
+# MV2H evaluation. CLI arguments override values in this file.
+#
+# Usage:
+#   python -m src.baselines.mt3.mt3_evaluate --config configs/mt3_evaluate.yaml
+#
+#   # Override specific parameters
+#   python -m src.baselines.mt3.mt3_evaluate --config configs/mt3_evaluate.yaml \
+#       --workers 16 --mode full
+#
+# =============================================================================
+
+# Evaluation mode: 'full' or 'chunks'
+#   full   - Evaluate entire songs (for comparison with Clef)
+#   chunks - 5-bar chunk evaluation (for comparison with Zeng et al.)
+mode: chunks
+
+# -----------------------------------------------------------------------------
+# Input paths
+# -----------------------------------------------------------------------------
+
+# Directory containing MT3 prediction MIDI files
+# Supports two structures:
+#   1. Flat: pred_dir/performance.mid
+#   2. ASAP-style: pred_dir/Composer/Work/Piece/performance.mid
+pred_dir: data/experiments/mt3/full_midi
+
+# ASAP dataset base directory (contains ground truth MIDI and MusicXML)
+gt_dir: /path/to/asap-dataset
+
+# Zeng chunk CSV file (required for chunks mode)
+# Format: chunk_id,piece,performance,chunk_index,start_measure,end_measure
+chunk_csv: src/evaluation/test_chunk_set.csv
+
+# -----------------------------------------------------------------------------
+# Output paths
+# -----------------------------------------------------------------------------
+
+# Output directory for results, MusicXML cache, and chunk MIDI files
+output_dir: results/mt3_baseline
+
+# Output CSV file for per-item results
+output_csv: results/mt3_baseline/chunks.csv
+
+# -----------------------------------------------------------------------------
+# Tool paths
+# -----------------------------------------------------------------------------
+
+# MV2H Java tool bin directory (compiled Java classes)
+mv2h_bin: MV2H/bin
+
+# MuseScore Studio 4.6.5 binary (AppImage extracted or installed)
+mscore_bin: tools/mscore
+
+# -----------------------------------------------------------------------------
+# Evaluation settings
+# -----------------------------------------------------------------------------
+
+# Number of parallel workers for evaluation
+workers: 8
+
+# MV2H timeout for full song evaluation (seconds)
+# Full songs may require longer for DTW alignment
+timeout: 120
+
+# MV2H timeout for chunk evaluation (seconds)
+# Zeng uses 10s for 5-bar chunks; shorter chunks need less time
+chunk_timeout: 10
+
+# MuseScore conversion timeout (seconds)
+# MIDI to MusicXML conversion is typically fast
+mscore_timeout: 60

@@ -219,12 +219,71 @@ class ASAPDataset:
 
         return None
 
+    def find_ground_truth_midi_by_piece_id(self, piece_id: str) -> Optional[str]:
+        """
+        Find ground truth MIDI using Zeng-style piece_id.
+
+        Converts '#' separator to path structure for ASAP dataset lookup.
+
+        Args:
+            piece_id: Zeng-style piece identifier (e.g., 'Bach#Prelude#bwv_875')
+
+        Returns:
+            Path to ground truth MIDI or None if not found
+
+        Example:
+            piece_id = 'Bach#Prelude#bwv_875'
+            -> searches: asap-dataset/Bach/Prelude/bwv_875/midi_score.mid
+        """
+        # Convert '#' separator to path components
+        # Bach#Prelude#bwv_875 -> ['Bach', 'Prelude', 'bwv_875']
+        path_parts = piece_id.split("#")
+
+        for gt_name in self.GT_MIDI_NAMES:
+            gt_path = self.base_dir / "/".join(path_parts) / gt_name
+            if gt_path.exists():
+                return str(gt_path)
+
+        logger.debug(f"No ground truth MIDI found for piece_id: {piece_id}")
+        return None
+
+    def find_ground_truth_xml_by_piece_id(self, piece_id: str) -> Optional[str]:
+        """
+        Find ground truth MusicXML using Zeng-style piece_id.
+
+        Converts '#' separator to path structure for ASAP dataset lookup.
+
+        Args:
+            piece_id: Zeng-style piece identifier (e.g., 'Bach#Prelude#bwv_875')
+
+        Returns:
+            Path to ground truth MusicXML or None if not found
+
+        Example:
+            piece_id = 'Bach#Prelude#bwv_875'
+            -> searches: asap-dataset/Bach/Prelude/bwv_875/xml_score.musicxml
+        """
+        # Convert '#' separator to path components
+        path_parts = piece_id.split("#")
+
+        for gt_name in self.GT_XML_NAMES:
+            gt_path = self.base_dir / "/".join(path_parts) / gt_name
+            if gt_path.exists():
+                return str(gt_path)
+
+        logger.debug(f"No ground truth XML found for piece_id: {piece_id}")
+        return None
+
     def load_chunks(self, csv_path: str) -> List[ChunkInfo]:
         """
         Load chunk definitions from CSV file.
 
-        Expected CSV format:
-            chunk_id,piece_id,start_measure,end_measure,asap_path
+        Supports two CSV formats:
+        1. Standard: chunk_id,piece_id,start_measure,end_measure,asap_path
+        2. Zeng format: chunk_id,piece,performance,chunk_index,start_measure,end_measure
+
+        For Zeng format, 'piece' column is used as piece_id.
+        The '#' separator in piece_id (e.g., 'Bach#Prelude#bwv_875') is preserved.
 
         Args:
             csv_path: Path to chunk CSV file
@@ -237,9 +296,12 @@ class ASAPDataset:
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
+                # Support both 'piece_id' (standard) and 'piece' (Zeng format)
+                piece_id = row.get("piece_id") or row.get("piece", "")
+
                 chunk = ChunkInfo(
                     chunk_id=row.get("chunk_id", ""),
-                    piece_id=row.get("piece_id", ""),
+                    piece_id=piece_id,
                     start_measure=int(row.get("start_measure", 0)),
                     end_measure=int(row.get("end_measure", 0)),
                     asap_path=row.get("asap_path", ""),
@@ -440,3 +502,56 @@ def extract_measures_musicxml(
     except Exception as e:
         logger.error(f"Measure extraction failed: {e}")
         return False
+
+
+def extract_measures_to_midi(
+    musicxml_path: str,
+    start_measure: int,
+    end_measure: int,
+    output_midi_path: str,
+) -> Optional[str]:
+    """
+    Extract a range of measures from a MusicXML file and output as MIDI.
+
+    This is the primary function for chunk evaluation. It extracts specific
+    measure ranges from MusicXML files (which have proper measure structure)
+    and exports them as MIDI for MV2H evaluation.
+
+    Args:
+        musicxml_path: Path to input MusicXML file
+        start_measure: Starting measure (1-indexed)
+        end_measure: Ending measure (inclusive)
+        output_midi_path: Path to output MIDI file
+
+    Returns:
+        Path to output MIDI file if successful, None otherwise
+
+    Example:
+        # Extract measures 10-14 (5-bar chunk) from a MusicXML file
+        midi_path = extract_measures_to_midi(
+            "score.musicxml",
+            start_measure=10,
+            end_measure=14,
+            output_midi_path="/tmp/chunk_10.mid"
+        )
+    """
+    try:
+        from music21 import converter
+
+        score = converter.parse(musicxml_path)
+        extracted = score.measures(start_measure, end_measure)
+
+        Path(output_midi_path).parent.mkdir(parents=True, exist_ok=True)
+        extracted.write("midi", fp=output_midi_path)
+
+        if Path(output_midi_path).exists():
+            return output_midi_path
+        return None
+
+    except ImportError:
+        logger.error("music21 required for measure extraction: pip install music21")
+        return None
+
+    except Exception as e:
+        logger.error(f"Measure extraction to MIDI failed: {e}")
+        return None

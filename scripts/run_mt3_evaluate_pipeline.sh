@@ -16,14 +16,14 @@
 # tuplet detection, representing the state-of-the-art for rule-based notation.
 #
 # Usage:
-#   ./run_mt3_pipeline.sh [options]
+#   ./run_mt3_evaluate_pipeline.sh [options]
 #
 # Examples:
 #   # Full pipeline with 8 workers
-#   ./run_mt3_pipeline.sh --audio_dir data/audio --gt_dir data/asap -j 8
+#   ./run_mt3_evaluate_pipeline.sh --audio_dir data/audio --gt_dir data/asap -j 8
 #
 #   # Evaluation only (skip inference)
-#   ./run_mt3_pipeline.sh --skip_inference --pred_dir data/mt3_midi --gt_dir data/asap
+#   ./run_mt3_evaluate_pipeline.sh --skip_inference --pred_dir data/mt3_midi --gt_dir data/asap
 #
 # =============================================================================
 
@@ -48,6 +48,7 @@ CHUNK_CSV=""
 # Processing
 WORKERS=$(nproc 2>/dev/null || echo 4)
 MV2H_TIMEOUT=120
+MV2H_CHUNK_TIMEOUT=10  # Shorter timeout for 5-bar chunk evaluation (Zeng's setting)
 MSCORE_TIMEOUT=60
 MODE="full"
 
@@ -81,7 +82,8 @@ Options:
 
 Processing:
   -j, --workers N       Number of parallel workers (default: $WORKERS)
-  --mv2h_timeout N      MV2H evaluation timeout in seconds (default: $MV2H_TIMEOUT)
+  --mv2h_timeout N      MV2H full song timeout in seconds (default: $MV2H_TIMEOUT)
+  --chunk_timeout N     MV2H chunk timeout in seconds (default: $MV2H_CHUNK_TIMEOUT)
   --mscore_timeout N    MuseScore conversion timeout in seconds (default: $MSCORE_TIMEOUT)
 
 Paths:
@@ -140,6 +142,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --mv2h_timeout)
             MV2H_TIMEOUT="$2"
+            shift 2
+            ;;
+        --chunk_timeout)
+            MV2H_CHUNK_TIMEOUT="$2"
             shift 2
             ;;
         --mscore_timeout)
@@ -238,11 +244,13 @@ echo "  Ground truth:      $GT_DIR"
 echo "  Predictions:       $PRED_DIR"
 echo "  Output:            $OUTPUT_DIR"
 echo "  Workers:           $WORKERS"
-echo "  MV2H timeout:      ${MV2H_TIMEOUT}s"
-echo "  MuseScore timeout: ${MSCORE_TIMEOUT}s"
 if [[ "$MODE" == "chunks" ]]; then
+    echo "  Chunk timeout:     ${MV2H_CHUNK_TIMEOUT}s"
     echo "  Chunk CSV:         $CHUNK_CSV"
+else
+    echo "  MV2H timeout:      ${MV2H_TIMEOUT}s"
 fi
+echo "  MuseScore timeout: ${MSCORE_TIMEOUT}s"
 echo ""
 
 # =============================================================================
@@ -365,7 +373,7 @@ if [[ "$SKIP_EVALUATION" == false ]]; then
 
     # Build evaluation command
     EVAL_CMD=(
-        python "${PROJECT_ROOT}/src/evaluation/mt3_evaluate.py"
+        python -m src.baselines.mt3.mt3_evaluate
         --mode "$MODE"
         --pred_dir "$PRED_DIR"
         --gt_dir "$GT_DIR"
@@ -375,6 +383,7 @@ if [[ "$SKIP_EVALUATION" == false ]]; then
         --output_dir "$MUSICXML_DIR"
         --workers "$WORKERS"
         --timeout "$MV2H_TIMEOUT"
+        --chunk_timeout "$MV2H_CHUNK_TIMEOUT"
         --mscore_timeout "$MSCORE_TIMEOUT"
     )
 
@@ -410,9 +419,15 @@ echo ""
 echo "Output directory structure:"
 echo "  ${OUTPUT_DIR}/"
 if [[ "$SKIP_INFERENCE" == false ]]; then
-    echo "  ├── midi/           # MT3 MIDI outputs"
+    echo "  ├── midi/              # MT3 MIDI outputs"
 fi
-echo "  ├── musicxml/       # MuseScore converted MusicXML"
+echo "  ├── musicxml/          # MuseScore converted MusicXML"
+if [[ "$MODE" == "chunks" ]]; then
+    echo "  ├── musicxml_cache/    # Cached MusicXML conversions"
+    echo "  ├── chunk_midi/        # Extracted 5-bar chunk MIDI files"
+    echo "  ├── timeouts.txt       # Chunks that exceeded timeout"
+    echo "  ├── errors.txt         # Chunks with errors"
+fi
 echo "  └── results/"
 echo "      ├── ${MODE}_song.csv"
 echo "      └── ${MODE}_song.summary.json"
