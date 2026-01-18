@@ -38,19 +38,26 @@ DEFAULT_INSTALL_DIR="$(dirname "$(realpath "$0")")/../tools"
 
 # Parse arguments
 INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
+SKIP_DEPS=false
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --install-dir)
             INSTALL_DIR="$2"
             shift 2
             ;;
+        --skip-deps)
+            SKIP_DEPS=true
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--install-dir /path/to/dir]"
+            echo "Usage: $0 [--install-dir /path/to/dir] [--skip-deps]"
             echo ""
             echo "Downloads and configures MuseScore ${MUSESCORE_VERSION} for headless operation."
             echo ""
             echo "Options:"
             echo "  --install-dir DIR   Installation directory (default: ${DEFAULT_INSTALL_DIR})"
+            echo "  --skip-deps         Skip system dependency installation (for HPC without sudo)"
             exit 0
             ;;
         *)
@@ -95,12 +102,18 @@ install_deps() {
     fi
 }
 
-# Check if xvfb-run exists
-if ! command -v xvfb-run &> /dev/null; then
-    echo "  xvfb-run not found, installing dependencies..."
-    install_deps
+if [[ "$SKIP_DEPS" == true ]]; then
+    echo "  Skipping dependency installation (--skip-deps)"
+    echo "  Make sure xvfb-run and libfuse2 are available on your system."
+    echo "  On HPC, try: module load xvfb  (or similar)"
 else
-    echo "  xvfb-run found: $(which xvfb-run)"
+    # Check if xvfb-run exists
+    if ! command -v xvfb-run &> /dev/null; then
+        echo "  xvfb-run not found, installing dependencies..."
+        install_deps
+    else
+        echo "  xvfb-run found: $(which xvfb-run)"
+    fi
 fi
 
 # -----------------------------------------------------------------------------
