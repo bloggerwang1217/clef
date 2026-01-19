@@ -70,6 +70,70 @@ Zeng 的 split 檔案位於：
 | Schubert | Impromptu D.899 No.1,2,4; Moment Musical 1; D.664/3, D.894/2 |
 | Schumann | Toccata |
 
+### Study 1: 5-bar Chunk 評估框架
+
+#### 資料集定義
+
+ASAP test split 的完整結構：
+
+| 層級 | 數量 | 說明 |
+|-----|------|------|
+| Pieces | 25 | 曲目數（上表所列） |
+| Performances | 80 | 演奏錄音數（Zeng 從 ASAP 186 個中選出） |
+| **Chunks** | **9,363** | 5-bar chunks（stride=1 重疊） |
+
+**Chunk 定義來源**：
+- 定義檔：`src/evaluation/test_chunk_set.csv`
+- 來源：根據 Ground Truth 樂譜（MusicXML）的小節數計算
+- 格式：`chunk_id, piece, performance, chunk_index, start_measure, end_measure`
+
+> **Note**: ASAP 完整 test set 有 186 個 performances，但 Zeng 只使用其中 80 個作為 test split，其餘用於 fine-tuning。
+
+#### 三維度評估框架
+
+為確保公平比較，我們採用三維度評估框架：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   Study 1: 5-bar Chunk 評估框架                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  維度 A: Success Rate（成功率）                                          │
+│  ═══════════════════════════════                                        │
+│  定義：成功評估的 chunks / 9,363                                         │
+│  意義：系統穩定性，能處理多少比例的測試樣本                               │
+│                                                                         │
+│  維度 B: Intersection MV2H（交集分數）                                   │
+│  ════════════════════════════════════                                   │
+│  定義：在「所有系統都成功」的 chunks 上計算 MV2H                          │
+│  意義：Apple-to-Apple 公平比較，排除 parsability 差異                    │
+│                                                                         │
+│  維度 C: Full Set MV2H（全集分數，失敗=0）                               │
+│  ═════════════════════════════════════════                              │
+│  定義：sum(成功分數) / 9,363                                             │
+│  意義：真實世界可用性，失敗的 chunks 計為 0 分                           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 各系統評估狀態
+
+| 系統 | Pipeline | 評估狀態 | Success Rate | MV2H (成功集) | MV2H (全集) |
+|-----|----------|---------|--------------|--------------|-------------|
+| **MT3 + MuseScore** | Audio→MIDI→MusicXML→Chunk | ✅ 完成 | 35.6% | 56.2%* | 20.0%* |
+| **Zeng (hum2xml)** | Kern→hum2xml→MusicXML | ⏳ 待跑 | ~46%? | ~66%? | ? |
+| **Clef** | Audio→MusicXML→Chunk | ⏳ 待跑 | ? | ? | ? |
+
+*MV2H_custom = (Multi-pitch + Voice + Value + Harmony) / 4
+
+#### 資料來源追蹤
+
+| 系統 | 評估結果檔案 | Summary 檔案 |
+|-----|-------------|-------------|
+| MT3 | `data/experiments/mt3/results/chunks_song.csv` | `data/experiments/mt3/results/chunks_song.summary.json` |
+| Zeng | (待產生) | (待產生) |
+| Clef | (待產生) | (待產生) |
+
 ### 兩階段訓練 (Two-Stage Training)
 
 ```
