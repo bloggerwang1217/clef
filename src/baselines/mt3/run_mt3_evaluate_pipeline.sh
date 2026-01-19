@@ -57,7 +57,7 @@ fi
 # Paths (use config defaults if available, otherwise use hardcoded defaults)
 PRED_DIR="${PRED_DIR_DEFAULT:-${PROJECT_ROOT}/data/experiments/mt3/full_midi}"
 GT_DIR="${GT_DIR_DEFAULT:-}"
-OUTPUT_DIR="${OUTPUT_DIR_DEFAULT:-${PROJECT_ROOT}/results/mt3_baseline}"
+OUTPUT_DIR="${OUTPUT_DIR_DEFAULT:-${PROJECT_ROOT}/data/experiments/mt3}"
 MSCORE_BIN="${MSCORE_BIN_DEFAULT:-${PROJECT_ROOT}/tools/mscore}"
 MV2H_BIN="${MV2H_BIN_DEFAULT:-${PROJECT_ROOT}/MV2H/bin}"
 CHUNK_CSV="${CHUNK_CSV_DEFAULT:-}"
@@ -312,7 +312,7 @@ fi
 echo ""
 
 # Validate that MIDI files exist and align with test set
-VALIDATION_RESULT=$(python3 << PYEOF
+python3 << PYEOF
 import sys
 import os
 from pathlib import Path
@@ -391,7 +391,6 @@ else:
 
 sys.exit(0)
 PYEOF
-)
 
 VALIDATION_EXIT_CODE=$?
 
@@ -411,29 +410,68 @@ else
 fi
 
 # =============================================================================
-# STEP 3: MUSESCORE CONVERSION (MIDI -> MusicXML)
+# STEP 3: VALIDATE MUSESCORE CONVERSION
 # =============================================================================
 
 echo "=============================================="
-echo "Step 3: MuseScore Conversion (MIDI -> MusicXML)"
+echo "Step 3: Validate MuseScore Conversion"
 echo "=============================================="
 
-MUSICXML_DIR="${OUTPUT_DIR}/musicxml"
+MUSICXML_DIR="${PROJECT_ROOT}/data/experiments/mt3/full_musicxml"
 mkdir -p "$MUSICXML_DIR"
 
-echo "Converting MIDI files to MusicXML using MuseScore Studio 4.6.5..."
-echo "  Input:  $PRED_DIR"
-echo "  Output: $MUSICXML_DIR"
+echo "Testing MuseScore MIDI -> MusicXML conversion..."
+echo "  MuseScore: $MSCORE_BIN"
 echo ""
 
 # Count MIDI files
 MIDI_COUNT=$(find "$PRED_DIR" -name "*.mid" -o -name "*.midi" 2>/dev/null | wc -l)
 echo "Found $MIDI_COUNT MIDI files to convert."
-echo ""
 
-# Conversion is handled by mt3_evaluate.py during evaluation
-# This step is mainly for visibility
-echo "Note: Conversion will be performed during evaluation step."
+# Test conversion on a sample MIDI file
+SAMPLE_MIDI=$(find "$PRED_DIR" -name "*.mid" -o -name "*.midi" 2>/dev/null | head -1)
+
+if [[ -z "$SAMPLE_MIDI" ]]; then
+    echo "ERROR: No MIDI files found for testing!"
+    exit 1
+fi
+
+SAMPLE_NAME=$(basename "$SAMPLE_MIDI" .mid)
+TEST_OUTPUT="/tmp/mscore_test_${SAMPLE_NAME}.musicxml"
+
+echo "Testing conversion with: $(basename "$SAMPLE_MIDI")"
+
+# Run MuseScore conversion test (suppress Qt warnings)
+"$MSCORE_BIN" "$SAMPLE_MIDI" -o "$TEST_OUTPUT" --force >/dev/null 2>&1
+MSCORE_EXIT_CODE=$?
+
+if [[ $MSCORE_EXIT_CODE -ne 0 ]]; then
+    echo ""
+    echo "ERROR: MuseScore conversion failed (exit code: $MSCORE_EXIT_CODE)"
+    echo "Please check MuseScore installation: $MSCORE_BIN"
+    exit 1
+fi
+
+if [[ ! -f "$TEST_OUTPUT" ]]; then
+    echo ""
+    echo "ERROR: MuseScore did not produce output file!"
+    exit 1
+fi
+
+# Check output file size
+OUTPUT_SIZE=$(stat -c%s "$TEST_OUTPUT" 2>/dev/null || stat -f%z "$TEST_OUTPUT" 2>/dev/null)
+if [[ "$OUTPUT_SIZE" -lt 100 ]]; then
+    echo ""
+    echo "ERROR: MuseScore output file is too small (${OUTPUT_SIZE} bytes)"
+    exit 1
+fi
+
+# Cleanup test file
+rm -f "$TEST_OUTPUT"
+
+echo "MuseScore conversion test passed!"
+echo ""
+echo "Note: Full conversion will be performed during evaluation step."
 echo ""
 
 # =============================================================================
@@ -489,7 +527,7 @@ if [[ "$SKIP_EVALUATION" == false ]]; then
     echo ""
     echo "Results saved to: $OUTPUT_CSV"
     echo "Summary saved to: ${OUTPUT_CSV%.csv}.summary.json"
-    echo "MusicXML files saved to: $MUSICXML_DIR"
+    echo "MusicXML cached in: $MUSICXML_DIR"
     echo ""
 else
     echo "Skipping evaluation (--skip_evaluation)"
@@ -502,12 +540,12 @@ fi
 echo ""
 echo "Output directory structure:"
 echo "  ${OUTPUT_DIR}/"
-echo "  ├── musicxml/          # MuseScore converted MusicXML"
+echo "  ├── full_midi/           # Input: MT3 MIDI predictions"
+echo "  ├── full_musicxml/       # MuseScore converted MusicXML (cached)"
 if [[ "$MODE" == "chunks" ]]; then
-    echo "  ├── musicxml_cache/    # Cached MusicXML conversions"
-    echo "  ├── chunk_midi/        # Extracted 5-bar chunk MIDI files"
-    echo "  ├── timeouts.txt       # Chunks that exceeded timeout"
-    echo "  ├── errors.txt         # Chunks with errors"
+    echo "  ├── chunk_midi/          # Extracted 5-bar chunk MIDI files"
+    echo "  ├── timeouts.txt         # Chunks that exceeded timeout"
+    echo "  ├── errors.txt           # Chunks with errors"
 fi
 echo "  └── results/"
 echo "      ├── ${MODE}_song.csv"

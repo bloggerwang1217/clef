@@ -47,8 +47,8 @@ import yaml
 from tqdm import tqdm
 
 # Import shared modules
-from evaluation.mv2h import MV2HEvaluator, MV2HResult, aggregate_mv2h_results, print_mv2h_summary
-from evaluation.asap import ASAPDataset, ChunkInfo, extract_measures_to_midi
+from src.evaluation.mv2h import MV2HEvaluator, MV2HResult, aggregate_mv2h_results, print_mv2h_summary
+from src.evaluation.asap import ASAPDataset, ChunkInfo, extract_measures_to_midi
 
 # =============================================================================
 # LOGGING
@@ -486,19 +486,23 @@ def convert_to_musicxml_cached(
     Caching ensures each MIDI file is only converted once, even when
     extracting multiple chunks from the same prediction.
 
+    MusicXML files are stored in data/experiments/mt3/full_musicxml/
+    to allow reuse across evaluation runs.
+
     Args:
         midi_path: Path to input MIDI file
-        cache_dir: Directory to store converted MusicXML files
+        cache_dir: Directory to store converted MusicXML files (unused, kept for API compatibility)
         config: MuseScore configuration
 
     Returns:
         Path to MusicXML file or None if conversion failed
     """
-    # Create cache path based on MIDI filename
-    midi_stem = Path(midi_path).stem
-    cache_subdir = Path(cache_dir) / "musicxml_cache"
+    # Fixed MusicXML output directory for reuse across runs
+    cache_subdir = Path("data/experiments/mt3/full_musicxml")
     cache_subdir.mkdir(parents=True, exist_ok=True)
 
+    # Create cache path based on MIDI filename
+    midi_stem = Path(midi_path).stem
     musicxml_path = cache_subdir / f"{midi_stem}.musicxml"
 
     # Return cached version if exists
@@ -769,6 +773,7 @@ def run_chunk_evaluation(
     chunk_csv: str,
     output_dir: str,
     config: EvalConfig,
+    musicxml_dir: Optional[str] = None,
 ) -> Tuple[List[EvalResult], Dict[str, Any]]:
     """
     Run 5-bar chunk evaluation with actual measure extraction.
