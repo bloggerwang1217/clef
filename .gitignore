@@ -78,11 +78,8 @@ checkpoints/
 runs/
 wandb/
 
-# Audio data (keep samples small)
-data*/
-*.mp3
-*.flac
-*.ogg
+# Data (keep samples small)
+data/
 
 # SoundFonts
 *.sf2
