@@ -1,0 +1,5 @@
+date,model,dataset,n_success,n_total,coverage,multi_pitch,voice,value,harmony,mv2h,meter,notes
+2024-05-22,Zeng et al. (Paper),ASAP test,,,,0.6330,0.8840,0.9070,0.5450,0.7420,,Original paper baseline (4-metric MV2H)
+2026-01-16,Zeng (Reproduction),ASAP test,,,,0.6395,0.8893,0.8932,0.5720,0.7485,0.3316,First reproduction with Converter21 - coverage not reported
+2026-01-19,MT3 + MuseScore (Success Set),ASAP test (chunks),3335,9363,0.3563,0.2150,0.5740,0.7030,0.7570,0.5620,0.1190,5-bar chunk eval - Success set only
+2026-01-19,MT3 + MuseScore (Full Set),ASAP test (chunks),3335,9363,0.3563,0.0760,0.2050,0.2510,0.2690,0.2000,0.0430,5-bar chunk eval - Full set (failures=0)
