@@ -18,12 +18,13 @@ Processing modes (via preset parameter):
 - None (default): No filtering (clef-tutti)
 """
 
+import json
 import re
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from src.score.clean_kern import clean_kern_sequence
+from src.score.clean_kern import clean_kern_sequence, extract_visual_from_sequence, strip_non_kern_spines
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class HumSynProcessor:
         self,
         input_dir: Path,
         output_dir: Path,
+        visual_dir: Optional[Path] = None,
         selected_chopin_path: Optional[Path] = None,
         preset: Optional[str] = None,
     ):
@@ -65,6 +67,8 @@ class HumSynProcessor:
         Args:
             input_dir: Path to HumSyn directory (data/datasets/HumSyn)
             output_dir: Path to output directory for processed kern files
+            visual_dir: Path to output directory for visual info JSON files.
+                        If None, visual info is not saved.
             selected_chopin_path: Path to selected_chopin.txt for filtering
             preset: Processing preset:
                 - "clef-piano-base": Chopin filter + Joplin remove **dynam & repeats
@@ -77,11 +81,16 @@ class HumSynProcessor:
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.visual_dir = Path(visual_dir) if visual_dir else None
+        if self.visual_dir:
+            self.visual_dir.mkdir(parents=True, exist_ok=True)
         self.preset = preset
 
         # Determine what filters to apply based on preset
         self.filter_chopin = preset in {"clef-piano-base", "clef-piano-full"}
         self.strip_joplin = preset == "clef-piano-base"
+        # clef-piano-base: remove all non-kern; clef-piano-full: keep **dynam
+        self.keep_dynam = preset == "clef-piano-full"
 
         # Load Chopin selection list (when filtering is enabled)
         self.selected_chopin: Optional[Set[str]] = None
@@ -158,7 +167,9 @@ class HumSynProcessor:
         name = filename[:-4] if filename.endswith(".krn") else filename
         return name in self.selected_chopin
 
-    def process_one(self, krn_path: Path, repo_name: str) -> Optional[str]:
+    def process_one(
+        self, krn_path: Path, repo_name: str
+    ) -> Optional[Tuple[str, List[List[Dict[str, Any]]]]]:
         """Process a single kern file.
 
         Args:
@@ -166,7 +177,8 @@ class HumSynProcessor:
             repo_name: Name of the HumSyn repository
 
         Returns:
-            Processed kern content, or None if file should be skipped
+            Tuple of (cleaned kern content, visual info), or None if file should be skipped.
+            Visual info is extracted BEFORE cleaning to preserve stem/beam/position markers.
         """
         filename = krn_path.name
 
@@ -188,10 +200,16 @@ class HumSynProcessor:
         if repo_name == "joplin" and self.strip_joplin:
             kern_raw = self._strip_joplin_extras(kern_raw)
 
-        # Apply unified kern cleaning
+        # Strip non-kern spines (keep_dynam=True for clef-piano-full)
+        kern_raw = strip_non_kern_spines(kern_raw, keep_dynam=self.keep_dynam)
+
+        # CRITICAL: Extract visual info BEFORE cleaning (preserves stem/beam/position)
+        visual_info = extract_visual_from_sequence(kern_raw)
+
+        # Apply unified kern cleaning (removes visual markers)
         kern_cleaned = clean_kern_sequence(kern_raw, warn_tuplet_ratio=False)
 
-        return kern_cleaned
+        return kern_cleaned, visual_info
 
     def process_all(self) -> Dict[str, str]:
         """Process all HumSyn repositories.
@@ -217,16 +235,24 @@ class HumSynProcessor:
                 output_name = f"{repo_name.replace('-', '_')}_{krn_path.stem}.krn"
 
                 try:
-                    processed = self.process_one(krn_path, repo_name)
+                    result = self.process_one(krn_path, repo_name)
 
-                    if processed is None:
+                    if result is None:
                         results[output_name] = "skipped"
                         continue
 
-                    # Write output
+                    kern_cleaned, visual_info = result
+
+                    # Write cleaned kern
                     output_path = self.output_dir / output_name
                     with open(output_path, "w", encoding="utf-8") as f:
-                        f.write(processed)
+                        f.write(kern_cleaned)
+
+                    # Write visual info if visual_dir is configured
+                    if self.visual_dir:
+                        visual_path = self.visual_dir / output_name.replace(".krn", ".json")
+                        with open(visual_path, "w", encoding="utf-8") as f:
+                            json.dump(visual_info, f)
 
                     results[output_name] = "success"
 

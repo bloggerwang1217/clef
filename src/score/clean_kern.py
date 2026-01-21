@@ -42,6 +42,134 @@ from typing import List, Tuple, Dict, Any
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Visual Information Extraction (for Visual Auxiliary Head ground truth)
+# ============================================================================
+
+def extract_visual_info(token: str) -> Dict[str, Any]:
+    """
+    Extract visual layout information from a Kern token.
+
+    This function extracts visual rendering hints that are typically removed
+    during cleaning for the main sequence, but preserved for the Visual
+    Auxiliary Head as ground truth.
+
+    Args:
+        token: Raw Kern token from converter21 (e.g., '8cc>/L', '4g/', '8dd\\J')
+
+    Returns:
+        Dict with keys:
+        - 'stem': 'up' | 'down' | None
+        - 'beam': List of beam markers ['L', 'J', 'k', 'K'] or None
+        - 'above_below': 'above' | 'below' | None
+
+    Examples:
+        >>> extract_visual_info("8cc>/L")
+        {'stem': 'up', 'beam': ['L'], 'above_below': 'above'}
+        >>> extract_visual_info("4g/")
+        {'stem': 'up', 'beam': None, 'above_below': None}
+        >>> extract_visual_info("8dd\\J")
+        {'stem': 'down', 'beam': ['J'], 'above_below': None}
+    """
+    visual_info: Dict[str, Any] = {}
+
+    # Stem direction (cleaned by clean_kern_token)
+    # / = stem up, \ = stem down
+    if '/' in token:
+        visual_info['stem'] = 'up'
+    elif '\\' in token:
+        visual_info['stem'] = 'down'
+    else:
+        visual_info['stem'] = None
+
+    # Beam markers (preserved in clean_kern_token by default)
+    # L = beam start, J = beam end, k = partial beam back, K = partial beam forward
+    beam = []
+    for marker in ['L', 'J', 'k', 'K']:
+        if marker in token:
+            beam.append(marker)
+    visual_info['beam'] = beam if beam else None
+
+    # Above/below staff markers (cleaned from note tokens)
+    # > = above middle line, < = below middle line
+    if '>' in token:
+        visual_info['above_below'] = 'above'
+    elif '<' in token:
+        visual_info['above_below'] = 'below'
+    else:
+        visual_info['above_below'] = None
+
+    return visual_info
+
+
+def extract_visual_from_sequence(sequence: str) -> List[List[Dict[str, Any]]]:
+    """
+    Extract visual info for each token in a sequence.
+
+    This function processes an entire Kern sequence and extracts visual
+    information for each token, including the spine index (Voice position).
+
+    Args:
+        sequence: Newline-separated lines, each line is tab-separated tokens
+
+    Returns:
+        List of lines, each line is list of dicts:
+        [
+            [  # line 0
+                {'stem': 'up', 'beam': ['L'], 'above_below': None, 'spine_index': 0},
+                {'stem': None, 'beam': None, 'above_below': None, 'spine_index': 1},
+            ],
+            [  # line 1
+                {'stem': 'down', 'beam': ['J'], 'above_below': None, 'spine_index': 0},
+                ...
+            ],
+        ]
+
+    Note:
+        spine_index represents the Voice position within the Part.
+        In Humdrum, spines are tab-separated columns representing voices.
+        Control tokens (barlines, interpretations, comments) are skipped.
+
+    Examples:
+        >>> seq = "8cc/L\\t4g\\n8dd\\\\J\\t4a"
+        >>> visual_seq = extract_visual_from_sequence(seq)
+        >>> visual_seq[0][0]
+        {'stem': 'up', 'beam': ['L'], 'above_below': None, 'spine_index': 0}
+    """
+    lines = sequence.split('\n')
+    result: List[List[Dict[str, Any]]] = []
+
+    for line in lines:
+        # Skip control lines (barlines, interpretations, comments)
+        if line.startswith(('=', '*', '!')) or line.strip() == '':
+            continue
+
+        if '\t' in line:
+            tokens = line.split('\t')
+        else:
+            tokens = [line]
+
+        line_visual: List[Dict[str, Any]] = []
+        for spine_index, token in enumerate(tokens):
+            # Skip placeholder tokens
+            if token in ('.', '', 'q'):
+                line_visual.append({
+                    'stem': None,
+                    'beam': None,
+                    'above_below': None,
+                    'spine_index': spine_index,
+                })
+                continue
+
+            visual = extract_visual_info(token)
+            visual['spine_index'] = spine_index
+            line_visual.append(visual)
+
+        result.append(line_visual)
+
+    return result
+
+
 def check_tuplet_ratio_notation(token: str) -> bool:
     """
     Check if token contains Humdrum tuplet ratio notation (X%Y).
@@ -67,7 +195,7 @@ def check_tuplet_ratio_notation(token: str) -> bool:
     return False
 
 
-def clean_kern_token(token: str, preserve_ties: bool = True) -> str:
+def clean_kern_token(token: str, preserve_ties: bool = True, preserve_articulation: bool = False) -> str:
     """
     Remove visual layout information from a single Kern token.
 
@@ -78,6 +206,9 @@ def clean_kern_token(token: str, preserve_ties: bool = True) -> str:
     Args:
         token: Raw Kern token from converter21 (e.g., '8rGG', '4g/', '8cc\\')
         preserve_ties: Whether to keep tie markers ([, ], _). Zeng's model uses ties.
+        preserve_articulation: If True, keep articulation marks (' ~ ^ : ` O x v w).
+                               Use True for clef-piano-full, False for clef-piano-base.
+                               Default: False (Zeng vocab doesn't include articulation).
 
     Returns:
         Cleaned token with only semantic information (e.g., '8r', '4g', '8cc')
@@ -87,8 +218,10 @@ def clean_kern_token(token: str, preserve_ties: bool = True) -> str:
         '8r'
         >>> clean_kern_token('4g/')
         '4g'
-        >>> clean_kern_token('4.c~')
+        >>> clean_kern_token('4.c~')  # preserve_articulation=False (default)
         '4.c'
+        >>> clean_kern_token('4.c~', preserve_articulation=True)
+        '4.c~'
         >>> clean_kern_token('4c_')  # With preserve_ties=True
         '4c_'
         >>> clean_kern_token('48.ff')  # Dotted triplet conversion
@@ -259,33 +392,73 @@ def clean_kern_token(token: str, preserve_ties: bool = True) -> str:
     # =========================================================================
     #    Examples: 4g/ (stem up), 8cc\ (stem down)
     #    In **kern spine: / and \ are stem directions (always remove)
-    #    In **kern spine: > and < are above/below staff markers (remove from note tokens)
-    #    In **dynam spine: < and > are crescendo/decrescendo (preserve standalone)
+    #    In **kern spine: / \ are stem directions (visual only)
+    #    In **kern spine: > < can be above/below markers OR accents (context-dependent)
     #
-    #    Strategy: Remove / \ always; remove > < only from note/rest tokens (with duration)
+    #    Strategy: Remove / \ always; > < handled in articulation section
     token = re.sub(r'[/\\]', '', token)  # Always remove stem up/down
 
-    # Only remove > < from tokens that have duration prefix (note/rest tokens)
-    # Preserve standalone < > (used in **dynam spine for crescendo/decrescendo)
-    if re.match(r'^\d', token):
-        token = re.sub(r'[><]', '', token)
+    # =========================================================================
+    # 5b. EDITORIAL/VISUAL MARKERS (always remove, regardless of preserve_articulation)
+    # =========================================================================
+    #    X : cautionary/explicit accidental ("show this accidental even if not required")
+    #    y : invisible/hidden symbol (visual only)
+    #    z : editorial Z / printed rest marker
+    #    N : editorial note marker ("editor added this")
+    #    * : editorial footnote (when inside token, not at line start)
+    #    = : editorial accidental marker (editor added this accidental)
+    #    ? : uncertainty marker (editor unsure about this note)
+    #    These are pure visual hints with no audible effect
+    token = re.sub(r'[XyzN*=?]', '', token)
 
     # =========================================================================
-    # 6. ARTICULATION AND ORNAMENT MARKS (not in Zeng's vocabulary)
+    # 6. ARTICULATION AND ORNAMENT MARKS
     # =========================================================================
-    #    Common marks in MusicXML/Humdrum:
+    #    These have AUDIBLE effects and should be preserved for clef-piano-full.
+    #    For clef-piano-base (Zeng vocab), remove them since Zeng doesn't have these.
+    #
+    #    Ornaments (audible):
+    #    T : trill (rapid alternation)
+    #    M : mordent
+    #    S : turn
+    #    m : mordent (lowercase variant)
+    #    s : spiccato / signum
+    #    t : inverted mordent
+    #    p : appoggiatura
+    #    P : acciaccatura (grace note with slash)
+    #    ~ : trill (alternate notation)
+    #
+    #    Articulations (audible):
     #    ' : staccato
-    #    ; : fermata (NOTE: ';' IS in Zeng's vocab, but often appears with position)
-    #    ~ : trill
     #    ^ : accent
+    #    > < : accent / emphasis (when in note token, not standalone)
+    #    ; : fermata
     #    : : stress
     #    ` : attack
-    #    O : harmonic/open
-    #    x : editorial mark
+    #
+    #    Other marks:
+    #    O : harmonic/open string
+    #    x : editorial accidental (lowercase)
     #    v : up bow
-    #    M : down bow
+    #    u : down bow (alternate)
     #    w : wedge
-    token = re.sub(r"['~^:`Oxvw]", '', token)
+    #    & : editorial
+    #    @ : ?
+    #    i j : ?
+    #    + : ? (possibly double sharp modifier in some encodings)
+    #    Z : ? (editorial)
+    #
+    #    Audible ornaments/articulations (keep for clef-piano-full):
+    #    W : Wagnerian turn (special ornament)
+    #    $ : Seufzer / inverted turn (sigh ornament)
+    #    ! : Sforzando (sudden strong accent) - note: ! at line start is comment
+    #    | : Breath mark / pause (affects phrasing)
+    #
+    #    preserve_articulation=False (default): Remove ALL for clef-piano-base (Zeng vocab)
+    #    preserve_articulation=True: Keep audible ornaments/articulations for clef-piano-full
+    if not preserve_articulation:
+        # Remove all articulation and ornament marks for Zeng compatibility
+        token = re.sub(r"[TMSmstpP'~^><;:`Oxvuw&@ijZ+W$!|]", '', token)
 
     # =========================================================================
     # 7. BEAM MARKERS (optional: Zeng's model may or may not use these)
@@ -309,16 +482,169 @@ def clean_kern_token(token: str, preserve_ties: bool = True) -> str:
     if not preserve_ties:
         token = re.sub(r'[\[\]_]', '', token)
 
+    # =========================================================================
+    # 10. UNICODE / NON-ASCII CLEANUP (always remove)
+    # =========================================================================
+    #    Kern standard is ASCII-only. Any Unicode is likely encoding errors
+    #    from HumSyn data (e.g., …, π, Ω found in Mozart/Beethoven sonatas).
+    token = ''.join(c for c in token if ord(c) < 128)
+
     return token
 
 
-def clean_kern_sequence(sequence: str, preserve_ties: bool = True, warn_tuplet_ratio: bool = True) -> str:
+def strip_non_kern_spines(content: str, keep_dynam: bool = False) -> str:
+    """
+    Remove non-kern spines from Humdrum content.
+
+    Handles spine splits (*^), joins (*v), and terminations (*-) correctly
+    by tracking which columns correspond to **kern spines throughout the file.
+
+    Args:
+        content: Raw Humdrum content with multiple spine types
+        keep_dynam: If True, preserve **dynam spines (for clef-piano-full).
+                    If False, only keep **kern spines (for clef-piano-base).
+
+    Returns:
+        Humdrum content with only **kern (and optionally **dynam) spines
+
+    Spine handling:
+        - clef-piano-base (keep_dynam=False): Keep only **kern
+        - clef-piano-full (keep_dynam=True): Keep **kern and **dynam
+        - Always remove: **text, **fing, and other non-kern spines
+
+    Note:
+        **text may contain expression markings (see docs/clef-plan.md 6.1),
+        which will be recovered via layout comment parsing in future.
+    """
+    lines = content.split('\n')
+    result_lines = []
+
+    # Track spine types for each column (updated on spine operations)
+    spine_types: List[str] = []
+    initialized = False
+
+    for line in lines:
+        # Skip empty lines
+        if not line.strip():
+            result_lines.append(line)
+            continue
+
+        # Global comments (no tabs, start with !!!)
+        if line.startswith('!!!'):
+            result_lines.append(line)
+            continue
+
+        # Check if line has columns
+        if '\t' not in line:
+            # Single column line - keep if it's a global comment or special
+            if line.startswith('!') or line.startswith('*'):
+                result_lines.append(line)
+            else:
+                result_lines.append(line)
+            continue
+
+        cols = line.split('\t')
+
+        # Initial spine declaration
+        if line.startswith('**'):
+            spine_types = cols.copy()
+            initialized = True
+            # Filter to keep only desired spines
+            keep_cols = []
+            for i, st in enumerate(spine_types):
+                if st == '**kern':
+                    keep_cols.append(i)
+                elif st == '**dynam' and keep_dynam:
+                    keep_cols.append(i)
+            # Build filtered line
+            filtered = [cols[i] for i in keep_cols]
+            if filtered:
+                result_lines.append('\t'.join(filtered))
+            continue
+
+        if not initialized:
+            # Before spine declaration, keep everything
+            result_lines.append(line)
+            continue
+
+        # Determine which columns to keep based on current spine_types
+        keep_cols = []
+        for i, st in enumerate(spine_types):
+            if i >= len(cols):
+                break
+            if st == '**kern':
+                keep_cols.append(i)
+            elif st == '**dynam' and keep_dynam:
+                keep_cols.append(i)
+
+        # Handle spine manipulators
+        if line.startswith('*'):
+            new_spine_types = []
+            src_idx = 0
+            i = 0
+            while i < len(cols):
+                if src_idx >= len(spine_types):
+                    break
+                col = cols[i]
+
+                if col == '*^':
+                    # Split: one spine becomes two with same type
+                    new_spine_types.append(spine_types[src_idx])
+                    new_spine_types.append(spine_types[src_idx])
+                    src_idx += 1
+                    i += 1
+                elif col == '*v':
+                    # Join: count consecutive *v tokens to determine merge count
+                    # N consecutive *v merge N spines into 1
+                    v_count = 1
+                    while i + v_count < len(cols) and cols[i + v_count] == '*v':
+                        v_count += 1
+                    # Merge v_count spines into one
+                    new_spine_types.append(spine_types[src_idx])
+                    src_idx += v_count
+                    i += v_count
+                elif col == '*-':
+                    # Terminate: remove this spine
+                    src_idx += 1
+                    i += 1
+                else:
+                    # Regular spine data (clef, key, meter, etc.)
+                    new_spine_types.append(spine_types[src_idx])
+                    src_idx += 1
+                    i += 1
+
+            spine_types = new_spine_types
+            # NOTE: Don't rebuild keep_cols here!
+            # The original keep_cols (from before spine operations) is correct
+            # for filtering the CURRENT line. The updated spine_types will
+            # affect the NEXT line's keep_cols determination.
+
+        # Filter columns
+        filtered = []
+        for i in keep_cols:
+            if i < len(cols):
+                filtered.append(cols[i])
+
+        if filtered:
+            result_lines.append('\t'.join(filtered))
+
+    return '\n'.join(result_lines)
+
+
+def clean_kern_sequence(
+    sequence: str,
+    preserve_ties: bool = True,
+    preserve_articulation: bool = False,
+    warn_tuplet_ratio: bool = True,
+) -> str:
     """
     Clean an entire Kern sequence (one measure or multi-measure chunk).
 
     Args:
         sequence: Tab-separated or newline-separated Kern tokens
         preserve_ties: Whether to keep tie markers
+        preserve_articulation: Whether to keep articulation marks (' ~ ^ : ` O x v w).
+                               Use True for clef-piano-full, False for clef-piano-base.
         warn_tuplet_ratio: Whether to log warning for tuplet ratio notation (%)
 
     Returns:
@@ -328,6 +654,8 @@ def clean_kern_sequence(sequence: str, preserve_ties: bool = True, warn_tuplet_r
         >>> seq = "8rGG\t4g/\t8cc\\\t4.c~"
         >>> clean_kern_sequence(seq)
         '8r\t4g\t8cc\t4.c'
+        >>> clean_kern_sequence(seq, preserve_articulation=True)
+        '8r\t4g\t8cc\t4.c~'
     """
     # Check for tuplet ratio notation (%) - will cause KeyError, Zeng also skips these
     if warn_tuplet_ratio and '%' in sequence:
@@ -343,11 +671,11 @@ def clean_kern_sequence(sequence: str, preserve_ties: bool = True, warn_tuplet_r
         if '\t' in line:
             # Tab-separated tokens
             tokens = line.split('\t')
-            cleaned_tokens = [clean_kern_token(t, preserve_ties) for t in tokens]
+            cleaned_tokens = [clean_kern_token(t, preserve_ties, preserve_articulation) for t in tokens]
             cleaned_lines.append('\t'.join(cleaned_tokens))
         else:
             # Single token or control line
-            cleaned_lines.append(clean_kern_token(line, preserve_ties))
+            cleaned_lines.append(clean_kern_token(line, preserve_ties, preserve_articulation))
 
     return '\n'.join(cleaned_lines)
 

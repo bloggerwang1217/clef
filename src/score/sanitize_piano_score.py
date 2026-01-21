@@ -12,6 +12,7 @@ Date: 2026-01-15
 
 import music21 as m21
 from collections import defaultdict
+from typing import Dict, List, Tuple, Union
 
 
 def sanitize_score(score):
@@ -302,39 +303,84 @@ def snap_dynamics_to_notes(score):
                 continue
 
 
-def heal_cross_staff(score):
+def heal_cross_staff(
+    score, record_movements: bool = False
+) -> Union[int, Tuple[int, List[Dict]]]:
     """
     Repair cross-staff notes by moving them to their logical owner Part.
-    
+
     Cross-staff notation places notes visually on one staff but logically belonging
     to another. music21 parses based on visual <staff> tag, causing notes to be
     misplaced. This function detects and fixes such cases.
-    
+
     Updated 2026-01-15: Now supports ASYMMETRIC Voice structures.
-    
+    Updated 2026-01-21: Added record_movements for Visual Auxiliary Head ground truth.
+
     Detection logic:
     1. ASYMMETRIC case (NEW): One Part has Voices, the other doesn't
        - Detects when a Voice in Part 1 should belong to Part 0 (or vice versa)
        - Criteria: Voice ends exactly where the other Part's notes begin
        - Criteria: Combined duration ≈ measure duration
        - Action: Move notes directly to the target Part (without creating Voice wrapper)
-       
+
     2. SYMMETRIC case (existing): Both Parts have notes for the same Voice ID
        - Combined duration = 1x measure duration (complete voice split)
        - Move notes from Part with less coverage to Part with more coverage
-    
+
     Example fixes:
     - Chopin Etude Op.10 #8 Measure 22: Right hand scale starts on bass staff
     - Schubert Impromptu D.899 #2: Cross-staff arpeggios
-    
+
+    Args:
+        score: music21.stream.Score
+        record_movements: If True, return movement records for Visual Aux Head ground truth
+
     Returns:
-        int: Number of notes moved
+        int: Number of notes moved (if record_movements=False)
+        Tuple[int, List[Dict]]: (moved_count, movement_records) if record_movements=True
+
+        movement_records format:
+        [
+            {
+                'note_id': id(note),
+                'pitch': 'C4' or 'C4,E4,G4' for chords,
+                'measure': 22,
+                'offset': 2.0,
+                'from_part': 1,  # 0=upper, 1=lower
+                'to_part': 0,
+                'reason': 'asymmetric_voice' | 'empty_part_voice1' | 'symmetric_merge'
+            },
+            ...
+        ]
     """
     if len(score.parts) < 2:
-        return 0
-    
+        return (0, []) if record_movements else 0
+
     part0, part1 = score.parts[0], score.parts[1]
     moved = 0
+    movement_records: List[Dict] = []
+
+    def get_pitch_str(note_or_chord) -> str:
+        """Get pitch string for a note or chord."""
+        if isinstance(note_or_chord, m21.chord.Chord):
+            return ','.join(p.nameWithOctave for p in note_or_chord.pitches)
+        elif isinstance(note_or_chord, m21.note.Note):
+            return note_or_chord.nameWithOctave
+        else:
+            return 'rest'
+
+    def record_movement(note, measure_num: int, from_part: int, to_part: int, reason: str):
+        """Record a note movement if record_movements is enabled."""
+        if record_movements:
+            movement_records.append({
+                'note_id': id(note),
+                'pitch': get_pitch_str(note),
+                'measure': measure_num,
+                'offset': float(note.offset),
+                'from_part': from_part,
+                'to_part': to_part,
+                'reason': reason,
+            })
     
     # Get all measure numbers
     measure_nums = set()
@@ -382,6 +428,7 @@ def heal_cross_staff(score):
                     # If voice + m0 = complete measure, voice is cross-staff → move to m0
                     if abs(combined_dur - measure_duration) < 0.1 * measure_duration:
                         for note in notes:
+                            record_movement(note, mnum, from_part=1, to_part=0, reason='asymmetric_voice')
                             voice.remove(note)
                             m0.insert(note.offset, note)
                             moved += 1
@@ -413,6 +460,7 @@ def heal_cross_staff(score):
                         notes = list(voice.notesAndRests)
                         if notes:
                             for note in notes:
+                                record_movement(note, mnum, from_part=1, to_part=0, reason='empty_part_voice1')
                                 voice.remove(note)
                                 m0.insert(note.offset, note)
                                 moved += 1
@@ -437,6 +485,7 @@ def heal_cross_staff(score):
                     # If voice + m1 = complete measure, voice is cross-staff → move to m1
                     if abs(combined_dur - measure_duration) < 0.1 * measure_duration:
                         for note in notes:
+                            record_movement(note, mnum, from_part=0, to_part=1, reason='asymmetric_voice')
                             voice.remove(note)
                             m1.insert(note.offset, note)
                             moved += 1
@@ -454,6 +503,7 @@ def heal_cross_staff(score):
                         notes = list(voice.notesAndRests)
                         if notes:
                             for note in notes:
+                                record_movement(note, mnum, from_part=0, to_part=1, reason='empty_part_voice5')
                                 voice.remove(note)
                                 m1.insert(note.offset, note)
                                 moved += 1
@@ -520,6 +570,7 @@ def heal_cross_staff(score):
 
                     for item in p1_notes:
                         note = item['note']
+                        record_movement(note, mnum, from_part=1, to_part=0, reason='symmetric_merge')
                         item['voice'].remove(note)
                         target_v.insert(item['offset'], note)
                         moved += 1
@@ -538,11 +589,12 @@ def heal_cross_staff(score):
 
                     for item in p0_notes:
                         note = item['note']
+                        record_movement(note, mnum, from_part=0, to_part=1, reason='symmetric_merge')
                         item['voice'].remove(note)
                         target_v.insert(item['offset'], note)
                         moved += 1
 
-    return moved
+    return (moved, movement_records) if record_movements else moved
 
 
 def refresh_spanners_after_heal(score):

@@ -11,9 +11,10 @@ Pipeline:
 4. Clean kern sequence (remove visual tokens)
 """
 
+import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import converter21
 import music21 as m21
@@ -22,7 +23,7 @@ import music21 as m21
 converter21.register()
 
 from src.score.sanitize_piano_score import sanitize_score
-from src.score.clean_kern import clean_kern_sequence
+from src.score.clean_kern import clean_kern_sequence, extract_visual_from_sequence, strip_non_kern_spines
 
 logger = logging.getLogger(__name__)
 
@@ -33,25 +34,53 @@ class MuseSynProcessor:
     Uses converter21 for MusicXML → Humdrum conversion (better success rate than verovio).
     """
 
-    def __init__(self, input_dir: Path, output_dir: Path):
+    # Valid preset values (same as HumSynProcessor)
+    PRESETS = {"clef-piano-base", "clef-piano-full", None}
+
+    def __init__(
+        self,
+        input_dir: Path,
+        output_dir: Path,
+        visual_dir: Optional[Path] = None,
+        preset: Optional[str] = None,
+    ):
         """Initialize MuseSyn processor.
 
         Args:
             input_dir: Path to MuseSyn directory (data/datasets/MuseSyn)
             output_dir: Path to output directory for processed kern files
+            visual_dir: Path to output directory for visual info JSON files.
+                        If None, visual info is not saved.
+            preset: Processing preset:
+                - "clef-piano-base": Remove all non-kern spines
+                - "clef-piano-full": Keep **dynam spines
+                - None: No filtering (clef-tutti, default)
         """
+        if preset not in self.PRESETS:
+            raise ValueError(f"Invalid preset: {preset}. Must be one of {self.PRESETS}")
+
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.visual_dir = Path(visual_dir) if visual_dir else None
+        if self.visual_dir:
+            self.visual_dir.mkdir(parents=True, exist_ok=True)
+        self.preset = preset
 
-    def process_one(self, xml_path: Path) -> Optional[str]:
+        # clef-piano-base: remove all non-kern; clef-piano-full: keep **dynam
+        self.keep_dynam = preset == "clef-piano-full"
+
+    def process_one(
+        self, xml_path: Path
+    ) -> Optional[Tuple[str, List[List[Dict[str, Any]]]]]:
         """Process a single MusicXML file to kern.
 
         Args:
             xml_path: Path to the MusicXML file
 
         Returns:
-            Cleaned kern content, or None if processing failed
+            Tuple of (cleaned kern content, visual info), or None if processing failed.
+            Visual info is extracted from converter21 output BEFORE cleaning.
         """
         try:
             # 1. Parse MusicXML
@@ -70,10 +99,16 @@ class MuseSynProcessor:
             # Clean up temp file
             Path(kern_raw).unlink(missing_ok=True)
 
-            # 4. Clean kern sequence (remove visual tokens)
+            # 4. Strip non-kern spines (keep_dynam=True for clef-piano-full)
+            kern_content = strip_non_kern_spines(kern_content, keep_dynam=self.keep_dynam)
+
+            # 5. Extract visual info BEFORE cleaning (preserves stem/beam/position)
+            visual_info = extract_visual_from_sequence(kern_content)
+
+            # 6. Clean kern sequence (remove visual tokens)
             kern_cleaned = clean_kern_sequence(kern_content, warn_tuplet_ratio=False)
 
-            return kern_cleaned
+            return kern_cleaned, visual_info
 
         except Exception as e:
             logger.error(f"Error processing {xml_path}: {e}")
@@ -102,16 +137,24 @@ class MuseSynProcessor:
             output_name = f"musesyn_{xml_path.stem}.krn"
 
             try:
-                processed = self.process_one(xml_path)
+                result = self.process_one(xml_path)
 
-                if processed is None:
+                if result is None:
                     results[output_name] = "error: processing failed"
                     continue
 
-                # Write output
+                kern_cleaned, visual_info = result
+
+                # Write cleaned kern
                 output_path = self.output_dir / output_name
                 with open(output_path, "w", encoding="utf-8") as f:
-                    f.write(processed)
+                    f.write(kern_cleaned)
+
+                # Write visual info if visual_dir is configured
+                if self.visual_dir:
+                    visual_path = self.visual_dir / output_name.replace(".krn", ".json")
+                    with open(visual_path, "w", encoding="utf-8") as f:
+                        json.dump(visual_info, f)
 
                 results[output_name] = "success"
 

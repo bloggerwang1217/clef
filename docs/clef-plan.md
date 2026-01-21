@@ -286,6 +286,28 @@ Kern 格式中的 Tandem Interpretation（如 `*Ivioln` 表示小提琴，`*Icel
 *   **評估指標（Evaluation Metrics）**：傳統的詞錯誤率（WER）無法真實反映樂譜的可用性，因為它既不懂音樂語意，也不懂結構語法（Mayer et al., 2024）。因此，本研究將採用以下兩個互補的核心指標：
     *   **音樂性（Musicality） - MV2H**：該指標由 Zeng et al. （2024） 提出，專門評估轉錄結果在音樂層面的準確性，包含音高、和聲與節奏等多個維度。相較於無法理解多聲部垂直關係的 WER，MV2H 能更真實地反映音樂內容的正確性。
     *   **結構性（Structure） - TEDn**：該指標由 Calvo-Zaragoza et al. （2020） 提出並由 Mayer et al. （2024） 確立其重要性，用以評估輸出的 MusicXML 在語法結構上的正確性。相較於無法理解 XML 樹狀結構的 WER，TEDn 能有效衡量樂譜是否「語法正確」以致能被 MuseScore 等打譜軟體順利開啟與編輯，這對應了最終的產品可用性。
+
+**TEDn 的侷限與 Optimality Gap**：
+
+TEDn 評估的是 MusicXML 樹狀結構的編輯距離，但這混合了**語意正確性**與**視覺佈局**。根據對 TEDn 實作的分析（olimpic-icdar24），Note 編碼為 `PVT S`（Pitch + Voice + Type + Stem），其中 **Stem direction** 和 **Voice assignment** 都會被評估。然而，A2S 模型無法從音訊推斷這些視覺資訊：
+
+| 元素 | TEDn 評估？ | A2S 可推斷？ | 說明 |
+|------|-------------|-------------|------|
+| Pitch | ✅ | ✅ | 音高可從頻譜聽出 |
+| Duration/Type | ✅ | ✅ | 時值可從音訊聽出 |
+| Voice | ✅ | ⚠️ | 部分可推斷，但 cross-staff 會混淆 |
+| Stem direction | ✅ | ❌ | 純視覺資訊，無法從音訊推斷 |
+| Staff assignment | ✅ | ❌ | cross-staff 的選擇是編輯者決定 |
+
+因此，本研究提出 **Optimality Gap** 評估方法來公平衡量模型效能：
+
+```
+TEDn_conversion = TEDn(XML, XML→Kern→XML)  # 轉換本身的 loss（upper bound）
+TEDn_model = TEDn(XML, Model_Kern→XML)     # 模型的 loss
+Optimality Gap = TEDn_model - TEDn_conversion  # 模型真正的錯誤
+```
+
+此方法將「格式轉換造成的固有誤差」與「模型預測錯誤」明確區分，提供更具鑑別力的評估基準。
     
 *   **泛化能力驗證**：在合成資料上訓練後，將在 **ASAP Dataset**（真實人類鋼琴演奏資料）上進行 **Zero-shot** 測試，即模型在**未見過任何真實錄音資料**的情況下直接進行轉譜。此設計旨在驗證資料增強金字塔是否能讓模型具備跨領域泛化能力。測試結果將與 Zeng （CNN-based） 與 Zhang （Whisper-based） 進行對比，以驗證 ViT 架構的優越性。
 *   **消融實驗（Ablation Study）**：為釐清模型效能提升的來源，本研究將設計一系列對照組。透過比較不同編碼器架構（**Swin V2 + Bridge vs. ViT vs. CNN vs. Whisper**）與不同資料增強策略（基礎 vs. 強化）的組合表現，量化各設計決策的貢獻，並驗證兩者結合的協同效應。具體而言，實驗將包含：
@@ -357,3 +379,112 @@ Kern 格式中的 Tandem Interpretation（如 `*Ivioln` 表示小提琴，`*Icel
   - 利用 Transformer Decoder 的語言模型特性，實現 **「Implicit Quantization」（隱性量化）**。模型不計算絕對時間，而是預測最合理的「音樂語法」。
 
   - 重新定義輸出規格，從單純的音符列表升級為結構化樂譜，並使用 **MV2H** 與 **TEDn** 雙指標驗證其生態效度。
+
+***
+
+## 5. 論文發表策略
+
+本研究規劃分兩階段發表，針對不同會議的審稿偏好進行內容分工：
+
+### 5.1 ISMIR 2026：單樂器轉譜（clef-piano-base / clef-piano-full / clef-solo）
+
+**目標受眾**：音樂資訊檢索社群，重視音樂任務的實用性與可聽性。
+
+**策略**：
+- 清除視覺資訊（stem direction, beam 等）以簡化任務
+- 專注於語意正確性（MV2H）與 Optimality Gap 評估
+- 展示跨樂器泛化能力（Piano, Guitar, Violin, Voice）
+- Demo 截圖選擇視覺乾淨的段落
+
+**不做的事**：
+- Visual Auxiliary Head（留給 ICLR）
+- 深入討論 representation learning（不是 ISMIR 的重點）
+
+### 5.2 ICLR 2027：多樂器合奏 + Representation Learning（clef-piano / clef-tutti）
+
+**目標受眾**：機器學習社群，重視 representation learning 與 auxiliary loss 設計。
+
+**策略**：
+- **Visual Auxiliary Head**：學習視覺佈局（stem, beam, voice, staff assignment）
+- **Instrument Auxiliary Loss**：樂器分類輔助任務
+- 探討「學習視覺佈局是否幫助語意理解？」
+- 跨樂器 TDR + Aux Loss 的協同效應
+
+**Visual Auxiliary Head 設計**：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Kern Decoder                          │
+│            (Autoregressive Transformer)                 │
+│                                                         │
+│   Output: 4C  4E  4G  =  8D  8F# ...                   │
+│           ↓   ↓   ↓      ↓   ↓                         │
+│         [h₁] [h₂] [h₃] [h₄] [h₅]  ← hidden states      │
+└──────────┬──────────────────────────────────────────────┘
+           │
+           ├────────────────┐
+           │                │
+           ▼                ▼
+    ┌─────────────┐  ┌─────────────────┐
+    │ Main Head   │  │ Visual Aux Head │
+    │ (CE Loss)   │  │ (Aux Loss)      │
+    │             │  │                 │
+    │ next token  │  │ stem: up/down   │
+    │ prediction  │  │ beam: L/J/k     │
+    │             │  │ voice: 1/2/3/4  │
+    └─────────────┘  └─────────────────┘
+```
+
+**核心洞見**：視覺佈局是從音樂內容可推導的（如：中央 B 以上 stem down，Voice 1 stem up），這個輔助任務強迫模型理解結構，同時不會為了視覺資訊犧牲音符準確性。
+
+**Loss 設計**：
+```python
+L_total = L_main + λ_inst * L_instrument + λ_vis * L_visual
+# λ_vis 建議 0.1，避免視覺任務主導訓練
+```
+
+### 5.3 兩篇論文的關係
+
+| 面向 | ISMIR 2026 | ICLR 2027 |
+|------|------------|-----------|
+| **目標** | 單樂器轉譜 | 多樂器合奏 + Representation |
+| **視覺資訊** | 清掉（簡化） | 學習（Visual Aux Head） |
+| **Auxiliary Loss** | Instrument only | Instrument + Visual |
+| **TDR 策略** | 同樂器內隨機化 | 跨樂器隨機化 |
+| **核心貢獻** | 架構 + 評估方法 | Auxiliary Loss 設計 |
+| **Demo 重點** | 「能用」 | 「為什麼能用」|
+
+ISMIR 先打基礎，ICLR 再深入探討 representation。兩篇互補，不會自相矛盾。
+
+---
+
+## 6. 已知問題與待辦事項
+
+### 6.1 Humdrum Layout Comments 包含重要音樂資訊
+
+**問題**：Humdrum `!LO:` layout comments 包含大量無法從 `**dynam` spine 取得的音樂標記：
+
+| 類型 | 標記範例 | 數量 |
+|------|---------|------|
+| Dynamics | cresc., dim., dimin. | 700+ |
+| Tempo | rit., ritenuto, rall., stretto | 280+ |
+| Expression | dolce, legato, sempre, ten., marcato | 600+ |
+| Navigation | Fine, Coda | 100+ |
+
+**格式**：
+```humdrum
+!	!	!LO:TX:i:t=cresc.	!     ← layout comment（套用到下一行）
+4D	[2.FF#	[2.A [2.d	<          ← 資料行
+```
+
+**影響**：clef-piano-full 若只解析 `**dynam` spine，會遺失這些重要標記。
+
+**待辦**：實作 `extract_layout_comments()` 解析 `!LO:TX` / `!LO:DY` / `!LO:HP` 標記。
+
+### 6.2 Non-kern Spines 處理
+
+**現況**：converter21 輸出包含 `**text`、`**fing`、`**dynam` 等 spines，目前只有 Joplin 有移除邏輯。
+
+**待辦**：實作通用的 `strip_non_kern_spines(content, keep_dynam=False)`：
+- clef-piano-base：移除全部非 kern spines
+- clef-piano-full：保留 `**dynam`

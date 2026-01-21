@@ -1,14 +1,15 @@
-# Experiment Design: Universal Solo Transcription (ISMIR 2026)
+# Experiment Design: Multi-instrument Ensemble Transcription (ICLR 2027)
 
-本文件描述 Clef 針對 **通用單樂器轉譜 (Universal Solo Transcription)** 的實驗設計。
+本文件描述 Clef 針對 **多樂器合奏轉譜 (Multi-instrument Ensemble Transcription)** 的實驗設計。
 
-**目標定位**：為所有音樂家設計的通用單樂器轉譜系統 — 不只是「另一個鋼琴轉譜模型」。
+**目標定位**：處理多樂器合奏場景 — 從音訊中分離並轉錄多個樂器的樂譜。
 
-> 「因為我不是鋼琴家，我是曼陀林演奏家... 你能想像鋼琴家在歡呼，然後隔壁的小提琴演奏家、長笛演奏家冷眼說：『喔，阿不就是另外一個鋼琴的轉錄模型？輪到我還久的』」
+**建立於 ISMIR 2026 基礎上**：
+> "Building upon the piano-specific architecture proposed in [ISMIR 2026], we extend the Video-VLM framework to multi-instrument transcription via domain randomization and auxiliary loss..."
 
 **核心實驗**：
-- **Study 1（深度/Precision）**：鋼琴 A2S — 證明架構的深度能力
-- **Study 2（廣度/Breadth）**：Universal Solo — 證明跨樂器的泛化能力
+- **Study 1（深度/Precision）**：沿用 ISMIR 2026 的鋼琴深度驗證
+- **Study 2（廣度/Breadth）**：Multi-instrument Ensemble — 處理多樂器合奏場景
 
 ---
 
@@ -218,7 +219,7 @@ Stage 2: Fine-tuning (Real Recordings)
 1. **音色扭曲問題（Critical）**：
    - VQT 為了讓 C4 和 C5 看起來一樣，對頻譜進行非線性扭曲
    - 這導致**固定的共振峰特徵被扭曲**，小提琴的泛音結構在高低音域看起來不同
-   - 這對跨樂器泛化是毀滅性的打擊（模型難以從音色區分樂器）
+   - 這對 **Instrument Auxiliary Loss** 是毀滅性的打擊（無法區分樂器）
 
 2. **ImageNet 遷移相容性**：
    - Log-Mel 頻譜圖的「雲霧狀」紋理與自然圖像相似
@@ -257,14 +258,14 @@ Stage 2: Fine-tuning (Real Recordings)
 
 我們將進行消融實驗來驗證此決策：
 
-| 實驗 | 頻譜類型 | 預期 Piano MV2H | 預期跨樂器 MV2H | 預期結論 |
-|------|---------|-----------------|-----------------|---------|
-| Clef + VQT | VQT (60 bins/oct) | ~83% | ~45% | 音高高解析，但音色辨識差 |
-| **Clef + Log-Mel** | Log-Mel (128 bins) | **~85%** | **~58%** | **音色保留佳，ImageNet 相容** |
+| 實驗 | 頻譜類型 | 預期 MV2H | 樂器 F1 | 預期結論 |
+|------|---------|-----------|---------|---------|
+| Clef + VQT | VQT (60 bins/oct) | ~83% | ~75% | 音高高解析，但音色辨識差 |
+| **Clef + Log-Mel** | Log-Mel (128 bins) | **~86%** | **~90%** | **音色保留佳，ImageNet 相容** |
 
-**科學問題**：「對於跨樂器泛化，Log-Mel 是否比 VQT 更適合？」
+**科學問題**：「對於多聲部音樂轉譜，Log-Mel 是否比 VQT 更適合？」
 
-**預期結果**：Log-Mel 在跨樂器泛化上顯著優於 VQT，因為它保留了音色特徵（共振峰）。
+**預期結果**：Log-Mel 在 Overall MV2H 上勝出，特別是在 $F_{harm}$（和聲）與 Instrument F1 上顯著優於 VQT。
 
 ---
 
@@ -315,111 +316,99 @@ asap-dataset/
 └── metadata.csv
 ```
 
-### GAPS Dataset（Study 2 - 吉他）
+### URMP Dataset（Study 2 - 多樂器合奏）
 
-GAPS (Guitar Audio-to-Score) 是 2024 年發布的高品質古典吉他資料集，包含真實錄音與對齊的 MusicXML 樂譜。
+需要填表單申請下載。
 
 **來源**：
-- 論文: "GAPS: A Dataset for Guitar Audio-to-Score Transcription", ISMIR 2024
-- 規模: 14 小時 / 200+ 演奏者
+- 官網: https://labsites.rochester.edu/air/projects/URMP.html
+- 大小: 12.5GB
+
+**下載步驟**：
+1. 前往 [URMP 官網](https://labsites.rochester.edu/air/projects/URMP.html)
+2. 點擊 **"Download the whole dataset package"**
+3. 填寫 Google Form（學術用途）
+4. 收到 email 後下載
+
+**資料結構（使用 AuMix + AuSep）**：
+```
+URMP/
+├── 01_Jupiter_vn_vc/           # Duet: 小提琴 + 大提琴
+│   ├── AuMix_01_Jupiter.wav    # ✅ 混音音訊（測試輸入）
+│   ├── AuSep_1_vn_01.wav       # ✅ 小提琴分軌（Ground Truth）
+│   ├── AuSep_2_vc_01.wav       # ✅ 大提琴分軌（Ground Truth）
+│   ├── Sco_01_Jupiter.mid      # MIDI 樂譜
+│   └── Notes_1_vn_01.txt       # 音符標註
+├── 02_Sonata_fl_fl/            # Duet: 雙長笛
+└── ...（共 44 首）
+```
+
+**樂器分類**：
+| 類別 | 樂器 |
+|------|------|
+| Strings | violin (vn), viola (va), cello (vc), double bass (db) |
+| Winds | flute (fl), oboe (ob), clarinet (cl), saxophone (sax), bassoon (bn) |
+| Brass | trumpet (tpt), horn (hn), trombone (tbn), tuba (tba) |
+
+### Slakh2100 Dataset（Study 2 - 合成多軌混音）
+
+**來源**：
+- 官網: https://zenodo.org/record/4599666
+- 論文: Manilow et al., "Cutting Music Source Separation Some Slakh", ISMIR 2019
+- 大小: ~120GB
+
+**下載步驟**：
+```bash
+# 下載 Slakh2100 (需要大量空間！)
+wget https://zenodo.org/record/4599666/files/slakh2100_flac_16k.tar.gz
+
+# 或使用官方腳本
+pip install slakh
+slakh download --help
+```
 
 **資料結構**：
 ```
-GAPS/
-├── audio/              # 真實錄音 (WAV)
-├── scores/             # MusicXML 樂譜
-└── alignments/         # Audio-score 對齊資訊
+slakh2100_flac/
+├── Track00001/
+│   ├── mix.flac              # ✅ 混音音訊（測試輸入）
+│   ├── stems/
+│   │   ├── S01.flac          # ✅ 樂器 1 分軌
+│   │   ├── S02.flac          # ✅ 樂器 2 分軌
+│   │   └── ...
+│   └── MIDI/
+│       ├── S01.mid           # MIDI Ground Truth
+│       └── ...
+└── ...（共 2100 首）
 ```
 
-**為什麼選 GAPS 而不是 GuitarSet？**
-- GuitarSet 只有 JAMS 格式（MIDI-like），**沒有 MusicXML**
-- GAPS 有完整的 MusicXML 樂譜，可直接用 MV2H 評估
+**樂器分類（MIDI Program Number）**：
+| 類別 | 樂器範例 |
+|------|---------|
+| Piano (0-7) | Acoustic Grand, Electric Piano |
+| Guitar (24-31) | Acoustic Guitar, Electric Guitar |
+| Bass (32-39) | Acoustic Bass, Electric Bass |
+| Strings (40-55) | Violin, Viola, Cello, Ensemble |
+| Brass (56-63) | Trumpet, Trombone, Tuba |
+| Reed (64-79) | Saxophone, Clarinet, Oboe |
+| Drums (N/A) | Drum Kit (不轉譜) |
 
-### Bach Violin Dataset（Study 2 - 小提琴）
+**Slakh2100 的優勢**：
+- 大規模：2100 首，比 URMP 多 47 倍
+- 多樂器：每首 4-8 軌，涵蓋流行/搖滾樂器
+- 高品質 MIDI：來自 Lakh MIDI Dataset，經過人工校正
 
-Bach Solo Violin 作品 BWV 1001-1006 的真實錄音與對齊樂譜。
+**Slakh2100 的劣勢**：
+- 合成音訊：使用 VST 合成，不是真實錄音
+- Sim-to-Real Gap：需要驗證在真實錄音（URMP）上的泛化能力
 
-**來源**：
-- 規模: 6.5 小時 / 17 位演奏家
-- 曲目: Bach Solo Violin Sonatas & Partitas (BWV 1001-1006)
-
-**資料結構**：
-```
-BachViolin/
-├── audio/              # 17 位演奏家的錄音
-├── scores/             # MusicXML 樂譜
-└── alignments/         # Performance-score 對齊
-```
-
-**特點**：
-- 標準曲目，審稿人熟悉
-- 單聲部（容易對齊）
-- 高品質專業錄音
-
-### GTSinger Dataset（Study 2 - 人聲）
-
-NeurIPS 2024 發布的大規模人聲資料集，包含真實演唱與對齊樂譜。
-
-**來源**：
-- 論文: "GTSinger: A Global Multi-Technique Singing Corpus", NeurIPS 2024
-- 規模: 80+ 小時 / 20 位歌手 / 9 語言
-
-**資料結構**：
-```
-GTSinger/
-├── audio/              # 真實演唱錄音
-├── scores/             # MusicXML 樂譜
-└── metadata/           # 語言、技巧標註
-```
-
-**特點**：
-- 目前最大的有樂譜人聲資料集
-- 多語言、多技巧
-- 與 MTC-ANN（荷蘭民謠 Kern）互補
-
-### MTC-ANN Dataset（Study 2 - 人聲/民謠，Kern 格式）
-
-Meertens Tune Collections 的標註子集，包含荷蘭田野錄音與 Kern 樂譜。
-
-**來源**：
-- 官網: https://www.liederenbank.nl/mtc/
-- 規模: 360 首 / 原生 Kern 格式
-- 授權: CC BY-NC-SA 3.0
-
-**特點**：
-- 真正的田野錄音（1950s-1980s）
-- 原生 Kern 格式（不需轉換）
-- 單聲部旋律
-
-**限制**：
-- 規模較小
-- 錄音品質參差（田野錄音）
-- 荷蘭語民謠，風格偏離古典
-
-### Evaluation Datasets 總覽
-
-| 資料集 | 樂器 | 規模 | 樂譜格式 | 狀態 |
-|--------|------|------|----------|------|
-| **ASAP** | 🎹 鋼琴 | 92+ 小時 / 1,068 performances | MusicXML | ✅ 可用 |
-| **GAPS** | 🎸 古典吉他 | 14 小時 / 200+ 演奏者 | MusicXML | ✅ 可用 |
-| **Bach Violin** | 🎻 小提琴 | 6.5 小時 / 17 位演奏家 | MusicXML | ✅ 可用 |
-| **GTSinger** | 🎤 人聲 | 80+ 小時 / 9 語言 | MusicXML | ✅ 可用 |
-| **MTC-ANN** | 🎤 人聲（民謠） | 360 首 | Kern | ✅ 可用（規模小） |
-| 中提琴 | — | — | — | ❌ 無 |
-| 大提琴 | — | — | — | ❌ 無 |
-| 長笛/木管 | — | — | — | ❌ 無 |
-
-> **Limitation**: 目前沒有公開可用的 **中提琴、大提琴、長笛** 資料集同時包含真實錄音 + MusicXML/Kern 樂譜。這些樂器的評估留待未來研究。
-
-### 資料集下載總覽
+### 資料集規模總覽
 
 | Dataset | 用途 | 檔案數 | 大小 | Study |
 |---------|------|--------|------|-------|
-| ASAP (test only) | Piano baseline | ~80 段 | ~3GB | Study 1 & 2 |
-| GAPS | Guitar 真實錄音 | ~200 段 | ~5GB | Study 2 |
-| Bach Violin | Violin 真實錄音 | ~100 段 | ~2GB | Study 2 |
-| GTSinger | Voice 真實錄音 | ~1000 段 | ~10GB | Study 2 |
-| MTC-ANN | Voice (民謠) | 360 首 | ~500MB | Study 2 (補充) |
+| ASAP (test only) | Piano baseline | ~80 段 | ~3GB | Study 1 |
+| URMP (full) | Multi-instrument ensemble | 44 首 | 12.5GB | Study 2 |
+| Slakh2100 | Multi-track training | 2100 首 | ~120GB | Study 2 |
 
 ---
 
@@ -429,14 +418,14 @@ Meertens Tune Collections 的標註子集，包含荷蘭田野錄音與 Kern 樂
 
 ### Study 1 vs Study 2 訓練對比
 
-| | Study 1 (Piano) | Study 2 (Universal Solo) |
+| | Study 1 (ISMIR 2026 結果) | Study 2 (Multi-instrument Ensemble) |
 |---|---|---|
-| **目標** | 公平比較架構差異 | 展示跨樂器泛化能力 |
-| **訓練資料** | MuseSyn + HumSyn（與 Zeng 相同） | MuseSyn + HumSyn + 多樂器拆分 + PDMX 非古典 |
-| **測試資料** | ASAP test (25首/80段) | ASAP + GAPS + Bach Violin + GTSinger |
+| **目標** | 證明架構有效性 | 展示多樂器合奏能力 |
+| **訓練資料** | ASAP train | PDMX + 跨樂器 TDR |
+| **測試資料** | ASAP test (25首/80段) | URMP ensemble + Slakh2100 |
 | **訓練類型** | Supervised | Zero-shot |
-| **樂器標籤** | `*Ipiano` (固定) | Kern 原生標籤 (`*Ipiano`, `*Iguitr`, etc.) |
-| **Auxiliary Loss** | 不使用 | 不使用（留給 ICLR 2027） |
+| **Auxiliary Loss** | 不使用 | ✅ Instrument Aux Loss (λ=0.3) |
+| **TDR 策略** | 同樂器 Aug | 跨樂器 TDR |
 
 ### Study 1: 與 Zeng 相同設定（公平比較）
 
@@ -478,91 +467,44 @@ Clef (Study 1) 訓練流程：
 
 > **結論**：Zeng 和 Clef 都輸出 \*\*Kern 格式，核心差異在於 **Encoder 架構**（CNN vs ViT）和 **Decoder 架構**（RNN vs Transformer）。
 
-### Study 2: Universal Solo 訓練（同樂器 Augmentation）
+### Study 2: Multi-instrument Ensemble 訓練（跨樂器 TDR + Aux Loss）
 
-Study 2 使用 **同樂器內 Augmentation** 策略，而非跨樂器 TDR：
+Study 2 使用 **跨樂器 TDR** 策略配合 **Instrument Auxiliary Loss**：
 
 ```
-Clef (Study 2) 訓練流程：
+Clef (ICLR 2027) 訓練流程：
 ┌─────────────────────────────────────────────────────────┐
-│  Training: Universal Solo Pre-training                   │
+│  Training: Universal + Cross-instrument TDR              │
 │  ├── Data: PDMX (250K+ scores，涵蓋多種樂器)             │
-│  ├── Audio: 同樂器 Augmentation（不跨樂器！）            │
-│  │   ├── Piano: Steinway, Yamaha, Upright, Electric      │
-│  │   ├── Guitar: Classical, Steel-string, Nylon          │
-│  │   ├── Violin: Stradivarius, Modern, Baroque           │
-│  │   └── ...每種樂器用 3-5 種不同音源                    │
-│  ├── Kern 樂器標籤: *Ipiano, *Iguitr, *Ivioln, etc.     │
+│  ├── Audio: 跨樂器 TDR 合成                              │
+│  │   ├── 小提琴譜 + 長笛音色                             │
+│  │   ├── 鋼琴譜 + 吉他音色                               │
+│  │   └── ... 隨機組合「樂譜 × 音色」                     │
+│  ├── Instrument Auxiliary Loss (λ=0.3)                  │
 │  └── 不使用任何真實錄音！                                │
 └─────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────┐
-│  Test: Sim-to-Real Evaluation (Zero-shot)               │
-│  ├── Piano: ASAP test (真實鋼琴錄音)                     │
-│  ├── Guitar: GuitarSet (真實吉他錄音)                    │
-│  ├── Strings/Winds: URMP solo tracks (真實錄音)          │
-│  └── 證明 Sim2Real 泛化能力                              │
+│  Test: Multi-instrument Ensemble (Zero-shot)            │
+│  ├── URMP ensemble (真實錄音)                            │
+│  ├── Slakh2100 test (合成多軌)                           │
+│  └── 證明 Source Separation + Transcription 能力         │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**為什麼用「同樂器 Augmentation」而非「跨樂器 TDR」？**
+**為什麼需要跨樂器 TDR + Aux Loss？**
 
-| 策略 | 優點 | 缺點 | 適用場景 |
-|------|------|------|---------|
-| **同樂器 Augmentation** | 模型自然學會正確樂器標籤 | 需要每種樂器都有足夠訓練資料 | ISMIR 2026 (單樂器) |
-| **跨樂器 TDR** | 最大化數據效率 | 需要 Aux Loss 解耦 | ICLR 2027 (多樂器合奏) |
+| 策略 | 數據效率 | 樂器辨識 | 適用場景 |
+|------|---------|---------|---------|
+| 同樂器 Aug (ISMIR 2026) | 低 | 自然正確 | 單樂器 Solo |
+| **跨樂器 TDR + Aux Loss** | **高** | **需要 Aux Loss 輔助** | **多樂器 Ensemble** |
 
 ### 訓練資料需求總覽
 
 | Study | 訓練資料 | 測試資料 | 需下載 |
 |-------|----------|----------|--------|
-| Study 1 | MuseSyn + HumSyn (與 Zeng 相同) | ASAP test (25首/80段) | ASAP + MAESTRO |
-| Study 2 | MuseSyn + HumSyn + 多樂器拆分 + PDMX 非古典 | ASAP + GAPS + Bach Violin + GTSinger | GAPS, Bach Violin, GTSinger |
-
-### Study 2 訓練資料策略
-
-**核心策略**：不使用 PDMX 的 50,000+ Piano Solo，避免樂器不平衡和 overfit。
-
-| 來源 | Piano 數量 | Genre | 角色 |
-|------|-----------|-------|------|
-| MuseSyn | ~200 | Classical | Study 1 baseline |
-| HumSyn | ~2,000 | Classical | Study 1 baseline |
-| PDMX (Pop/Jazz/Rock) | ~2,000-3,000 | Non-classical | 多元化 |
-| 拆分的伴奏 | ~5,000 | Mixed | 伴奏角色 |
-| **Total Piano** | **~10,000** | **Balanced** | ✅ |
-
-**為什麼這樣設計？**
-
-1. **承接 Study 1**：Piano 資料與 Zeng 相同，確保公平比較
-2. **防止 Overfit**：不讓 50,000+ Piano 主導訓練
-3. **伴奏 Piano 的價值**：從 Piano-Voice、Piano-Violin 等拆出來的 Piano 是伴奏角色，音域、節奏、複雜度都不同於 Solo Piano
-
-**其他樂器的資料策略**：
-
-| 樂器 | Solo 數量估計 | 拆分補充 | 總計 |
-|------|--------------|---------|------|
-| **Violin** | ~3,000-5,000 | String Quartet | ~8,000 |
-| **Voice** | ~2,000 | Piano-Voice Lieder | ~8,000 |
-| **Cello** | ~500-1,000 | String Quartet | ~4,000 |
-| **Viola** | ~200-500 | String Quartet | ~3,000 |
-| **Flute** | ~500-1,000 | Chamber Music | ~3,000 |
-| **Guitar** | ~2,000 | — | ~2,000 |
-
-**Genre 多元化（好和弦策略）**：
-
-PDMX rated subset (~14,182 首) 中約 40% 是非古典/民謠：
-- Pop, Rock, Jazz, Blues, R&B, Latin, World, Soundtrack
-
-```python
-# 篩選非古典的 rated songs
-non_classical = df[
-    (df['is_rated'] == True) &
-    (~df['genre'].isin(['classical', 'folk', None, '']))
-]
-```
-
-**Paper 可以這樣寫**：
-> "To ensure genre diversity and prevent classical music bias, we supplement MuseSyn and HumSyn (classical piano) with non-classical works from PDMX's rated subset, which contains approximately 40% non-classical/folk genres including pop, jazz, rock, and world music."
+| Study 1 | (引用 ISMIR 2026) | ASAP test (25首/80段) | — |
+| Study 2 | PDMX + 跨樂器 TDR | URMP ensemble + Slakh2100 | URMP, Slakh2100 |
 
 ---
 
@@ -765,82 +707,34 @@ xml_output = beyer.performance_to_score(midi_output)
 
 ---
 
-## Study 1: Depth (深度) — ASAP Dataset
+## Study 1: Depth (深度) — 引用 ISMIR 2026 結果
 
-### Clef 變體設計
+> **本章節引用 ISMIR 2026 論文的結果**：完整的架構驗證和消融實驗請參考 ISMIR 2026 論文。
 
-為了區分各設計決策的貢獻，我們設計一系列 Clef 變體：
+### 核心架構（來自 ISMIR 2026）
 
-| 變體 | Input | Encoder | Bridge | 目的 |
-|------|-------|---------|--------|------|
-| **Zeng (2024)** | Mono VQT | CNN | N/A | Baseline |
-| **Clef-ViT** | Log-Mel | ViT | N/A | **證明 Transformer > RNN** |
-| **Clef-Swin** | Log-Mel | Swin-V2 | N/A | **證明 Swin > ViT** |
-| **Clef-Swin + Bridge** | Log-Mel | Swin-V2 | 2 layers | **證明 Bridge 的必要性** |
-| **Clef-Full** | Stereo 3-ch | Swin-V2 | 2 layers | **最佳性能**（含前處理改進） |
+ICLR 2027 版本建立在 ISMIR 2026 證明的架構基礎上：
 
-**Clef 變體說明**：
-- **Clef-ViT**：與 Zeng 使用相同輸入（Log-Mel），驗證 Transformer Decoder 優於 Hierarchical RNN
-- **Clef-Swin**：驗證 Swin-V2 優於 ViT（相對位置編碼 vs 絕對位置插值）
-- **Clef-Swin + Bridge**：驗證 Global Transformer Bridge 對段落結構理解的貢獻
-- **Clef-Full**：加入所有前處理改進（Stereo 3-ch + Loudness norm + L/R flip）
+| 元件 | 設計 | 驗證來源 |
+|------|------|---------|
+| **Encoder** | Swin-V2 | ISMIR 2026 Study 1 |
+| **Bridge** | 2-layer Transformer | ISMIR 2026 Study 1 |
+| **Decoder** | Autoregressive Transformer | ISMIR 2026 Study 1 |
+| **輸入** | Stereo 3-channel Log-Mel | ISMIR 2026 Study 1 |
+| **輸出** | Kern（含樂器標籤） | ISMIR 2026 Study 2 |
 
-> **注意**：ISMIR 2026 版本不使用 Instrument Auxiliary Loss。Aux Loss 留給 ICLR 2027 的多樂器合奏版本。
+### 鋼琴 A2S 結果摘要（來自 ISMIR 2026）
 
-### Table 1: Comparison of A2S Systems on Real-World Recordings (Piano)
+| System | MV2H | $F_p$ | $F_{harm}$ |
+|--------|------|-------|------------|
+| MT3 + MuseScore 4 | ~58% | ~80% | ~40% |
+| Zeng (2024) | 74.2% | 63.3% | 54.5% |
+| **Clef (ISMIR 2026)** | **~85%** | **~81%** | **~70%** |
 
-| Approach | System | Audio Model | Score Model | MV2H | $F_p$ | $F_{harm}$ | 關鍵弱點 |
-|----------|--------|-------------|-------------|------|-------|-----------|----------|
-| Pipeline | MT3 + MuseScore 4 | MT3 (CNN) | music21 (Rule) | ~58% | ~80% | ~40% | **量化災難**：啟發式演算法無法處理 Rubato 與複雜節奏 |
-| Pipeline | Transkun + Beyer | Transkun (Trans.) | Beyer (Trans.) | ~68% | ~92% | ~50% | **誤差傳播**：MIDI 層級的小誤差在符號化時被放大 |
-| E2E | Zeng (2024) | CNN | H-RNN | 74.2% | 63.3% | 54.5% | **局部感受野**：CNN 無法捕捉長距離和聲結構 |
-| E2E | Clef-ViT | ViT | Transformer | ~77% | 70% | 58% | **絕對位置**：ViT 對變長輸入支援不佳 |
-| E2E | **Clef-Swin** | **Swin-V2** | Transformer | **~80%** | **75%** | **62%** | **缺 Bridge**：無全域段落結構理解 |
-| E2E | **Clef-Swin + Bridge** | **Swin-V2** | **Transformer + Bridge** | **~84%** | **79%** | **68%** | **最佳架構** |
-| E2E | **Clef-Full** | **Swin-V2** | **Transformer + Bridge** | **~85%** | **81%** | **70%** | **完整系統**（含前處理改進） |
-
-**評估設定**：
-- 資料集：ASAP test split (25 首 / 80 段錄音)
-- 評估指標：MV2H (Non-aligned, McLeod 2019)
-- 統一評估流程：所有系統 → (Slice to 5-bar if needed) → MusicXML → MIDI → MV2H
-
-### 貢獻分解
-
-```
-總提升 = Clef-Full - Zeng = ~11%
-
-├── ViT + Transformer vs CNN + RNN: ~3%
-│
-├── ViT → Swin-V2: ~3%
-│
-├── Swin-V2 → +Bridge: ~4%
-│
-└── 前處理改進: ~1%
-    ├── Stereo 3-channel input
-    ├── Loudness normalization
-    └── L/R flip augmentation
-```
-
-> **注意**：Instrument Auxiliary Loss 不在 ISMIR 2026 版本使用，留給 ICLR 2027。
-
-> **註**：Transkun 的 $F_p$ 設為 92% 是參考其 MAESTRO 數據，但轉成 XML 後 MV2H 通常會掉下來。Zeng 的數據來自其論文中的 ASAP 實測。
-
-### Baseline 選擇理由
-
-1. **為什麼選 MT3 + MuseScore 4？**
-   - 這是 **Baseline of Baselines**
-   - MT3 是目前引用率最高的 Audio-to-MIDI 模型
-   - music21 是最多人用的處理庫
-   - 目的：證明「工業標準」在轉譜任務上不及格
-
-2. **為什麼選 Transkun + Beyer？**
-   - 這是 **防禦性攻擊 (Defensive Attack)**
-   - 預防審稿人說：「MT3 表現爛是因為它舊了」
-   - 如果連這套 SOTA Combo 都輸，就證明了 **Pipeline 方法論本身的失敗**
-
-3. **為什麼不交叉 (Cross-match)？**
-   - MT3 + Beyer (爛頭+好尾) 和 Transkun + music21 (好頭+爛尾) 結果介於中間
-   - 對論證「E2E vs Pipeline」的優劣沒有額外幫助
+**ICLR 2027 的延伸**：在 ISMIR 2026 驗證的架構基礎上，加入：
+1. **Instrument Auxiliary Loss**：強迫編碼器保留音色資訊
+2. **跨樂器 Timbre Domain Randomization**：最大化數據效率
+3. **Multi-track 輸出**：使用 `<coc>` token 分隔不同樂器軌道
 
 ---
 
@@ -880,38 +774,42 @@ xml_output = beyer.performance_to_score(midi_output)
 
 **研究問題**：「Bridge 的最佳層數是多少？」
 
-### 3. 同樂器 Augmentation vs 無 Augmentation（Study 2 專用）
+### 3. Instrument Auxiliary Loss Ablation
 
-驗證同樂器 Augmentation 對跨樂器泛化的貢獻：
+驗證樂器分類輔助任務對多樂器合奏的貢獻：
 
-| 實驗 | 訓練策略 | Piano MV2H | Guitar MV2H | Strings MV2H |
-|------|----------|------------|-------------|--------------|
-| Clef-Swin + Bridge (無 Aug) | 單一音源 | ~84% | ~40% | ~35% |
-| **Clef-Swin + Bridge (同樂器 Aug)** | 同樂器多音源 | **~84%** | **~60%** | **~55%** |
+| 實驗 | TDR 策略 | Aux Loss | λ | Solo MV2H | Ensemble MV2H | 樂器 F1 |
+|------|----------|----------|---|-----------|---------------|---------|
+| Clef (ISMIR) | 同樂器 Aug | ❌ | - | ~85% | ~30% | ~65% |
+| Clef + 跨樂器 TDR | 跨樂器 TDR | ❌ | - | ~80% | ~40% | ~55% |
+| **Clef + TDR + Aux** | 跨樂器 TDR | ✅ | 0.1 | ~83% | ~55% | ~80% |
+| **Clef + TDR + Aux** | 跨樂器 TDR | ✅ | **0.3** | **~85%** | **~65%** | **~90%** |
+| Clef + TDR + Aux | 跨樂器 TDR | ✅ | 0.5 | ~82% | ~60% | ~92% |
 
 **預期結論**：
-- 同樂器 Augmentation 顯著提升跨音源泛化能力
-- 對 Piano 效果有限（因為 ASAP 本身就有多種演奏者）
-- 對 Guitar/Strings 效果顯著（因為測試資料是完全不同的音源）
-
-> **注意**：Instrument Auxiliary Loss 不在本 Study 使用，留給 ICLR 2027 的多樂器合奏版本。
+- 無 Aux Loss 的跨樂器 TDR 會導致「樂器混淆」（Solo 下降、樂器 F1 暴跌）
+- λ = 0.3 為最佳權重，平衡主任務與輔助任務
+- Auxiliary Loss 帶來的效能提升主要來自：
+  1. **特徵解耦**：強迫編碼器分離「音色」與「音高」表徵
+  2. **樂器辨識**：在混音中正確辨識各樂器來源
+  3. **Source Separation**：隱式學會分離不同樂器軌道
 
 ### 4. 頻譜表示 Ablation（VQT vs Log-Mel）
 
 驗證 Log-Mel 對音色保留的優勢：
 
-| 實驗 | 頻譜類型 | 解析度 | 預期 Piano MV2H | 預期 Guitar MV2H | 備註 |
-|------|---------|--------|-----------------|------------------|------|
-| Clef-Swin + VQT | VQT | 60 bins/oct | ~83% | ~45% | 音高解析度高，但音色扭曲 |
-| **Clef-Swin + Log-Mel** | Log-Mel | 128 bins | **~85%** | **~60%** | 音色保留佳，ImageNet 相容 |
-| Clef-Swin + Log-Mel-256 | Log-Mel | 256 bins | ~84% | ~58% | 邊際效益遞減 |
+| 實驗 | 頻譜類型 | 解析度 | 預期 MV2H | 樂器 F1 | 備註 |
+|------|---------|--------|-----------|---------|------|
+| Clef-Swin + VQT | VQT | 60 bins/oct | ~83% | ~75% | 音高解析度高，但音色扭曲 |
+| **Clef-Swin + Log-Mel** | Log-Mel | 128 bins | **~86%** | **~90%** | 音色保留佳，ImageNet 相容 |
+| Clef-Swin + Log-Mel-256 | Log-Mel | 256 bins | ~85% | ~88% | 邊際效益遞減 |
 
-**科學問題**：「對於跨樂器泛化，Log-Mel 是否比 VQT 更適合？」
+**科學問題**：「對於多聲部音樂轉譜，Log-Mel 是否比 VQT 更適合？」
 
 **理論基礎**：
 - VQT 會對頻譜進行非線性扭曲，破壞共振峰（Formant）位置
 - 共振峰是區分小提琴 vs 中提琴的關鍵特徵
-- Log-Mel 保留頻譜包絡，有利於跨樂器泛化
+- Log-Mel 保留頻譜包絡，有利於 Instrument Auxiliary Loss
 
 ### 5. 前處理 Ablation
 
@@ -924,49 +822,38 @@ xml_output = beyer.performance_to_score(midi_output)
 | + Stereo | Stereo 3-ch | ✅ | ❌ | ~83% |
 | + L/R Flip | Stereo 3-ch | ✅ | ✅ | ~84% |
 
-### 6. 完整 Ablation 總結表
+### 6. 完整 Ablation 總結表（ICLR 2027 重點）
 
-| 設計決策 | 預期貢獻 | 驗證方式 |
-|---------|---------|---------|
-| ViT → Swin-V2 | +2~3% | 編碼器 Ablation |
-| Swin → +Bridge | +2~3% | Bridge Ablation |
-| Bridge-0 → Bridge-2 | +2% | Bridge Ablation |
-| VQT → Log-Mel | +2~3% | 頻譜 Ablation |
-| Loudness Norm | +1% | 前處理 Ablation |
-| Stereo 3-ch | +1~2% | 前處理 Ablation |
-| L/R Flip | +1% | 前處理 Ablation |
-| 同樂器 Augmentation | +15~20% (非鋼琴) | Study 2 (Universal Solo) |
+| 設計決策 | Solo 貢獻 | Ensemble 貢獻 | 驗證方式 |
+|---------|----------|---------------|---------|
+| Swin-V2 + Bridge | (ISMIR 基礎) | (ISMIR 基礎) | 引用 ISMIR 2026 |
+| **跨樂器 TDR** | -5% (樂器混淆) | +10% | TDR Ablation |
+| **Aux Loss (λ=0.3)** | +5% (補回) | +25% | Aux Loss Ablation |
+| **TDR + Aux 組合** | ±0% | **+35%** | 完整系統比較 |
 
-> **注意**：Instrument Auxiliary Loss 不在此版本使用，留給 ICLR 2027 的多樂器合奏版本。
+**核心結論**：
+- 跨樂器 TDR 單獨使用會導致「樂器混淆」，Solo 效能下降
+- Aux Loss 是跨樂器 TDR 的「必要配套」，兩者必須同時使用
+- 組合後在 Solo 上維持 ISMIR 效能，在 Ensemble 上大幅提升
 
-### 7. 消融實驗預期結果表（Study 1: Piano）
+### 7. 消融實驗預期結果表（Study 2: Multi-instrument Ensemble）
 
-| Model Configuration | MV2H | $F_p$ | $F_{voi}$ | $F_{val}$ | $F_{harm}$ | TEDn |
-|---------------------|------|-------|-----------|-----------|------------|------|
-| Zeng (2024) | 74.2 | 63.3 | 88.4 | 90.7 | 54.5 | 0.72 |
-| Clef-ViT + Transformer | 77.0 | 70.0 | 86.0 | 89.0 | 58.0 | 0.75 |
-| Clef-Swin + Transformer | 80.0 | 75.0 | 87.0 | 90.0 | 62.0 | 0.77 |
-| Clef-Swin + Bridge-0 | 80.0 | 75.0 | 87.0 | 90.0 | 62.0 | 0.77 |
-| Clef-Swin + Bridge-1 | 82.0 | 77.0 | 88.0 | 91.0 | 65.0 | 0.78 |
-| **Clef-Swin + Bridge-2** | **84.0** | **79.0** | **89.0** | **92.0** | **68.0** | **0.80** |
-| **Clef-Full (+ 前處理)** | **85.0** | **81.0** | **90.0** | **93.0** | **70.0** | **0.81** |
+| Model Configuration | Solo MV2H | Ensemble MV2H | Instrument F1 | Source Sep. SDR |
+|---------------------|-----------|---------------|---------------|-----------------|
+| MT3 + MuseScore 4 | ~50% | ~25% | N/A | N/A |
+| Clef (ISMIR 2026) | 85.0 | ~30% | ~65% | N/A |
+| Clef + 跨樂器 TDR (無 Aux) | 80.0 | ~40% | ~55% | ~3 dB |
+| Clef + TDR + Aux (λ=0.1) | 83.0 | ~55% | ~80% | ~5 dB |
+| **Clef + TDR + Aux (λ=0.3)** | **85.0** | **~65%** | **~90%** | **~7 dB** |
+| Clef + TDR + Aux (λ=0.5) | 82.0 | ~60% | ~92% | ~6 dB |
 
-### 8. Study 2 預期結果表（Universal Solo — 4 Instrument Categories）
+**評估說明**：
+- **Solo MV2H**：在單樂器錄音上的 MV2H
+- **Ensemble MV2H**：在多樂器混音上，分離後各軌的平均 MV2H
+- **Instrument F1**：樂器辨識準確度（Multi-label）
+- **Source Sep. SDR**：Signal-to-Distortion Ratio（分離品質，僅作參考）
 
-| Model | Piano (ASAP) | Guitar (GAPS) | Violin (Bach) | Voice (GTSinger) | Avg |
-|-------|--------------|---------------|---------------|------------------|-----|
-| Clef (Study 1, Piano Only) | 85.0 | ~25% | ~20% | ~20% | ~38% |
-| **Clef (Study 2, Universal)** | **85.0** | **~60%** | **~55%** | **~50%** | **~63%** |
-
-**評估資料集對應**：
-- Piano: ASAP test split (與 Study 1 相同)
-- Guitar: GAPS (古典吉他，MusicXML)
-- Violin: Bach Violin Dataset (BWV 1001-1006，MusicXML)
-- Voice: GTSinger (多語言人聲，MusicXML)
-
-> **註**：Study 2 使用同樂器 Augmentation，不使用 Instrument Auxiliary Loss。Aux Loss 留給 ICLR 2027 的多樂器合奏版本。
-
-> **Limitation**：由於缺乏公開的 Cello/Viola/Flute + MusicXML 資料集，這些樂器的定量評估留待未來研究。
+> **註**：跨樂器 TDR 需要 Auxiliary Loss 配合才能維持 Solo 效能並提升 Ensemble 效能。
 
 ---
 
@@ -1057,144 +944,220 @@ def stereo_flip_augmentation(input_tensor):
 
 ---
 
-## Study 2: Breadth (廣度) — Universal Solo Benchmark
+## Study 2: Breadth (廣度) — Multi-instrument Ensemble
 
 ### 設計理念
 
-Study 2 的目標是證明 Clef 能夠成為 **通用單樂器轉譜系統**，而不是「另一個鋼琴專用模型」。
+Study 2 的目標是展示 Clef 在 **多樂器合奏場景** 的能力：
+- 從混音中分離並轉錄多個樂器
+- 正確辨識每個樂器並輸出對應的 Kern 樂器標籤
 
 核心問題：
-> 「一個訓練在各種單樂器譜（用同樂器不同音源做 augmentation）的模型，能不能在真實錄音上正確轉譜各種樂器？」
+> 「一個用跨樂器 TDR + Auxiliary Loss 訓練的模型，能不能在真實合奏錄音中正確分離並轉錄多個樂器？」
 
-### 策略：使用 Kern 原生的樂器標籤
+### 核心技術（ICLR 2027 新增）
 
-Kern 格式本身就有內建的樂器標籤（Tandem Interpretation），不需要自己設計 token：
+#### 1. Instrument Auxiliary Loss
 
-| Kern Code | 樂器 | 譜表格式 |
-|-----------|------|---------|
-| `*Ipiano` | 鋼琴 | Grand Staff (大譜表) |
-| `*Iguitr` | 吉他 | 單譜表 + 8va |
-| `*Ivioln` | 小提琴 | 單譜表 (G clef) |
-| `*Iviola` | 中提琴 | 中音譜號 (Alto clef) |
-| `*Icello` | 大提琴 | 低音譜號 (Bass clef) |
-| `*Iflt` | 長笛 | 單譜表 (G clef) |
-| `*Iclars` | 單簧管 | 單譜表 (移調樂器) |
-| `*Ioboe` | 雙簧管 | 單譜表 |
-| `*Imandol` | 曼陀林 | 單譜表 + 8va |
+**目的**：強迫編碼器保留音色資訊，幫助模型在跨樂器 TDR 下正確辨識樂器。
 
-**模型輸出**：正確的 Kern（含 `*I` 樂器標籤）→ 自動產生正確的譜表格式
+**數學定義**：
+$$
+\mathcal{L}_{total} = \mathcal{L}_{transcription} + \lambda \cdot \mathcal{L}_{instrument}
+$$
 
-### 訓練策略：同樂器內 Augmentation
+其中：
+- $\mathcal{L}_{transcription}$：主要的轉譜損失（Cross-Entropy）
+- $\mathcal{L}_{instrument}$：樂器分類損失（Multi-label Cross-Entropy）
+- $\lambda$：權重係數（預設 0.3）
 
-| 策略 | 說明 |
-|------|------|
-| **同樂器 Augmentation** | 鋼琴譜只用不同鋼琴音源（Steinway, Yamaha, Upright, Electric）|
-| **不跨樂器** | 不會出現「吉他譜 + 鋼琴音色」的組合 |
-| **Kern 原生標籤** | `*Iguitr` 自動對應吉他記譜法（單譜表 + 8va）|
+**實作方式**：
+```python
+# Bridge output: (batch, seq_len, hidden_dim)
+bridge_output = self.bridge(encoder_output)
 
-**為什麼不用「跨樂器 TDR」？**
-- 跨樂器 TDR 需要 Instrument Auxiliary Loss 來幫助模型解纏（Disentangle）
-- 這個策略留給 ICLR 2027 的多樂器合奏版本
-- ISMIR 2026 版本專注於「單樂器」場景，Auxiliary Loss 不是必要的
+# Auxiliary head: instrument classification
+# Global average pooling + MLP
+pooled = bridge_output.mean(dim=1)  # (batch, hidden_dim)
+instrument_logits = self.instrument_head(pooled)  # (batch, num_instruments)
 
-**為什麼不用「家族內 TDR」（例如弦樂家族內互換）？**
-- 曼陀林和小提琴音域一樣，用幾何特徵無法區分
-- 模型必須從音色中學會區分樂器，而不是從幾何結構
-- 如果用「小提琴音色 + 曼陀林譜」訓練，模型會學錯樂器標籤
+# Multi-label loss (each track can have multiple instruments)
+aux_loss = F.binary_cross_entropy_with_logits(
+    instrument_logits,
+    instrument_labels  # (batch, num_instruments) one-hot
+)
+```
 
-### 測試資料：Sim-to-Real Evaluation
+**為什麼需要 Auxiliary Loss？**
 
-使用真實錄音測試，驗證合成訓練資料的泛化能力：
+| 策略 | 跨樂器 TDR | 樂器辨識準確度 | 說明 |
+|------|-----------|---------------|------|
+| 無 Aux Loss | ✅ | ~60% | 模型混淆樂器標籤 |
+| **有 Aux Loss** | ✅ | **~90%** | 強迫編碼器保留音色資訊 |
 
-| 樂器類別 | 資料集 | 規模 | 樂譜格式 | 說明 |
-|---------|--------|------|----------|------|
-| 🎹 Piano | ASAP test split | 80 段 | MusicXML | 與 Study 1 相同 |
-| 🎸 Guitar | GAPS | 14 小時 | MusicXML | 古典吉他真實錄音 |
-| 🎻 Violin | Bach Violin | 6.5 小時 | MusicXML | BWV 1001-1006 |
-| 🎤 Voice | GTSinger | 80+ 小時 | MusicXML | 9 語言多元人聲 |
+#### 2. 跨樂器 Timbre Domain Randomization (TDR)
 
-> **Limitation**: 目前沒有公開可用的 **中提琴、大提琴、長笛** 資料集同時包含真實錄音 + MusicXML 樂譜。這些樂器的評估留待未來研究。
+**與 ISMIR 2026 的差異**：
+| 策略 | ISMIR 2026 | ICLR 2027 |
+|------|------------|-----------|
+| **同樂器 Aug** | ✅ 使用 | ✅ 使用 |
+| **跨樂器 TDR** | ❌ 不使用 | ✅ 使用 |
+| **Aux Loss** | ❌ 不使用 | ✅ 使用 |
 
-### Table 2: Cross-instrument Zero-Shot Transfer (4 Instrument Categories)
+**跨樂器 TDR 策略**：
+```python
+# 訓練時：隨機組合「樂譜 + 音色」
+score_instrument = "violin"  # 原本的樂譜樂器
+synth_instrument = random.choice(["violin", "flute", "cello", "clarinet"])
 
-| Model Strategy | Training Data | Piano | Guitar | Violin | Voice |
-|----------------|---------------|-------|--------|--------|-------|
-| MT3 + MuseScore 4 | MAESTRO | ~58% | ~30% | ~25% | ~20% |
-| Clef (Study 1) | Piano Only | **~85%** | < 25% | < 20% | < 20% |
-| **Clef (Study 2)** | **Universal Solo** | **~85%** | **~60%** | **~55%** | **~50%** |
+# Aux Loss 幫助模型學會：
+# - 從音色判斷「這是什麼聲音」
+# - 從樂譜標籤知道「應該轉成什麼譜」
+```
 
-**評估說明**：
-- 所有指標為 MV2H (Non-aligned)
-- **4 個樂器類別**：Piano, Guitar, Violin, Voice — 涵蓋大譜表、撥弦、弓弦、人聲
-- MT3 + MuseScore 4 在非鋼琴樂器上的「量化災難」更嚴重
-- Clef (Study 1) 只練鋼琴，遇到非鋼琴樂器完全失效
-- Clef (Study 2) 使用 Universal Solo 訓練策略，展現跨樂器泛化能力
+#### 3. Multi-track 輸出格式
 
-**Contribution Statement**：
-> "To the best of our knowledge, Clef is the first end-to-end audio-to-score system validated across **4 distinct instrument categories** (keyboard, plucked string, bowed string, voice) on real-world recordings."
+使用 `<coc>` (Change of Channel) token 分隔不同樂器軌道：
+
+```
+*Ivioln
+4c 4e 4g
+*-
+<coc>
+*Icello
+4C 4E 4G
+*-
+```
+
+### 測試資料
+
+| 資料集 | 類型 | 樂器數 | 說明 |
+|--------|------|--------|------|
+| URMP (ensemble) | 真實錄音 | 2-5 | Duets, Trios, Quartets |
+| Slakh2100 | 合成錄音 | 4-8 | Pop/Rock 多軌混音 |
+
+### Table 2: Multi-instrument Ensemble Transcription
+
+| Model Strategy | Training Data | Architecture | Solo MV2H | Ensemble MV2H | Instrument F1 |
+|----------------|---------------|--------------|-----------|---------------|---------------|
+| MT3 + MuseScore 4 | MAESTRO + Slakh | CNN + Rule | ~50% | ~25% | N/A |
+| Clef (ISMIR 2026) | Universal Solo | Swin + Bridge | **~85%** | ~30% | ~65% |
+| **Clef (ICLR 2027)** | **Universal + TDR** | **Swin + Bridge + Aux** | **~85%** | **> 60%** | **~90%** |
+
+> **註**：Ensemble MV2H 是在分離後的各軌上分別計算，再取平均。
+
+### 消融實驗：Auxiliary Loss 權重 (λ)
+
+| λ | Transcription MV2H | Instrument F1 | 備註 |
+|---|-------------------|---------------|------|
+| 0.0 | ~60% | ~60% | 無 Aux Loss，樂器混淆 |
+| 0.1 | ~62% | ~80% | Aux Loss 太弱 |
+| **0.3** | **~65%** | **~90%** | **最佳平衡** |
+| 0.5 | ~63% | ~92% | Aux Loss 太強，搶走主任務梯度 |
 
 ### 表格亮點
 
-1. **Clef (Study 1)**：證明「專用模型」的侷限性（只練鋼琴，其他樂器完全失效）
-2. **Clef (Study 2)**：證明 Kern 原生樂器標籤 + 同樂器 Augmentation 的有效性
-   - Swin 的階層式結構學習音色紋理
-   - Bridge 捕捉曲式結構
-   - 不需要 Auxiliary Loss 也能達到 **4 種樂器類別** 的跨樂器泛化
-3. **MT3 + MuseScore 4**：Pipeline 在非鋼琴樂器上的「量化災難」更嚴重（缺乏樂器特定記譜規則）
-
-### Study 2 的「Cute Killer」策略
-
-ISMIR 審稿人是音樂學者，他們在乎的是：
-- 這個模型對**我的樂器**有用嗎？
-- 轉出來的譜**能不能讀**？
-
-你不需要在 Study 2 強調技術細節（Swin、Bridge），而是強調：
-> "Clef is not just another piano transcription model — it's designed for **all musicians**."
-
-技術細節留給 ICLR 2027。
+1. **Clef (ISMIR 2026)**：單樂器表現優異，但合奏場景失效
+2. **Clef (ICLR 2027)**：
+   - Aux Loss 強迫特徵解耦
+   - 跨樂器 TDR 提供音色不變性
+   - 成功在合奏場景分離並轉錄多個樂器
+3. **MT3 + MuseScore 4**：完全無法處理多樂器合奏
 
 ---
 
-## 論文結構總覽（ISMIR 2026）
+## 論文結構總覽（ICLR 2027）
 
 | Study | 定位 | 戰場 | 對手 | 目標 |
 |-------|------|------|------|------|
-| Study 1 | Depth (深度) | ASAP (Piano) | Zeng 2024, MT3 + MuseScore 4 | MV2H > 78% |
-| Study 2 | Breadth (廣度) | ASAP + GAPS + Bach Violin + GTSinger | MT3 + MuseScore 4 | Cross-instrument MV2H > 55% |
-
-### 樂器覆蓋總結
-
-| 類別 | 樂器 | Evaluation Dataset | 狀態 |
-|------|------|-------------------|------|
-| 大譜表（鍵盤） | 鋼琴 | ASAP | ✅ 充足 |
-| 撥弦 | 古典吉他 | GAPS | ✅ 充足 |
-| 弓弦 | 小提琴 | Bach Violin | ✅ 可用 |
-| 人聲 | 獨唱 | GTSinger | ✅ 充足 |
-| 木管/銅管 | 長笛、單簧管等 | — | ⚠️ 缺口 |
-| 其他弦樂 | 中提琴、大提琴 | — | ⚠️ 缺口 |
-
-> **Paper Limitation Statement**: "Due to the lack of publicly available datasets with aligned audio and musical scores for viola, cello, and wind instruments, we leave their evaluation to future work."
+| Study 1 | Depth (深度) | ASAP (Piano) | (引用 ISMIR 2026) | — |
+| Study 2 | Representation | Visual Aux Head Ablation | Clef w/o Aux | 證明 Aux Head 的效果 |
 
 ### 核心論點
 
-> 「Clef 不只是另一個鋼琴轉譜模型 — 它是為所有音樂家設計的通用單樂器轉譜系統。」
+> 「學習視覺佈局（stem, beam, voice）是否能幫助語意理解？」
+
+這是一個 representation learning 的問題，而非純粹的音樂轉譜任務。
 
 ### ISMIR 2026 vs ICLR 2027 差異
 
-| 面向 | ISMIR 2026 (本文件) | ICLR 2027 |
-|------|---------------------|-----------|
-| **目標** | 單樂器轉譜 | 多樂器合奏 |
-| **TDR 策略** | 同樂器內隨機化 | 跨樂器隨機化 + Aux Loss |
-| **Auxiliary Loss** | 不使用 | 使用 Instrument Auxiliary Loss |
-| **輸出格式** | Kern（含樂器標籤） | Kern（含樂器標籤 + `<coc>` 分軌） |
-| **測試資料** | Solo tracks | Ensemble recordings |
+| 面向 | ISMIR 2026 | ICLR 2027 (本文件) |
+|------|------------|-------------------|
+| **目標** | 單樂器轉譜 | Representation Learning |
+| **視覺資訊** | **清掉**（簡化任務） | **學習**（Visual Auxiliary Head） |
+| **TDR 策略** | 同樂器內換音源 | 同樂器內換音源 |
+| **Auxiliary Loss** | 不使用 | ✅ Instrument Aux + Visual Aux |
+| **輸出格式** | Kern（語意為主） | Kern（語意 + 視覺佈局） |
+| **TEDn 評估** | Optimality Gap 方法 | 完整 TEDn（含視覺） |
+| **核心賣點** | 「能用」 | 「為什麼能用」 |
 
-### 後續研究方向（ICLR 2027 預告）
+### Visual Auxiliary Head 設計（ICLR 2027 核心創新）
 
-ISMIR 2026 證明了 Clef 在單樂器場景的能力後，ICLR 2027 將擴展至多樂器合奏：
+**架構**：
 
-1. **Instrument Auxiliary Loss**：強迫編碼器保留音色資訊，幫助模型在跨樂器 TDR 下正確辨識樂器
-2. **跨樂器 TDR**：最大化數據效率，用「小提琴譜 + 長笛音色」這類組合訓練模型
-3. **Ensemble 測試**：使用 URMP 混音和 Slakh2100 測試多樂器分離能力
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Kern Decoder                          │
+│            (Autoregressive Transformer)                 │
+│                                                         │
+│   Output: 4C  4E  4G  =  8D  8F# ...                   │
+│           ↓   ↓   ↓      ↓   ↓                         │
+│         [h₁] [h₂] [h₃] [h₄] [h₅]  ← hidden states      │
+└──────────┬──────────────────────────────────────────────┘
+           │
+           ├────────────────┐
+           │                │
+           ▼                ▼
+    ┌─────────────┐  ┌─────────────────┐
+    │ Main Head   │  │ Visual Aux Head │
+    │ (CE Loss)   │  │ (Aux Loss)      │
+    │             │  │                 │
+    │ next token  │  │ stem: up/down   │
+    │ prediction  │  │ beam: L/J/k/K   │
+    │             │  │ voice: 1/2/3/4  │
+    │             │  │ staff: 1/2      │
+    └─────────────┘  └─────────────────┘
+```
 
-> 詳見：`experiment-design-multi-instrument.md`
+**Loss 設計**：
+```python
+L_total = L_main + λ_inst * L_instrument + λ_vis * L_visual
+# λ_inst ≈ 0.3, λ_vis ≈ 0.1
+# 視覺任務權重較低，避免主導訓練
+```
+
+**核心洞見**：視覺佈局是從音樂內容可推導的規則：
+- Stem direction：中央 B 以上 stem down，以下 stem up
+- Voice assignment：Voice 1 stem up，Voice 2 stem down
+- Staff assignment：根據音域和聲部分配
+
+這個輔助任務強迫模型理解樂譜結構，同時不會為了視覺資訊犧牲音符準確性。
+
+**Ground Truth 來源**：heal_cross_staff 的移動紀錄可作為 staff assignment 的 ground truth。
+
+### 時程規劃
+
+| 時間點 | 行動 | 里程碑 |
+|--------|------|--------|
+| 2026 May | 投稿 ISMIR 2026 | Piano A2S 論文 |
+| 2026 Jun-Aug | 衝刺 Visual Aux Head 實驗 | Ablation Study |
+| 2026 Aug-Sep | 撰寫 ICLR 論文 | ISMIR 放榜（通常 8 月底）|
+| **2026 Sep-Oct** | **投稿 ICLR 2027** | Representation Learning 論文 |
+| 2026 Nov | 參加 ISMIR 2026 | 阿布達比 (Abu Dhabi) |
+| 2027 Apr-May | 參加 ICLR 2027 | (地點待定) |
+
+### ICLR 風格的包裝策略
+
+**Title Idea**：
+> _Learning Visual Layout as Auxiliary Supervision for Audio-to-Score Transcription_
+
+**關鍵賣點**：
+1. **Sim-to-Real Transfer**：用合成數據訓練，在真實錄音上表現良好
+2. **Representation Disentanglement**：Instrument Aux Loss 強迫編碼器分離「音色」與「音高」；Visual Aux Head 強迫 decoder 分離「語意」與「視覺」
+3. **Zero-shot Generalization**：對未見過的樂器/錄音環境仍能正確轉錄（ICLR 評審在乎泛化能力）
+4. **Auxiliary Task Design**：Visual layout prediction 作為輔助任務，探討是否幫助主任務
+
+**次要賣點**：
+- 小節線有沒有畫對
+- Rubato 處理
+- 人類可讀性（但可以放 demo）

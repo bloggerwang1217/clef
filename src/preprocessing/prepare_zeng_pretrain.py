@@ -75,6 +75,7 @@ def phase1_score_to_kern(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     metadata_dir: Path = DEFAULT_METADATA_DIR,
     preset: Optional[str] = None,
+    save_visual_info: bool = True,
 ) -> Dict[str, str]:
     """Phase 1: Convert scores to kern format.
 
@@ -87,12 +88,18 @@ def phase1_score_to_kern(
             - "clef-piano-base": Chopin filter + Joplin strip
             - "clef-piano-full": Chopin filter only
             - None: No filtering (clef-tutti)
+        save_visual_info: Whether to save visual info JSON files for Visual Aux Head
 
     Returns:
         Dictionary of {filename: status} for all processed files
     """
     kern_output_dir = output_dir / "kern"
     kern_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Visual info output directory (for Visual Auxiliary Head ground truth)
+    visual_output_dir = output_dir / "visual" if save_visual_info else None
+    if visual_output_dir:
+        visual_output_dir.mkdir(parents=True, exist_ok=True)
 
     all_results = {}
 
@@ -102,6 +109,7 @@ def phase1_score_to_kern(
     humsyn_processor = HumSynProcessor(
         input_dir=humsyn_dir,
         output_dir=kern_output_dir,
+        visual_dir=visual_output_dir,
         selected_chopin_path=selected_chopin_path,
         preset=preset,
     )
@@ -113,6 +121,8 @@ def phase1_score_to_kern(
     musesyn_processor = MuseSynProcessor(
         input_dir=musesyn_dir,
         output_dir=kern_output_dir,
+        visual_dir=visual_output_dir,
+        preset=preset,
     )
     musesyn_results = musesyn_processor.process_all()
     all_results.update(musesyn_results)
