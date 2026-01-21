@@ -22,11 +22,11 @@
 |-----|------|------|
 | Pieces | 25 | 曲目數 |
 | Performances | 80 | 演奏錄音數（從 ASAP 186 個中選出） |
-| **Chunks** | **9,363** | 5-bar chunks (stride=1) |
+| **Chunks** | **13,335** | 5-bar chunks (stride=1) |
 
-**定義檔案**：`src/evaluation/test_chunk_set.csv`
+**定義檔案**：`src/evaluation/asap/test_chunk_set.csv`
 
-> **Note**: 9,363 chunks 是根據 Ground Truth 樂譜的小節數計算出的完整測試集定義。不同系統的差異在於「能成功評估多少」，而非「定義了多少」。
+> **Note**: 13,335 chunks 是根據 Ground Truth 樂譜的小節數計算出的完整測試集定義。不同系統的差異在於「能成功評估多少」，而非「定義了多少」。
 
 ---
 
@@ -42,19 +42,21 @@
 
 ### 評估結果比較表
 
-基於 9,363 chunks (Zeng test split 完整定義)：
+基於 13,335 chunks (Zeng test split 完整定義)：
 
 | 系統 | Success Rate | Success | Failed | MV2H_custom (成功集) | MV2H_custom (全集) |
 |-----|-------------|---------|--------|---------------------|-------------------|
-| **MT3 + MuseScore** | **35.6%** | 3,335 | 6,028 | 56.2% | **20.0%** |
-| Zeng (hum2xml) | ~46%? | ? | ? | ~66%? | ? |
+| **MT3 + MuseScore** | **35.1%** | 4,685 | 8,650 | 56.5% | **19.9%** |
+| Zeng (hum2xml) | 88.2% | 3,262 | 438 | 75.1% | 66.2% |
 | Clef | ? | ? | ? | ? | ? |
+
+> **Note**: Zeng 的數據基於 3,700 chunks 的子集評估（非完整 13,335）
 
 ### 關鍵發現
 
-1. **MT3 可切割 100% 的 chunks**：9,363 chunks 全部送入 MV2H 評估
+1. **MT3 可切割 100% 的 chunks**：13,335 chunks 全部送入 MV2H 評估
 2. **Phase Drift 導致大量失敗**：Success rate 從前段 53% 下降到後段 14%
-3. **即使成功，MV2H 也偏低**：成功集的 MV2H_custom 只有 56.2%（vs Zeng 的 ~66%）
+3. **即使成功，MV2H 也偏低**：成功集的 MV2H_custom 只有 56.5%（vs Zeng 的 ~75%）
 
 ---
 
@@ -64,9 +66,9 @@
 
 | 檔案類型 | 路徑 | 說明 |
 |---------|------|------|
-| **評估結果** | `data/experiments/mt3/results/chunks_song.csv` | 9,363 chunks 的詳細評估結果 |
+| **評估結果** | `data/experiments/mt3/results/chunks_song.csv` | 13,335 chunks 的詳細評估結果 |
 | **統計摘要** | `data/experiments/mt3/results/chunks_song.summary.json` | 統計數據 JSON |
-| **錯誤記錄** | `data/experiments/mt3/full_musicxml/errors.txt` | 6,028 個失敗 chunks 的詳細記錄 |
+| **錯誤記錄** | `data/experiments/mt3/full_musicxml/errors.txt` | 8,650 個失敗 chunks 的詳細記錄 |
 | **Chunk MIDI** | `data/experiments/mt3/full_musicxml/chunk_midi/` | 擷取的 chunk MIDI 檔案 |
 | **MusicXML** | `data/experiments/mt3/full_musicxml/` | MuseScore 轉換的 MusicXML |
 
@@ -88,43 +90,43 @@ MT3 Pipeline (Baseline):
 
 | Metric | Count | Percentage |
 |--------|-------|------------|
-| Total Chunks | 9,363 | 100% |
-| **Successful** | 3,335 | **35.6%** |
-| Failed | 6,028 | 64.4% |
+| Total Chunks | 13,335 | 100% |
+| **Successful** | 4,685 | **35.1%** |
+| Failed | 8,650 | 64.9% |
 
 #### Failure Breakdown
 
 | Status | Count | Percentage | 說明 |
 |--------|-------|------------|------|
-| `success` | 3,335 | 35.6% | MV2H 評估成功 |
-| `mv2h_failed` | 3,884 | 41.5% | MV2H DTW timeout（Phase Drift 導致對齊失敗）|
-| `zero_score` | 2,144 | 22.9% | Prediction MIDI 為空（小節超出範圍）|
+| `success` | 4,685 | 35.1% | MV2H 評估成功 |
+| `mv2h_failed` | 5,741 | 43.1% | MV2H DTW timeout（Phase Drift 導致對齊失敗）|
+| `zero_score` | 2,909 | 21.8% | Prediction MIDI 為空（小節超出範圍）|
 
 #### MV2H Scores
 
-**Zeng's Method（排除失敗，n=3,335）**：
+**Zeng's Method（排除失敗，n=4,685）**：
 
 | Metric | Score |
 |--------|-------|
-| Multi-pitch | 21.5% |
-| Voice | 57.4% |
-| Meter | 11.9% |
-| Value | 70.3% |
-| Harmony | 75.7% |
-| MV2H (official) | 47.4% |
-| **MV2H_custom** | **56.2%** |
+| Multi-pitch | 21.92% |
+| Voice | 56.94% |
+| Meter | 12.64% |
+| Value | 71.22% |
+| Harmony | 76.09% |
+| MV2H (official) | 47.76% |
+| **MV2H_custom** | **56.54%** |
 
-**Include Failures（全集，n=9,363）**：
+**Include Failures（全集，n=13,335）**：
 
 | Metric | Score |
 |--------|-------|
-| Multi-pitch | 7.6% |
-| Voice | 20.5% |
-| Meter | 4.3% |
-| Value | 25.1% |
-| Harmony | 26.9% |
-| MV2H (official) | 16.9% |
-| **MV2H_custom** | **20.0%** |
+| Multi-pitch | 7.70% |
+| Voice | 20.00% |
+| Meter | 4.44% |
+| Value | 25.02% |
+| Harmony | 26.73% |
+| MV2H (official) | 16.78% |
+| **MV2H_custom** | **19.86%** |
 
 ### Phase Drift 分析
 
@@ -132,22 +134,22 @@ MT3 Pipeline (Baseline):
 
 | Chunk Position | Success Rate | Sample Count | Interpretation |
 |----------------|--------------|--------------|----------------|
-| 1-10 | **53.1%** | 448 | 開頭尚可對齊 |
-| 11-20 | 42.0% | 483 | 開始漂移 |
-| 21-30 | 49.9% | 511 | 波動 |
-| 31-40 | 61.1% | 434 | 局部穩定 |
-| 41-50 | 53.0% | 383 | 持續波動 |
-| 51-100 | 43.2% | 2,094 | 明顯下降 |
-| 101-200 | **32.0%** | 3,122 | 嚴重漂移 |
-| 201-500 | **14.1%** | 1,888 | 完全崩潰 |
+| 1-10 | **50.9%** | 666 | 開頭尚可對齊 |
+| 11-20 | 40.4% | 713 | 開始漂移 |
+| 21-30 | 46.7% | 719 | 波動 |
+| 31-40 | 54.0% | 724 | 局部穩定 |
+| 41-50 | 45.9% | 725 | 持續波動 |
+| 51-100 | 42.2% | 3,032 | 明顯下降 |
+| 101-200 | **31.3%** | 4,456 | 嚴重漂移 |
+| 201-500 | **13.0%** | 2,253 | 完全崩潰 |
 
 #### Failure Mode by Chunk Position
 
 | Status | Mean Index | Median Index | Count | Interpretation |
 |--------|------------|--------------|-------|----------------|
-| `success` | 89.6 | **74** | 3,335 | 成功案例集中在前半段 |
-| `zero_score` | 198.4 | **208** | 2,144 | 空 MIDI 集中在後半段 |
-| `mv2h_failed` | 103.7 | 91 | 3,884 | DTW 超時集中在中段 |
+| `success` | 85.7 | **70** | 4,685 | 成功案例集中在前半段 |
+| `zero_score` | 188.3 | **196** | 2,909 | 空 MIDI 集中在後半段 |
+| `mv2h_failed` | 96.5 | **82** | 5,741 | DTW 超時集中在中段 |
 
 #### Phase Drift 機制
 
@@ -173,9 +175,9 @@ MT3 + MuseScore (量化後):
 
 ### Root Cause Analysis
 
-#### 為什麼 Multi-pitch 只有 21.5%？
+#### 為什麼 Multi-pitch 只有 21.92%？
 
-即使 MT3 的 onset detection 準確率高達 90%+，MV2H 的 Multi-pitch 卻只有 21.5%。
+即使 MT3 的 onset detection 準確率高達 90%+，MV2H 的 Multi-pitch 卻只有 21.92%。
 
 **原因**：MV2H 評估的是「在正確的小節裡有沒有正確的音」，而非物理時間的 onset 準確度。
 
@@ -234,7 +236,7 @@ poetry run ./src/baselines/mt3/run_mt3_evaluate_pipeline.sh --mode chunks -j 4
 #### errors.txt 格式
 
 ```
-# Total: 6028 chunks with errors
+# Total: 8650 chunks with errors
 # Format: chunk_id	status	error_message
 Bach#Prelude#bwv_875#Ahfat01M.12	mv2h_failed	MV2H returned None (check Java process logs)
 Bach#Prelude#bwv_875#Ahfat01M.32	zero_score	MV2H returned 0 (likely MIDI parsing error)
@@ -245,33 +247,33 @@ Bach#Prelude#bwv_875#Ahfat01M.32	zero_score	MV2H returned 0 (likely MIDI parsing
 
 ```json
 {
-  "n_total": 9363,
-  "n_evaluated": 9363,
-  "n_successful": 3335,
-  "n_failed": 6028,
-  "success_rate": 0.356,
+  "n_total": 13335,
+  "n_evaluated": 13335,
+  "n_successful": 4685,
+  "n_failed": 8650,
+  "success_rate": 0.351,
   "status_breakdown": {
-    "mv2h_failed": 3884,
-    "success": 3335,
-    "zero_score": 2144
+    "mv2h_failed": 5741,
+    "success": 4685,
+    "zero_score": 2909
   },
   "zeng_method": {
-    "Multi-pitch": 0.215,
-    "Voice": 0.574,
-    "Meter": 0.119,
-    "Value": 0.703,
-    "Harmony": 0.757,
-    "MV2H": 0.474,
-    "MV2H_custom": 0.562
+    "Multi-pitch": 0.2192,
+    "Voice": 0.5694,
+    "Meter": 0.1264,
+    "Value": 0.7122,
+    "Harmony": 0.7609,
+    "MV2H": 0.4776,
+    "MV2H_custom": 0.5654
   },
   "include_failures": {
-    "Multi-pitch": 0.076,
-    "Voice": 0.205,
-    "Meter": 0.043,
-    "Value": 0.251,
-    "Harmony": 0.269,
-    "MV2H": 0.169,
-    "MV2H_custom": 0.200
+    "Multi-pitch": 0.0770,
+    "Voice": 0.2000,
+    "Meter": 0.0444,
+    "Value": 0.2502,
+    "Harmony": 0.2673,
+    "MV2H": 0.1678,
+    "MV2H_custom": 0.1986
   }
 }
 ```
@@ -384,7 +386,7 @@ Bach#Prelude#bwv_875#Ahfat01M.32	zero_score	MV2H returned 0 (likely MIDI parsing
 | 項目 | 值 |
 |------|---|
 | Pipeline | `hum2xml`（Zeng 原本） |
-| Test Set | ASAP test split (9,363 chunks) |
+| Test Set | ASAP test split (13,335 chunks) |
 | Timeout | 10 秒（待確認是否延長到 300 秒）|
 | MV2H Version | Non-aligned (McLeod 2019) |
 
@@ -417,4 +419,4 @@ Bach#Prelude#bwv_875#Ahfat01M.32	zero_score	MV2H returned 0 (likely MIDI parsing
 
 ---
 
-*Last updated: 2026-01-19*
+*Last updated: 2026-01-21*

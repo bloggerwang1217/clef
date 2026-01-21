@@ -535,6 +535,10 @@ def extract_measures_to_midi(
             output_midi_path="/tmp/chunk_10.mid"
         )
     """
+    # Skip if already extracted (cache)
+    if Path(output_midi_path).exists():
+        return output_midi_path
+
     try:
         from music21 import converter
 
@@ -555,3 +559,78 @@ def extract_measures_to_midi(
     except Exception as e:
         logger.error(f"Measure extraction to MIDI failed: {e}")
         return None
+
+
+def extract_chunks_batch(
+    musicxml_path: str,
+    chunks: List[Tuple[int, int, str]],
+) -> Dict[str, Optional[str]]:
+    """
+    Extract multiple measure ranges from a MusicXML file (parse once).
+
+    This is much faster than calling extract_measures_to_midi() repeatedly,
+    as it only parses the MusicXML file once.
+
+    Args:
+        musicxml_path: Path to input MusicXML file
+        chunks: List of (start_measure, end_measure, output_path) tuples
+
+    Returns:
+        Dictionary mapping output_path to actual path (or None if failed)
+
+    Example:
+        results = extract_chunks_batch(
+            "score.musicxml",
+            [
+                (10, 14, "/tmp/chunk_10.mid"),
+                (11, 15, "/tmp/chunk_11.mid"),
+                (12, 16, "/tmp/chunk_12.mid"),
+            ]
+        )
+    """
+    results = {}
+
+    # Check which chunks need extraction (skip cached)
+    to_extract = []
+    for start_m, end_m, output_path in chunks:
+        if Path(output_path).exists():
+            results[output_path] = output_path
+        else:
+            to_extract.append((start_m, end_m, output_path))
+
+    if not to_extract:
+        return results
+
+    try:
+        from music21 import converter
+
+        # Parse once
+        score = converter.parse(musicxml_path)
+
+        # Ensure output directory exists
+        if to_extract:
+            Path(to_extract[0][2]).parent.mkdir(parents=True, exist_ok=True)
+
+        # Extract all chunks
+        for start_m, end_m, output_path in to_extract:
+            try:
+                extracted = score.measures(start_m, end_m)
+                extracted.write("midi", fp=output_path)
+
+                if Path(output_path).exists():
+                    results[output_path] = output_path
+                else:
+                    results[output_path] = None
+            except Exception as e:
+                logger.debug(f"Failed to extract measures {start_m}-{end_m}: {e}")
+                results[output_path] = None
+
+        return results
+
+    except ImportError:
+        logger.error("music21 required for measure extraction: pip install music21")
+        return {output_path: None for _, _, output_path in chunks}
+
+    except Exception as e:
+        logger.error(f"Batch measure extraction failed: {e}")
+        return {output_path: None for _, _, output_path in chunks}

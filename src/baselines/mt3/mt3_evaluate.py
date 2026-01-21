@@ -48,7 +48,7 @@ from tqdm import tqdm
 
 # Import shared modules
 from src.evaluation.mv2h import MV2HEvaluator, MV2HResult, aggregate_mv2h_results, print_mv2h_summary
-from src.evaluation.asap import ASAPDataset, ChunkInfo, extract_measures_to_midi
+from src.evaluation.asap import ASAPDataset, ChunkInfo, extract_measures_to_midi, extract_chunks_batch
 
 # =============================================================================
 # LOGGING
@@ -773,6 +773,7 @@ def run_chunk_evaluation(
     chunk_csv: str,
     output_dir: str,
     config: EvalConfig,
+    output_csv: Optional[str] = None,
     musicxml_dir: Optional[str] = None,
 ) -> Tuple[List[EvalResult], Dict[str, Any]]:
     """
@@ -786,12 +787,18 @@ def run_chunk_evaluation(
     5. Run MV2H on extracted chunk MIDI files
     6. Report results using both Zeng's method and include-failures method
 
+    Incremental saving:
+    - Results are saved to CSV immediately after each chunk completes
+    - Already completed chunks (status='success' in CSV) are skipped
+    - This enables resuming evaluation after interruption
+
     Args:
         pred_dir: Directory containing MT3 prediction MIDI files
         gt_dir: ASAP dataset directory with ground truth
         chunk_csv: Path to Zeng chunk CSV file
         output_dir: Output directory for results and intermediate files
         config: Evaluation configuration
+        output_csv: Path to results CSV (enables incremental saving and resume)
 
     Returns:
         Tuple of (results list, summary dict)
@@ -803,6 +810,15 @@ def run_chunk_evaluation(
     total_chunks = len(chunks)
     logger.info(f"Processing {len(grouped)} (piece, performance) pairs, {total_chunks} total chunks")
 
+    # Load already completed chunks if output_csv exists
+    completed_chunks = set()
+    if output_csv:
+        completed_chunks = load_completed_chunks(output_csv)
+        if completed_chunks:
+            logger.info(f"Found {len(completed_chunks)} already completed chunks, will skip")
+        # Initialize CSV with headers if needed
+        init_csv_file(output_csv, CHUNK_CSV_FIELDS)
+
     # Create output directories
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     chunk_midi_dir = os.path.join(output_dir, "chunk_midi")
@@ -812,6 +828,7 @@ def run_chunk_evaluation(
     tasks: List[ChunkEvalTask] = []
     skipped_pieces: List[str] = []
     conversion_errors: List[str] = []
+    skipped_completed: int = 0
 
     # Process each (piece, performance) group
     for (piece_id, performance), piece_chunks in tqdm(
@@ -838,9 +855,41 @@ def run_chunk_evaluation(
             conversion_errors.append(f"{piece_id}#{performance}")
             continue
 
-        # 4. Extract chunks from both pred and GT
+        # 4. Filter out already completed chunks
+        chunks_to_extract = []
         for chunk in piece_chunks:
-            # Create unique paths for chunk MIDI files
+            if chunk.chunk_id in completed_chunks:
+                skipped_completed += 1
+            else:
+                chunks_to_extract.append(chunk)
+
+        if not chunks_to_extract:
+            continue
+
+        # 5. Prepare batch extraction lists (parse each XML only once!)
+        pred_chunks_list = [
+            (
+                chunk.start_measure,
+                chunk.end_measure,
+                os.path.join(chunk_midi_dir, f"{chunk.chunk_id.replace('#', '_')}_pred.mid"),
+            )
+            for chunk in chunks_to_extract
+        ]
+        gt_chunks_list = [
+            (
+                chunk.start_measure,
+                chunk.end_measure,
+                os.path.join(chunk_midi_dir, f"{chunk.chunk_id.replace('#', '_')}_gt.mid"),
+            )
+            for chunk in chunks_to_extract
+        ]
+
+        # 6. Batch extract (parse XML once, extract all chunks)
+        pred_results = extract_chunks_batch(pred_xml, pred_chunks_list)
+        gt_results = extract_chunks_batch(gt_xml, gt_chunks_list)
+
+        # 7. Create evaluation tasks
+        for chunk in chunks_to_extract:
             pred_chunk_path = os.path.join(
                 chunk_midi_dir, f"{chunk.chunk_id.replace('#', '_')}_pred.mid"
             )
@@ -848,21 +897,8 @@ def run_chunk_evaluation(
                 chunk_midi_dir, f"{chunk.chunk_id.replace('#', '_')}_gt.mid"
             )
 
-            # Extract prediction chunk (from MuseScore-converted MusicXML)
-            pred_chunk = extract_measures_to_midi(
-                pred_xml,
-                chunk.start_measure,
-                chunk.end_measure,
-                pred_chunk_path,
-            )
-
-            # Extract ground truth chunk (from ASAP MusicXML)
-            gt_chunk = extract_measures_to_midi(
-                gt_xml,
-                chunk.start_measure,
-                chunk.end_measure,
-                gt_chunk_path,
-            )
+            pred_chunk = pred_results.get(pred_chunk_path)
+            gt_chunk = gt_results.get(gt_chunk_path)
 
             if pred_chunk and gt_chunk:
                 tasks.append(ChunkEvalTask(
@@ -875,15 +911,17 @@ def run_chunk_evaluation(
             else:
                 logger.debug(f"Failed to extract chunk: {chunk.chunk_id}")
 
+    if skipped_completed:
+        logger.info(f"Skipped {skipped_completed} already completed chunks")
     if skipped_pieces:
         logger.warning(f"Skipped {len(skipped_pieces)} pieces (no prediction or GT)")
     if conversion_errors:
         logger.warning(f"Conversion failed for {len(conversion_errors)} pieces")
 
-    logger.info(f"Prepared {len(tasks)} chunk evaluation tasks")
+    logger.info(f"Prepared {len(tasks)} new chunk evaluation tasks")
 
-    # Run parallel evaluation
-    results: List[EvalResult] = []
+    # Run parallel evaluation with incremental saving
+    new_results: List[EvalResult] = []
     n_workers = min(config.workers, len(tasks)) if tasks else 1
 
     if tasks:
@@ -896,24 +934,37 @@ def run_chunk_evaluation(
                 desc="Evaluating chunks",
             ):
                 try:
-                    results.append(future.result())
+                    result = future.result()
                 except Exception as e:
                     task = futures[future]
-                    results.append(EvalResult(
+                    result = EvalResult(
                         task_id=task.task_id,
                         pred_path=task.pred_chunk_midi,
                         gt_path=task.gt_chunk_midi,
                         status="executor_error",
                         error_message=str(e),
-                    ))
+                    )
 
-    # Save failed chunks
-    save_failed_chunks(results, output_dir)
+                new_results.append(result)
+
+                # Incremental save to CSV
+                if output_csv:
+                    append_result_to_csv(result, output_csv, CHUNK_CSV_FIELDS)
+
+    # Save failed chunks to separate file for easy retry
+    save_failed_chunks(new_results, output_dir)
+
+    # Load all results (including previously completed) for summary
+    all_results = new_results
+    if output_csv and completed_chunks:
+        # Reload all results from CSV for accurate summary
+        all_results = load_results_from_csv(output_csv)
+        logger.info(f"Loaded {len(all_results)} total results for summary")
 
     # Compute summary
-    summary = compute_chunk_summary(results, total_chunks)
+    summary = compute_chunk_summary(all_results, total_chunks)
 
-    return results, summary
+    return all_results, summary
 
 
 # =============================================================================
@@ -983,18 +1034,201 @@ def load_retry_tasks(
 # =============================================================================
 
 
-def save_results_csv(results: List[EvalResult], output_path: str) -> None:
-    """Save results to CSV."""
+# CSV field names for chunk evaluation results
+# Includes chunk_index for position-based analysis (e.g., success rate by chunk position)
+CHUNK_CSV_FIELDS = [
+    "task_id", "chunk_index", "piece_id", "performance",
+    "status", "error_message",
+    "Multi-pitch", "Voice", "Meter", "Value", "Harmony", "MV2H", "MV2H_custom",
+    "pred_path", "gt_path",
+]
+
+# CSV field names for full song evaluation
+FULL_CSV_FIELDS = [
+    "task_id", "status", "error_message",
+    "Multi-pitch", "Voice", "Meter", "Value", "Harmony", "MV2H", "MV2H_custom",
+    "pred_path", "gt_path",
+]
+
+
+def parse_chunk_id(chunk_id: str) -> Dict[str, Any]:
+    """
+    Parse Zeng-style chunk_id into components for analysis.
+
+    Args:
+        chunk_id: Zeng chunk identifier (e.g., 'Bach#Prelude#bwv_875#Ahfat01M.10')
+
+    Returns:
+        Dictionary with piece_id, performance, chunk_index
+
+    Example:
+        parse_chunk_id('Bach#Prelude#bwv_875#Ahfat01M.10')
+        -> {'piece_id': 'Bach#Prelude#bwv_875', 'performance': 'Ahfat01M', 'chunk_index': 10}
+    """
+    # chunk_id = "Bach#Prelude#bwv_875#Ahfat01M.10"
+    parts = chunk_id.rsplit("#", 1)
+    if len(parts) != 2:
+        return {"piece_id": chunk_id, "performance": "", "chunk_index": 0}
+
+    piece_id = parts[0]  # Bach#Prelude#bwv_875
+    perf_chunk = parts[1]  # Ahfat01M.10
+
+    perf_parts = perf_chunk.rsplit(".", 1)
+    if len(perf_parts) == 2:
+        performance = perf_parts[0]  # Ahfat01M
+        try:
+            chunk_index = int(perf_parts[1])  # 10
+        except ValueError:
+            chunk_index = 0
+    else:
+        performance = perf_chunk
+        chunk_index = 0
+
+    return {"piece_id": piece_id, "performance": performance, "chunk_index": chunk_index}
+
+
+def load_completed_chunks(csv_path: str) -> set:
+    """
+    Load task_ids of already completed chunks from existing CSV.
+
+    This enables resuming evaluation from where it left off.
+    Only chunks with status='success' are considered completed.
+
+    Args:
+        csv_path: Path to existing results CSV
+
+    Returns:
+        Set of completed task_ids
+    """
+    completed = set()
+    if not Path(csv_path).exists():
+        return completed
+
+    try:
+        with open(csv_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Only skip if successfully evaluated (not failed)
+                if row.get("status") == "success":
+                    completed.add(row.get("task_id", ""))
+    except Exception as e:
+        logger.warning(f"Failed to read existing CSV: {e}")
+
+    return completed
+
+
+def init_csv_file(csv_path: str, fieldnames: List[str]) -> None:
+    """
+    Initialize CSV file with headers if it doesn't exist.
+
+    Args:
+        csv_path: Path to CSV file
+        fieldnames: CSV column names
+    """
+    if Path(csv_path).exists():
+        return
+
+    Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+
+
+def append_result_to_csv(result: EvalResult, csv_path: str, fieldnames: List[str]) -> None:
+    """
+    Append a single evaluation result to CSV file.
+
+    This enables incremental saving so results are preserved even if
+    the process is interrupted.
+
+    Args:
+        result: Evaluation result to append
+        csv_path: Path to CSV file
+        fieldnames: CSV column names
+    """
+    row = result.to_dict()
+
+    # Add parsed chunk info for chunk evaluation
+    if "chunk_index" in fieldnames:
+        parsed = parse_chunk_id(result.task_id)
+        row.update(parsed)
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writerow(row)
+
+
+def load_results_from_csv(csv_path: str) -> List[EvalResult]:
+    """
+    Load all evaluation results from CSV file.
+
+    This is used to reload results after resuming for accurate summary computation.
+
+    Args:
+        csv_path: Path to results CSV file
+
+    Returns:
+        List of EvalResult objects
+    """
+    results = []
+    if not Path(csv_path).exists():
+        return results
+
+    try:
+        with open(csv_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Reconstruct MV2HResult if metrics are present
+                metrics = None
+                if row.get("Multi-pitch") and row.get("status") == "success":
+                    try:
+                        metrics = MV2HResult(
+                            multi_pitch=float(row.get("Multi-pitch", 0)),
+                            voice=float(row.get("Voice", 0)),
+                            meter=float(row.get("Meter", 0)),
+                            value=float(row.get("Value", 0)),
+                            harmony=float(row.get("Harmony", 0)),
+                            mv2h=float(row.get("MV2H", 0)),
+                        )
+                    except (ValueError, TypeError):
+                        pass
+
+                results.append(EvalResult(
+                    task_id=row.get("task_id", ""),
+                    pred_path=row.get("pred_path", ""),
+                    gt_path=row.get("gt_path", ""),
+                    status=row.get("status", "unknown"),
+                    metrics=metrics,
+                    error_message=row.get("error_message", ""),
+                ))
+    except Exception as e:
+        logger.error(f"Failed to load results from CSV: {e}")
+
+    return results
+
+
+def save_results_csv(results: List[EvalResult], output_path: str, is_chunk_mode: bool = False) -> None:
+    """
+    Save all results to CSV (used for final output or non-incremental mode).
+
+    Args:
+        results: List of evaluation results
+        output_path: Path to output CSV file
+        is_chunk_mode: If True, use chunk CSV format with chunk_index
+    """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    fieldnames = ["task_id", "pred_path", "gt_path", "status", "error_message",
-                  "Multi-pitch", "Voice", "Meter", "Value", "Harmony", "MV2H", "MV2H_custom"]
+    fieldnames = CHUNK_CSV_FIELDS if is_chunk_mode else FULL_CSV_FIELDS
 
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for r in results:
-            writer.writerow(r.to_dict())
+            row = r.to_dict()
+            if is_chunk_mode:
+                parsed = parse_chunk_id(r.task_id)
+                row.update(parsed)
+            writer.writerow(row)
 
     logger.info(f"Results saved to: {output_path}")
 
@@ -1191,13 +1425,16 @@ Examples:
 
     else:  # chunks mode
         results, summary = run_chunk_evaluation(
-            pred_dir, gt_dir, chunk_csv, output_dir, config
+            pred_dir, gt_dir, chunk_csv, output_dir, config,
+            output_csv=output_path,  # Enable incremental saving
         )
         # Print chunk-specific summary (both methods)
         print_chunk_summary(summary)
+        # Note: Results are saved incrementally during evaluation
 
-    # Save results CSV
-    save_results_csv(results, output_path)
+    # For full mode, save results (chunk mode saves incrementally)
+    if mode == "full":
+        save_results_csv(results, output_path, is_chunk_mode=False)
 
     # Save summary JSON
     summary_path = Path(output_path).with_suffix(".summary.json")

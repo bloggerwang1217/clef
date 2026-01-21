@@ -52,6 +52,10 @@ if [[ -f "$CONFIG_FILE" ]]; then
     MV2H_BIN_DEFAULT=$(_get_yaml_value "mv2h_bin")
     MSCORE_BIN_DEFAULT=$(_get_yaml_value "mscore_bin")
     OUTPUT_DIR_DEFAULT=$(_get_yaml_value "output_dir")
+    WORKERS_DEFAULT=$(_get_yaml_value "workers")
+    MV2H_TIMEOUT_DEFAULT=$(_get_yaml_value "timeout")
+    MV2H_CHUNK_TIMEOUT_DEFAULT=$(_get_yaml_value "chunk_timeout")
+    MSCORE_TIMEOUT_DEFAULT=$(_get_yaml_value "mscore_timeout")
 fi
 
 # Paths (use config defaults if available, otherwise use hardcoded defaults)
@@ -62,11 +66,11 @@ MSCORE_BIN="${MSCORE_BIN_DEFAULT:-${PROJECT_ROOT}/tools/mscore}"
 MV2H_BIN="${MV2H_BIN_DEFAULT:-${PROJECT_ROOT}/MV2H/bin}"
 CHUNK_CSV="${CHUNK_CSV_DEFAULT:-}"
 
-# Processing
-WORKERS=$(nproc 2>/dev/null || echo 4)
-MV2H_TIMEOUT=120
-MV2H_CHUNK_TIMEOUT=10  # Shorter timeout for 5-bar chunk evaluation (Zeng's setting)
-MSCORE_TIMEOUT=60
+# Processing (use config values if available, otherwise use defaults)
+WORKERS="${WORKERS_DEFAULT:-$(nproc 2>/dev/null || echo 4)}"
+MV2H_TIMEOUT="${MV2H_TIMEOUT_DEFAULT:-120}"
+MV2H_CHUNK_TIMEOUT="${MV2H_CHUNK_TIMEOUT_DEFAULT:-10}"  # Zeng's setting for 5-bar chunks
+MSCORE_TIMEOUT="${MSCORE_TIMEOUT_DEFAULT:-60}"
 MODE="full"
 
 # Flags
@@ -495,7 +499,7 @@ if [[ "$SKIP_EVALUATION" == false ]]; then
 
     # Build evaluation command
     EVAL_CMD=(
-        python -m src.baselines.mt3.mt3_evaluate
+        poetry run python -m src.baselines.mt3.mt3_evaluate
         --mode "$MODE"
         --pred_dir "$PRED_DIR"
         --gt_dir "$GT_DIR"
