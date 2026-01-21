@@ -162,3 +162,105 @@ else:
 
 - 等待 converter21 v4.0.1 修復
 - 向 converter21 作者 Greg Chapman 回報此問題
+
+---
+
+### converter21 SMUFL TextExpression Bug（已修復）
+
+#### 發現日期
+2026-01-21
+
+#### 檔案資訊
+- **資料集**: MuseSyn
+- **受影響檔案**: `The_Glorious_State_Anthem_of_the_Soviet_Union.xml`
+- **錯誤類型**: `IndexError: string index out of range`
+- **錯誤位置**: converter21 `humdrum/m21convert.py:2064` (`translateSMUFLNotesToNoteNames`)
+
+#### Bug 本質
+
+converter21 在處理 SMUFL（Standard Music Font Layout）字元時，如果 SMUFL 字元位於字串末尾，會發生索引越界錯誤。
+
+#### SMUFL 說明
+
+SMUFL 是標準化的音樂符號字體規範，將音樂符號編碼到 Unicode Private Use Area (U+E000 - U+F8FF)。
+常見於 MuseScore 匯出的 MusicXML 中，用於節拍器標記等視覺符號。
+
+converter21 支援的 SMUFL 節拍器符號對應：
+| Unicode | Humdrum 名稱 |
+|---------|-------------|
+| U+ECA0 | double-whole |
+| U+ECA2 | whole |
+| U+ECA3 | half |
+| U+ECA5 | quarter |
+| U+ECA7 | 8th |
+| U+ECA9 | 16th |
+
+#### 問題根源
+
+**錯誤位置**: `converter21/humdrum/m21convert.py:2064`
+
+**原始錯誤程式碼**:
+```python
+@staticmethod
+def translateSMUFLNotesToNoteNames(text: str) -> str:
+    # ...
+    for i, char in enumerate(text):
+        if char in SharedConstants.SMUFL_METRONOME_MARK_NOTE_CHARS_TO_HUMDRUM_NOTE_NAME:
+            output += '[' + SharedConstants.SMUFL_METRONOME_MARK_NOTE_CHARS_TO_HUMDRUM_NOTE_NAME[char]
+            j = i + 1
+            while text[j] in (...):  # BUG: 沒有邊界檢查！
+                # ...
+```
+
+**問題分析**:
+1. 當 SMUFL 字元在字串末尾時，`j = i + 1` 會等於字串長度
+2. `while text[j]` 會存取超出範圍的索引，導致 `IndexError`
+
+#### 觸發條件
+
+**復現測試**:
+```python
+from converter21.humdrum.m21convert import M21Convert
+
+# 這些會 crash
+M21Convert.translateSMUFLNotesToNoteNames('\ueca5')        # 只有 SMUFL
+M21Convert.translateSMUFLNotesToNoteNames('tempo = \ueca5') # SMUFL 在末尾
+
+# 這個正常
+M21Convert.translateSMUFLNotesToNoteNames('\ueca5 = 120')   # SMUFL 後面有字元
+# 輸出: '[quarter] = 120'
+```
+
+**受影響的 MuseSyn 檔案**:
+該檔案包含一個 TextExpression，內容只有單一 SMUFL 字元 `'\ueca5'`（四分音符符號）。
+
+#### 解決方案
+
+**我們的 Workaround**（在 `sanitize_piano_score.py`）:
+在 TextExpression 末尾的 SMUFL 字元後面加空格，繞過 converter21 的邊界檢查 bug。
+
+```python
+def fix_smufl_text_expressions(score):
+    """Fix SMUFL characters at end of TextExpression to avoid converter21 bug."""
+    for el in score.recurse():
+        if isinstance(el, m21.expressions.TextExpression):
+            if el.content and is_smufl_char(el.content[-1]):
+                el.content = el.content + ' '  # 加空格繞過 bug
+```
+
+這樣：
+- `'\ueca5'` → `'\ueca5 '` → converter21 輸出 `'[quarter] '`
+- 資訊保留，不會遺失速度標記
+
+**正確的修復方式**（應由 converter21 修復）:
+```python
+# m21convert.py:2064
+j = i + 1
+while j < len(text) and text[j] in (...):  # 加入邊界檢查
+    # ...
+```
+
+#### 後續行動
+
+- [x] 在 `sanitize_piano_score.py` 實作 workaround
+- [ ] 向 converter21 作者 Greg Chapman 回報此問題

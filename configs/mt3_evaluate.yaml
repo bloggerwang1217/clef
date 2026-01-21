@@ -30,18 +30,18 @@ mode: chunks
 pred_dir: data/experiments/mt3/full_midi
 
 # ASAP dataset base directory (contains ground truth MIDI and MusicXML)
-gt_dir: /path/to/asap-dataset
+gt_dir: /home/bloggerwang/asap-dataset
 
 # Zeng chunk CSV file (required for chunks mode)
 # Format: chunk_id,piece,performance,chunk_index,start_measure,end_measure
-chunk_csv: src/evaluation/test_chunk_set.csv
+chunk_csv: src/evaluation/asap/test_chunk_set.csv
 
 # -----------------------------------------------------------------------------
 # Output paths
 # -----------------------------------------------------------------------------
 
 # Output directory for results, MusicXML cache, and chunk MIDI files
-output_dir: results/mt3_baseline
+output_dir: data/experiments/mt3
 
 # Output CSV file for per-item results
 output_csv: results/mt3_baseline/chunks.csv
