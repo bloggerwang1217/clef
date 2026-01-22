@@ -228,11 +228,11 @@ logit(P(Y_t = 1)) = β₀ + β₁ × position_t + β₂ × Y_{t-1}
 
 #### 轉換為機率（at mid-song position）
 
-| System | OR (Position) | OR (Prev) | P(S\|prev_F) | P(S\|prev_S) | Recovery Rate | R² |
-|--------|---------------|-----------|--------------|--------------|---------------|-----|
-| MT3 + MuseScore | 0.53 | **40.2** | 9.7% | 83.1% | **9.7%** | 0.43 |
-| Transkun + Beyer | 0.59 | **65.3** | 15.2% | 91.4% | **15.2%** | 0.49 |
-| Zeng | 1.36 | 4.6 | 68.0% | 89.9% | **68.0%** | 0.06 |
+| System | OR (Position) | OR (Prev) | P(S\|prev_F) | P(S\|prev_S) | Recovery Rate | Pseudo R² |
+|--------|---------------|-----------|--------------|--------------|---------------|-----------|
+| MT3 + MuseScore | 0.53 | **40.2** | 9.7% | 81.1% | **9.7%** | 0.426 |
+| Transkun + Beyer & Dai | 0.59 | **65.3** | 15.2% | 92.1% | **15.2%** | 0.495 |
+| Zeng et al. | 1.36 | 4.6 | 68.0% | 90.8% | **68.0%** | 0.056 |
 
 ### 關鍵發現
 
@@ -248,9 +248,11 @@ logit(P(Y_t = 1)) = β₀ + β₁ × position_t + β₂ × Y_{t-1}
    - Pipeline：**9.7% - 15.2%**（失敗後幾乎無法恢復）
    - E2E：**68.0%**（失敗後容易恢復）
 
-4. **Model Fit**
-   - Pipeline R² ≈ 0.43-0.49：模型解釋大量變異（Mode Locking 效果強）
-   - E2E R² = 0.06：模型解釋很少（本來就幾乎全部成功）
+4. **Model Fit (Pseudo R²)**
+   - Pipeline R² ≈ 0.43-0.49：優秀的 fit（McFadden's R² > 0.4 很罕見）
+     - 轉移模型解釋了大量變異 → 累積誤差傳播是系統性、可預測的失敗模式
+   - E2E R² = 0.06：低 fit（這是好事！）
+     - 模型解釋不了什麼 → 成功/失敗相對獨立，沒有系統性的失敗模式
 
 ### 理論解釋：Representational Flaw
 
@@ -303,21 +305,27 @@ Token = measure_position + beat_position + pitch  # discrete, score-level
 
 ## Current Results
 
-### MV2H Scores
+### Fair Comparison: All Systems on n=3,700
 
-| Model | Type | n_success | n_total | Coverage | Multi-pitch | Voice | Value | Harmony | MV2H_custom |
-|-------|------|-----------|---------|----------|-------------|-------|-------|---------|-------------|
-| MT3 + MuseScore | Pipeline | 4,685 | 13,335 | 35.1% | 21.92% | 56.94% | 71.22% | 76.09% | 56.54% |
-| Transkun + Beyer | Pipeline | 8,806 | 13,335 | 66.0% | 65.90% | 89.16% | 87.83% | 71.79% | 78.67% |
-| Zeng | E2E | 3,262 | 3,700 | 88.2% | 64.48% | 88.98% | 89.35% | 57.56% | 75.09% |
+為了公平比較，所有系統都在相同的 3,700 個 chunks 上評估（Zeng et al. 前處理後的測試集）。失敗的 chunks 分數計為 0。
+
+### MV2H Scores (Fair Comparison, failures as 0)
+
+| Model | Type | Evaluability | $F_p$ | $F_{voi}$ | $F_{val}$ | $F_{harm}$ | $F_{MV2H}$ |
+|-------|------|--------------|-------|-----------|-----------|------------|------------|
+| MT3 + MuseScore | Pipeline | 38.6% | 8.4 | 22.2 | 26.6 | 28.3 | 21.4 |
+| Transkun + Beyer & Dai | Pipeline | 75.0% | 50.6 | 68.0 | 65.8 | 48.0 | 58.1 |
+| Zeng et al. | E2E | 88.2% | 56.8 | 78.4 | 78.8 | 50.7 | 66.2 |
+
+*Evaluability = percentage of chunks that MV2H can successfully evaluate*
 
 ### Mode Locking + Phase Drift Summary
 
-| Method | Type | Phase Drift | Mode Locking OR | Recovery Rate | Interpretation |
-|--------|------|-------------|-----------------|---------------|----------------|
-| MT3 + MuseScore (Pipeline) | Pipeline | **YES** (β₁=-0.64***) | 40.2x | 9.7% | Severe both |
-| Transkun + Beyer et al. (Pipeline) | Pipeline | **YES** (β₁=-0.52***) | 65.3x | 15.2% | Severe both |
-| Zeng et al. (E2E) | E2E | **NO** (p=.11) | 4.6x | 68.0% | Mild Mode Locking only |
+| Method | Type | Phase Drift | Mode Locking OR | Recovery Rate | Pseudo R² |
+|--------|------|-------------|-----------------|---------------|-----------|
+| MT3 + MuseScore | Pipeline | **YES** (β₁=-0.64***) | 40.2x | 9.7% | 0.426 |
+| Transkun + Beyer & Dai | Pipeline | **YES** (β₁=-0.52***) | 65.3x | 15.2% | 0.495 |
+| Zeng et al. | E2E | **NO** (p=.11) | 4.6x | 68.0% | 0.056 |
 
 ---
 
@@ -342,8 +350,11 @@ Token = measure_position + beat_position + pitch  # discrete, score-level
 poetry run python -m src.baselines.mt3.mt3_evaluate \
     --config configs/mt3_evaluate.yaml
 
-# Run analysis (generates plots)
-poetry run python src/analysis/analyze_mv2h_results.py
+# Run analysis with fair comparison (all systems on Zeng's 3,700 samples)
+poetry run python src/analysis/analyze_mv2h_results.py --fair
+
+# Generate table data for paper
+poetry run python src/analysis/analyze_mv2h_results.py --fair --table
 ```
 
 ### Output Plots
@@ -351,14 +362,12 @@ poetry run python src/analysis/analyze_mv2h_results.py
 | Plot | Description |
 |------|-------------|
 | `results/success_rate_by_position.png` | MV2H Evaluability vs Position (main figure) |
-| `results/transition_model_comparison.png` | Transition model coefficients comparison |
-| `results/pipeline_vs_e2e.png` | Recovery Rate comparison between Pipeline and E2E |
 
-#### Main Figure: Evaluability Decay
+#### Main Figure: Evaluability by Position (Fair Comparison, n=3,700)
 
-![Evaluability Decay](../results/success_rate_by_position.png)
+![Evaluability by Position](../results/success_rate_by_position.png)
 
-*Figure: Pipeline Systems Exhibit Cumulative Error Propagation. Solid lines show theoretical marginal from Markov chain simulation; dashed lines with shaded bands show empirical mean evaluability with 95% bootstrap CI.*
+*Figure: MV2H evaluability by normalized position within song. Solid lines show theoretical marginal from Markov chain simulation; dashed lines with shaded bands show empirical mean with 95% bootstrap CI. All systems evaluated on the same 3,700 chunks.*
 
 `results/success_rate_by_position.png` 展示了 Pipeline 和 E2E 系統的 evaluability 隨位置的變化：
 
@@ -389,7 +398,7 @@ where:
 
 使用 Logistic Transition Model 分析，我們發現 Pipeline 和 E2E 方法有本質差異：
 
-### Pipeline 方法（MT3 + MuseScore, Transkun + Beyer et al.）
+### Pipeline 方法（MT3 + MuseScore, Transkun + Beyer & Dai）
 
 1. **Phase Drift**：成功率隨位置下降（β₁ < 0, p < .001）
    - 從歌曲開頭到結尾，成功 odds 下降到原本的 53-59%
@@ -397,12 +406,18 @@ where:
 2. **Mode Locking**：失敗具有「黏性」（β₂ > 0, OR = 40-65x）
    - 失敗後只有 9.7-15.2% 機率恢復
 
+3. **Model Fit**：Pseudo R² = 0.43-0.50（優秀）
+   - 轉移模型解釋了大量變異 → 累積誤差傳播是系統性的失敗模式
+
 ### E2E 方法（Zeng et al.）
 
 1. **No Phase Drift**：成功率不隨位置變化（β₁ 不顯著, p = .11）
 
 2. **Mild Mode Locking**：輕微的狀態依賴（OR = 4.6x）
    - 失敗後有 68.0% 機率恢復
+
+3. **Model Fit**：Pseudo R² = 0.06（低，這是好事！）
+   - 模型解釋不了什麼 → 沒有系統性的失敗模式
 
 ### 統計模型
 

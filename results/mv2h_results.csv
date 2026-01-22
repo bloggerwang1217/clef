@@ -6,3 +6,6 @@ date,model,dataset,n_success,n_total,coverage,multi_pitch,voice,value,harmony,mv
 2026-01-21,MT3 + MuseScore 4 (Strict),ASAP test (5-bar chunks),4685,13335,0.3514,0.0770,0.2000,0.2502,0.2673,0.1678,0.0444,Pipeline baseline - failures as 0
 2026-01-22,Transkun + Beyer (Zeng Method),ASAP test (5-bar chunks),8806,13335,0.6603,0.6590,0.8916,0.8783,0.7179,0.7101,0.4036,SOTA Pipeline - exclude failures
 2026-01-22,Transkun + Beyer (Strict),ASAP test (5-bar chunks),8806,13335,0.6603,0.4352,0.5888,0.5800,0.4741,0.4689,0.2665,SOTA Pipeline - failures as 0
+2026-01-22,MT3 + MuseScore (Fair Comparison),ASAP test (Zeng 3700),1429,3700,0.3862,0.0843,0.2222,0.2662,0.2832,0.1802,,Fair comparison on Zeng's 3700 samples - failures as 0
+2026-01-22,Transkun + Beyer (Fair Comparison),ASAP test (Zeng 3700),2775,3700,0.7500,0.5059,0.6803,0.6581,0.4797,0.5278,,Fair comparison on Zeng's 3700 samples - failures as 0
+2026-01-22,Zeng (Fair Comparison),ASAP test (Zeng 3700),3262,3700,0.8816,0.5684,0.7844,0.7877,0.5074,0.5894,,Fair comparison on Zeng's 3700 samples - failures as 0

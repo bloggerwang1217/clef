@@ -320,6 +320,88 @@ def print_position_analysis(analysis: List[Dict[str, Any]]) -> None:
               f"(n={item['n_total']:4d}, MV2H_custom={mv2h:5.1f}%)")
 
 
+def print_fair_comparison_table(
+    csv_paths: Dict[str, str],
+    filter_task_ids: set,
+    system_types: Dict[str, str],
+) -> None:
+    """
+    Print fair comparison table for all systems on the same sample set.
+
+    Args:
+        csv_paths: Dict mapping system name to CSV path
+        filter_task_ids: Set of task_ids to filter to (for fair comparison)
+        system_types: Dict mapping system name to type (Pipeline/E2E)
+    """
+    import pandas as pd
+
+    print("\n" + "=" * 80)
+    print("FAIR COMPARISON TABLE (Strict Method: failures as 0)")
+    print(f"Sample set: n = {len(filter_task_ids):,}")
+    print("=" * 80)
+
+    results = []
+    for name, csv_path in csv_paths.items():
+        if not Path(csv_path).exists():
+            print(f"Warning: {csv_path} not found, skipping {name}")
+            continue
+
+        df = pd.read_csv(csv_path)
+
+        # Filter to fair comparison set
+        df = df[df["task_id"].isin(filter_task_ids)].copy()
+        total = len(df)
+        successful = df[df["status"] == "success"]
+        n_success = len(successful)
+
+        # Evaluability
+        eval_rate = n_success / total if total > 0 else 0
+
+        # Strict metrics: sum of successful / total (failures as 0)
+        multi_pitch = successful["Multi-pitch"].sum() / total if total > 0 else 0
+        voice = successful["Voice"].sum() / total if total > 0 else 0
+        value = successful["Value"].sum() / total if total > 0 else 0
+        harmony = successful["Harmony"].sum() / total if total > 0 else 0
+        mv2h = successful["MV2H"].sum() / total if total > 0 else 0
+
+        # MV2H_custom (4-metric average)
+        mv2h_custom = (multi_pitch + voice + value + harmony) / 4
+
+        results.append({
+            "name": name,
+            "type": system_types.get(name, "Unknown"),
+            "n": total,
+            "eval": eval_rate,
+            "multi_pitch": multi_pitch,
+            "voice": voice,
+            "value": value,
+            "harmony": harmony,
+            "mv2h": mv2h,
+            "mv2h_custom": mv2h_custom,
+        })
+
+        print(f"\n{name}:")
+        print(f"  n = {total}")
+        print(f"  Evaluability = {eval_rate*100:.1f}%")
+        print(f"  Multi-pitch  = {multi_pitch*100:.1f}")
+        print(f"  Voice        = {voice*100:.1f}")
+        print(f"  Value        = {value*100:.1f}")
+        print(f"  Harmony      = {harmony*100:.1f}")
+        print(f"  MV2H         = {mv2h*100:.1f}")
+        print(f"  MV2H_custom  = {mv2h_custom*100:.1f}")
+
+    # Print LaTeX table format
+    print("\n" + "=" * 80)
+    print("LaTeX Table Rows (copy-paste ready)")
+    print("=" * 80)
+    for r in results:
+        # Format: System & Type & n & Eval & F_p & F_voi & F_val & F_harm & F_MV2H \\
+        print(f"{r['name']} & {r['type']} & {r['n']:,} & "
+              f"{r['eval']*100:.1f} & {r['multi_pitch']*100:.1f} & "
+              f"{r['voice']*100:.1f} & {r['value']*100:.1f} & "
+              f"{r['harmony']*100:.1f} & {r['mv2h_custom']*100:.1f} \\\\")
+
+
 # =============================================================================
 # VISUALIZATION
 # =============================================================================
@@ -544,6 +626,7 @@ def plot_success_rate_by_position(
     csv_paths: Dict[str, str],
     output_path: Optional[str] = None,
     n_empirical_bins: int = 50,
+    filter_to_task_ids: Optional[set] = None,
 ) -> None:
     """
     Plot MV2H Evaluability vs normalized position with Markov chain theoretical curve.
@@ -559,6 +642,8 @@ def plot_success_rate_by_position(
         csv_paths: Dict mapping system name to CSV path
         output_path: Path to save the plot
         n_empirical_bins: Number of bins for empirical data visualization
+        filter_to_task_ids: If provided, filter all systems to only these task_ids
+                           (for fair comparison across systems with different sample sizes)
     """
     try:
         import matplotlib.pyplot as plt
@@ -568,17 +653,17 @@ def plot_success_rate_by_position(
         print("matplotlib, pandas, and statsmodels required")
         return
 
-    # Publication quality settings
+    # Publication quality settings (larger fonts for print)
     plt.rcParams.update({
         "font.family": "sans-serif",
         "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-        "font.size": 11,
-        "axes.labelsize": 12,
-        "axes.titlesize": 13,
-        "legend.fontsize": 10,
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-        "axes.linewidth": 1.2,
+        "font.size": 18,
+        "axes.labelsize": 20,
+        "axes.titlesize": 20,
+        "legend.fontsize": 16,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+        "axes.linewidth": 1.5,
         "figure.dpi": 300,
     })
 
@@ -588,7 +673,7 @@ def plot_success_rate_by_position(
     # Using IBM/Wong colorblind-safe palette
     styles = {
         "MT3 + MuseScore": {"color": "#DC267F", "label": "MT3 + MuseScore (Pipeline)"},
-        "Transkun + Beyer": {"color": "#FE6100", "label": "Transkun + Beyer et al. (Pipeline)"},
+        "Transkun + Beyer": {"color": "#FE6100", "label": "Transkun + Beyer & Dai (Pipeline)"},
         "Zeng (E2E)": {"color": "#648FFF", "label": "Zeng et al. (E2E)"},
     }
 
@@ -598,6 +683,13 @@ def plot_success_rate_by_position(
             continue
 
         df = pd.read_csv(csv_path)
+
+        # Filter to specified task_ids for fair comparison
+        if filter_to_task_ids is not None:
+            original_len = len(df)
+            df = df[df["task_id"].isin(filter_to_task_ids)].copy()
+            print(f"  {name}: filtered {original_len} -> {len(df)} samples")
+
         df["success"] = (df["status"] == "success").astype(int)
 
         # Parse song_id and chunk_index from task_id
@@ -743,9 +835,8 @@ def plot_success_rate_by_position(
 
     # Plot formatting
     ax.axhline(y=50, color="gray", linestyle="--", linewidth=1, alpha=0.5)
-    ax.set_xlabel("Position within Song (normalized)")
+    ax.set_xlabel("Normalized Position within Song")
     ax.set_ylabel("MV2H Evaluability (%)")
-    ax.set_title("Pipeline Systems Exhibit Cumulative Error Propagation", fontweight="bold")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 100)
     ax.legend(loc="lower left", frameon=True, fancybox=False, edgecolor="black")
@@ -791,13 +882,20 @@ def main():
     import warnings
     warnings.filterwarnings("ignore")
 
+    # Parse arguments (simple flag parsing)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+
     # Use command line arg if provided, otherwise default
-    csv_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CSV
+    csv_path = args[0] if args else DEFAULT_CSV
 
     if not Path(csv_path).exists():
         print(f"Error: File not found: {csv_path}", file=sys.stderr)
         print(f"Expected: {DEFAULT_CSV}")
         sys.exit(1)
+
+    fair_comparison = "--fair" in flags
+    generate_table = "--table" in flags
 
     print(f"\n{'#' * 70}")
     print(f"# MV2H Results Analysis")
@@ -859,9 +957,29 @@ def main():
             "Transkun + Beyer": TRANSKUN_BEYER_CSV,
             "Zeng (E2E)": ZENG_CSV,
         }
+
+        # Use Zeng's task_ids for fair comparison if --fair flag is set
+        filter_task_ids = None
+
+        if fair_comparison and Path(ZENG_CSV).exists():
+            import pandas as pd
+            zeng_df = pd.read_csv(ZENG_CSV)
+            filter_task_ids = set(zeng_df["task_id"].tolist())
+            print(f"\n[Fair Comparison Mode] Filtering all systems to Zeng's {len(filter_task_ids):,} task_ids")
+
+        # Generate table data if requested
+        if generate_table and filter_task_ids is not None:
+            system_types = {
+                "MT3 + MuseScore": "Pipeline",
+                "Transkun + Beyer": "Pipeline",
+                "Zeng (E2E)": "E2E",
+            }
+            print_fair_comparison_table(csv_paths, filter_task_ids, system_types)
+
         plot_success_rate_by_position(
             csv_paths,
             output_path=DEFAULT_SUCCESS_RATE_PLOT,
+            filter_to_task_ids=filter_task_ids,
         )
 
 
