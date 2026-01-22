@@ -231,7 +231,7 @@ class MV2HEvaluator:
 
         except subprocess.TimeoutExpired:
             logger.debug(f"MV2H timeout after {self.timeout}s")
-            return None
+            raise  # Let caller handle timeout separately from mv2h_failed
 
         except Exception as e:
             logger.debug(f"MV2H error: {e}")

@@ -9,8 +9,9 @@
 1. [資料集定義](#資料集定義)
 2. [系統比較總覽](#系統比較總覽)
 3. [MT3 Baseline 評估](#mt3-baseline-評估)
-4. [Zeng Model 評估](#zeng-model-評估)
-5. [Clef 評估](#clef-評估) (待補充)
+4. [Transkun + Beyer 評估](#transkun--beyer-評估)
+5. [Zeng Model 評估](#zeng-model-評估)
+6. [Clef 評估](#clef-評估) (待補充)
 
 ---
 
@@ -37,26 +38,39 @@
 | 系統 | 評估結果 CSV | Summary JSON | Error Log | 狀態 |
 |-----|-------------|--------------|-----------|------|
 | **MT3** | `data/experiments/mt3/results/chunks_song.csv` | `chunks_song.summary.json` | `full_musicxml/errors.txt` | ✅ 完成 |
-| **Zeng (hum2xml)** | (待產生) | (待產生) | (待產生) | ⏳ 待跑 |
+| **Transkun + Beyer** | `data/experiments/transkun_beyer/results/chunks.csv` | `chunks.summary.json` | - | ✅ 完成 |
+| **Zeng (hum2xml)** | `/home/bloggerwang/piano-a2s/results/chunk_results.csv` | - | - | ✅ 完成 |
 | **Clef** | (待產生) | (待產生) | (待產生) | ⏳ 待跑 |
 
 ### 評估結果比較表
 
 基於 13,335 chunks (Zeng test split 完整定義)：
 
-| 系統 | Success Rate | Success | Failed | MV2H_custom (成功集) | MV2H_custom (全集) |
-|-----|-------------|---------|--------|---------------------|-------------------|
-| **MT3 + MuseScore** | **35.1%** | 4,685 | 8,650 | 56.5% | **19.9%** |
-| Zeng (hum2xml) | 88.2% | 3,262 | 438 | 75.1% | 66.2% |
-| Clef | ? | ? | ? | ? | ? |
+| 系統 | Type | Success Rate | Success | Failed | MV2H_custom (成功集) | MV2H_custom (全集) |
+|-----|------|-------------|---------|--------|---------------------|-------------------|
+| MT3 + MuseScore | Pipeline | 35.1% | 4,685 | 8,650 | 56.5% | 19.9% |
+| **Transkun + Beyer** | **Pipeline** | **66.0%** | **8,806** | **4,529** | **78.7%** | **52.0%** |
+| Zeng (hum2xml) | E2E | 88.2%* | 3,262 | 438 | 75.1% | 66.2% |
+| Clef | E2E | ? | ? | ? | ? | ? |
 
 > **Note**: Zeng 的數據基於 3,700 chunks 的子集評估（非完整 13,335）
 
 ### 關鍵發現
 
-1. **MT3 可切割 100% 的 chunks**：13,335 chunks 全部送入 MV2H 評估
-2. **Phase Drift 導致大量失敗**：Success rate 從前段 53% 下降到後段 14%
-3. **即使成功，MV2H 也偏低**：成功集的 MV2H_custom 只有 56.5%（vs Zeng 的 ~75%）
+1. **Survivorship Bias 的典型案例**
+   - Transkun + Beyer 成功集 MV2H (78.7%) > Zeng (75.1%)
+   - 但這是因為 Transkun + Beyer 失敗了 34% 的「困難」chunks
+   - **全集比較才是公平的**：Zeng (66.2%) > Transkun + Beyer (52.0%)
+
+2. **SOTA Pipeline 大幅優於 Industrial Pipeline**
+   - Transkun + Beyer: 66.0% success rate, 52.0% MV2H_custom (全集)
+   - MT3 + MuseScore: 35.1% success rate, 19.9% MV2H_custom (全集)
+   - Beyer Transformer 的學習式量化優於 MuseScore 的規則式量化
+
+3. **E2E 方法的優勢**
+   - Zeng 的 success rate (88.2%) 遠高於 Pipeline 方法
+   - E2E 方法不會發生 Mode Locking（見 evaluation-protocol.md）
+   - 每個 chunk 獨立評估，不受前序錯誤影響
 
 ---
 
@@ -280,6 +294,114 @@ Bach#Prelude#bwv_875#Ahfat01M.32	zero_score	MV2H returned 0 (likely MIDI parsing
 
 ---
 
+## Transkun + Beyer 評估
+
+### 系統說明
+
+**Transkun + Beyer** 是目前 SOTA 的 Audio-to-Score Pipeline：
+- **Transkun** (Li et al., 2023): SOTA AMT 模型，輸出 raw MIDI
+- **Beyer** (Beyer et al., 2024): Transformer-based 量化模型，MIDI → MusicXML
+
+這個系統比 MT3 + MuseScore 更先進，因為量化步驟是學習式的（Transformer）而非規則式的（MuseScore）。
+
+### 資料來源
+
+| 檔案類型 | 路徑 | 說明 |
+|---------|------|------|
+| **評估結果** | `data/experiments/transkun_beyer/results/chunks.csv` | 13,335 chunks 的詳細評估結果 |
+| **統計摘要** | `data/experiments/transkun_beyer/results/chunks.summary.json` | 統計數據 JSON |
+| **Chunk MIDI** | `data/experiments/transkun_beyer/chunk_midi/` | 擷取的 chunk MIDI 檔案 |
+| **MusicXML** | `data/experiments/transkun_beyer/musicxml/` | Beyer 轉換的 MusicXML |
+
+### 評估流程
+
+```
+Transkun + Beyer Pipeline (SOTA):
+  Audio (full song)
+    → Transkun → Raw MIDI (no measure structure)
+    → Beyer Transformer → MusicXML (quantized, with measures)
+    → music21 extract measures [start:end]
+    → Chunk MIDI
+    → MV2H evaluation vs Ground Truth chunk
+```
+
+### 評估結果
+
+#### Success Rate
+
+| Metric | Count | Percentage |
+|--------|-------|------------|
+| Total Chunks | 13,335 | 100% |
+| **Successful** | 8,806 | **66.0%** |
+| Failed | 4,529 | 34.0% |
+
+#### Failure Breakdown
+
+| Status | Count | Percentage | 說明 |
+|--------|-------|------------|------|
+| `success` | 8,806 | 66.0% | MV2H 評估成功 |
+| `mv2h_failed` | 4,217 | 31.6% | MV2H DTW timeout |
+| `zero_score` | 312 | 2.3% | Prediction MIDI 為空 |
+
+#### MV2H Scores
+
+**Zeng's Method（排除失敗，n=8,806）**：
+
+| Metric | Score |
+|--------|-------|
+| Multi-pitch | 65.90% |
+| Voice | 89.16% |
+| Meter | 40.36% |
+| Value | 87.83% |
+| Harmony | 71.79% |
+| MV2H (official) | 71.01% |
+| **MV2H_custom** | **78.67%** |
+
+**Include Failures（全集，n=13,335）**：
+
+| Metric | Score |
+|--------|-------|
+| Multi-pitch | 43.52% |
+| Voice | 58.88% |
+| Meter | 26.65% |
+| Value | 58.00% |
+| Harmony | 47.41% |
+| MV2H (official) | 46.89% |
+| **MV2H_custom** | **51.95%** |
+
+### 與 MT3 比較
+
+| Metric | MT3 + MuseScore | Transkun + Beyer | 提升 |
+|--------|-----------------|------------------|------|
+| Success Rate | 35.1% | **66.0%** | **+30.9%** |
+| MV2H_custom (成功集) | 56.5% | **78.7%** | **+22.2%** |
+| MV2H_custom (全集) | 19.9% | **52.0%** | **+32.1%** |
+
+**關鍵發現**：
+1. **Beyer Transformer 大幅優於 MuseScore**
+   - Success rate 從 35.1% 提升到 66.0%
+   - 學習式量化能更好地處理 rubato
+
+2. **但仍無法與 E2E 方法競爭**
+   - Zeng (E2E) 全集 MV2H: 66.2%
+   - Transkun + Beyer (Pipeline) 全集 MV2H: 52.0%
+   - 差距 14.2%，證明 Pipeline 的根本限制
+
+3. **Survivorship Bias 的警示**
+   - 成功集 MV2H: Transkun + Beyer (78.7%) > Zeng (75.1%)
+   - 全集 MV2H: Zeng (66.2%) > Transkun + Beyer (52.0%)
+   - **只報告成功集會得出錯誤結論**
+
+### 結論
+
+即使是 SOTA Pipeline (Transkun + Beyer)，在全集評估下仍然落後 E2E 方法 (Zeng) 14.2%。這證明了：
+
+1. **Pipeline 方法的根本限制**：即使用 Transformer 學習量化，仍無法完全解決 Phase Drift
+2. **全集評估的重要性**：成功集的分數會產生 Survivorship Bias，誤導比較結果
+3. **E2E 方法的優勢**：直接輸出小節結構，避免累積誤差
+
+---
+
 ## Zeng Model 評估
 
 ### 背景：為何需要回到 Zeng 的原始 Pipeline？
@@ -419,4 +541,4 @@ Bach#Prelude#bwv_875#Ahfat01M.32	zero_score	MV2H returned 0 (likely MIDI parsing
 
 ---
 
-*Last updated: 2026-01-21*
+*Last updated: 2026-01-22*

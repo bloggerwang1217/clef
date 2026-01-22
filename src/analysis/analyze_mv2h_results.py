@@ -274,88 +274,6 @@ def analyze_by_chunk_position(
     return analysis
 
 
-def analyze_by_piece(results: List[ChunkResult]) -> List[Dict[str, Any]]:
-    """
-    Analyze results grouped by piece.
-
-    Args:
-        results: List of chunk results
-
-    Returns:
-        List of per-piece analysis dictionaries
-    """
-    # Group by piece_id
-    by_piece = defaultdict(list)
-    for r in results:
-        by_piece[r.piece_id].append(r)
-
-    analysis = []
-    for piece_id, piece_results in sorted(by_piece.items()):
-        successful = [r for r in piece_results if r.status == "success"]
-        n_total = len(piece_results)
-        n_success = len(successful)
-
-        avg_metrics = {}
-        if successful:
-            avg_metrics = {
-                "Multi-pitch": np.mean([r.multi_pitch for r in successful]),
-                "MV2H_custom": np.mean([r.mv2h_custom for r in successful]),
-            }
-
-        analysis.append({
-            "piece_id": piece_id,
-            "n_total": n_total,
-            "n_success": n_success,
-            "success_rate": n_success / n_total if n_total > 0 else 0,
-            "metrics": avg_metrics,
-        })
-
-    return analysis
-
-
-def analyze_by_composer(results: List[ChunkResult]) -> List[Dict[str, Any]]:
-    """
-    Analyze results grouped by composer.
-
-    Args:
-        results: List of chunk results
-
-    Returns:
-        List of per-composer analysis dictionaries
-    """
-    # Group by composer (first part of piece_id)
-    by_composer = defaultdict(list)
-    for r in results:
-        composer = r.piece_id.split("#")[0] if "#" in r.piece_id else r.piece_id
-        by_composer[composer].append(r)
-
-    analysis = []
-    for composer, composer_results in sorted(by_composer.items()):
-        successful = [r for r in composer_results if r.status == "success"]
-        n_total = len(composer_results)
-        n_success = len(successful)
-
-        avg_metrics = {}
-        if successful:
-            avg_metrics = {
-                "Multi-pitch": np.mean([r.multi_pitch for r in successful]),
-                "Voice": np.mean([r.voice for r in successful]),
-                "Value": np.mean([r.value for r in successful]),
-                "Harmony": np.mean([r.harmony for r in successful]),
-                "MV2H_custom": np.mean([r.mv2h_custom for r in successful]),
-            }
-
-        analysis.append({
-            "composer": composer,
-            "n_total": n_total,
-            "n_success": n_success,
-            "success_rate": n_success / n_total if n_total > 0 else 0,
-            "metrics": avg_metrics,
-        })
-
-    return analysis
-
-
 # =============================================================================
 # OUTPUT FORMATTING
 # =============================================================================
@@ -402,254 +320,255 @@ def print_position_analysis(analysis: List[Dict[str, Any]]) -> None:
               f"(n={item['n_total']:4d}, MV2H_custom={mv2h:5.1f}%)")
 
 
-def print_composer_analysis(analysis: List[Dict[str, Any]]) -> None:
-    """Print per-composer analysis."""
-    print("\n" + "=" * 60)
-    print("RESULTS BY COMPOSER")
-    print("=" * 60)
-
-    for item in analysis:
-        mv2h = item["metrics"].get("MV2H_custom", 0) * 100 if item["metrics"] else 0
-        print(f"  {item['composer']:12s}: {item['success_rate']*100:5.1f}% "
-              f"(n={item['n_total']:4d}, MV2H_custom={mv2h:5.1f}%)")
-
-
 # =============================================================================
 # VISUALIZATION
 # =============================================================================
 
 
-def plot_evaluability_comparison(
-    mt3_results: List[ChunkResult],
-    output_path: Optional[str] = None,
-    zeng_csv_path: Optional[str] = None,
-) -> None:
-    """
-    Plot Evaluability (Success Rate) vs Chunk Position comparison.
+# =============================================================================
+# LOGISTIC TRANSITION MODEL
+# =============================================================================
 
-    Creates a scatter plot with fitted lines comparing:
-    - MT3 + MuseScore: Weibull decay fit (shows decline over position)
-    - Zeng: Scatter points + constant fit (no position dependence)
+
+def run_transition_model(
+    csv_path: str,
+    name: str,
+) -> Dict[str, Any]:
+    """
+    Fit Logistic Transition Model to analyze Mode Locking and Phase Drift.
+
+    Model specification:
+        logit(P(Y_t = 1)) = beta_0 + beta_1 * position + beta_2 * Y_{t-1}
+
+    Where:
+        - Y_t: success (1) or failure (0) at chunk t
+        - position: normalized position in song (0-1)
+        - Y_{t-1}: lagged outcome (previous chunk's success)
+
+    Parameters:
+        - beta_1: Phase Drift effect (negative = success decreases with position)
+        - beta_2: Mode Locking effect (positive = sticky success/failure)
+
+    Interpretation:
+        - OR(position) < 1: Phase Drift present (success odds decrease from start to end)
+        - OR(prev_success) >> 1: Mode Locking present (failure is "sticky")
+        - Recovery Rate = P(success | prev_fail) at mid-song
+
+    Note:
+        GEE with exchangeable correlation was tested but Independence structure
+        performed better (lower QIC), indicating that the transition term (Y_{t-1})
+        already captures most within-song dependence. Simple logistic regression
+        is therefore preferred for interpretability.
 
     Args:
-        mt3_results: List of MT3 chunk results
+        csv_path: Path to chunk results CSV
+        name: Name of the system for display
+
+    Returns:
+        Dictionary with model results including coefficients, odds ratios, and CIs
+    """
+    import pandas as pd
+    import statsmodels.formula.api as smf
+
+    df = pd.read_csv(csv_path)
+    df["success"] = (df["status"] == "success").astype(int)
+
+    # Parse song_id from different CSV formats
+    if "piece_id" in df.columns and "performance" in df.columns:
+        df["song_id"] = df["piece_id"] + "#" + df["performance"]
+    elif "task_id" in df.columns:
+        df["song_id"] = df["task_id"].apply(
+            lambda x: x.rsplit("#", 1)[0] + "#" + x.rsplit("#", 1)[1].rsplit(".", 1)[0]
+            if "#" in x and "." in x.rsplit("#", 1)[1]
+            else x
+        )
+
+    # Get chunk_index from different CSV formats
+    if "chunk_index" not in df.columns:
+        if "measure_idx" in df.columns:
+            df["chunk_index"] = df["measure_idx"]
+        elif "task_id" in df.columns:
+            df["chunk_index"] = df["task_id"].apply(
+                lambda x: int(x.rsplit(".", 1)[1]) if "." in x else 0
+            )
+
+    # Normalize position within song (0-1 scale)
+    df["song_length"] = df.groupby("song_id")["chunk_index"].transform("max") + 1
+    df["position_norm"] = df["chunk_index"] / df["song_length"]
+
+    # Sort and create lagged Y
+    df_sorted = df.sort_values(["song_id", "chunk_index"]).reset_index(drop=True)
+    df_sorted["prev_success"] = df_sorted.groupby("song_id")["success"].shift(1)
+
+    # Drop first observation of each song (no prev)
+    df_model = df_sorted.dropna(subset=["prev_success"]).copy()
+    df_model["prev_success"] = df_model["prev_success"].astype(int)
+
+    # Fit logistic regression
+    model = smf.logit("success ~ position_norm + prev_success", data=df_model)
+    result = model.fit(disp=0)
+
+    # Extract results
+    b0 = result.params["Intercept"]
+    b1 = result.params["position_norm"]
+    b2 = result.params["prev_success"]
+    se1 = result.bse["position_norm"]
+    se2 = result.bse["prev_success"]
+    p1 = result.pvalues["position_norm"]
+    p2 = result.pvalues["prev_success"]
+
+    # Odds ratios with 95% CI
+    or1 = np.exp(b1)
+    or1_ci = (np.exp(b1 - 1.96 * se1), np.exp(b1 + 1.96 * se1))
+    or2 = np.exp(b2)
+    or2_ci = (np.exp(b2 - 1.96 * se2), np.exp(b2 + 1.96 * se2))
+
+    # Calculate probabilities at mid-song
+    avg_pos = 0.5
+    logit_after_fail = b0 + b1 * avg_pos + b2 * 0
+    logit_after_success = b0 + b1 * avg_pos + b2 * 1
+    p_after_fail = 1 / (1 + np.exp(-logit_after_fail))
+    p_after_success = 1 / (1 + np.exp(-logit_after_success))
+
+    return {
+        "name": name,
+        "n_obs": len(df_model),
+        "n_songs": df_model["song_id"].nunique(),
+        "success_rate": df_model["success"].mean(),
+        "b0_intercept": b0,
+        "b1_position": b1,
+        "se1_position": se1,
+        "p1_position": p1,
+        "b2_prev": b2,
+        "se2_prev": se2,
+        "p2_prev": p2,
+        "or_position": or1,
+        "or_position_ci": or1_ci,
+        "or_prev": or2,
+        "or_prev_ci": or2_ci,
+        "p_after_fail": p_after_fail,
+        "p_after_success": p_after_success,
+        "recovery_rate": p_after_fail,
+        "pseudo_r2": result.prsquared,
+        "aic": result.aic,
+        "has_phase_drift": p1 < 0.05 and b1 < 0,
+        "has_mode_locking": p2 < 0.05 and b2 > 0,
+    }
+
+
+def print_transition_model_results(results: List[Dict[str, Any]]) -> None:
+    """Print Logistic Transition Model results in formatted table."""
+    print("\n" + "=" * 95)
+    print("LOGISTIC TRANSITION MODEL RESULTS")
+    print("Model: logit(P(Y_t)) = b0 + b1*position + b2*prev_success")
+    print("=" * 95)
+
+    # Coefficients table
+    print(f"\n{'System':<20} {'b1(pos)':>8} {'OR1':>8} {'95% CI':>16} {'b2(prev)':>10} {'OR2':>8}")
+    print("-" * 95)
+
+    for r in results:
+        sig1 = "***" if r["p1_position"] < 0.001 else "**" if r["p1_position"] < 0.01 else "*" if r["p1_position"] < 0.05 else ""
+        sig2 = "***" if r["p2_prev"] < 0.001 else ""
+        or1_ci = r.get("or_position_ci", (0, 0))
+        print(f"{r['name']:<20} {r['b1_position']:>7.3f}{sig1:<1} {r['or_position']:>8.2f} "
+              f"[{or1_ci[0]:.2f}, {or1_ci[1]:.2f}] {r['b2_prev']:>9.3f}{sig2:<1} {r['or_prev']:>8.1f}")
+
+    # Interpretation
+    print("\n" + "-" * 95)
+    print("INTERPRETATION")
+    print("-" * 95)
+    print(f"{'System':<20} {'Phase Drift':>12} {'Mode Locking':>14} {'Recovery':>10} {'R²':>8}")
+    print("-" * 95)
+
+    for r in results:
+        pd_str = "YES" if r["has_phase_drift"] else "NO"
+        ml_str = "SEVERE" if r["or_prev"] > 10 else "MODERATE" if r["or_prev"] > 3 else "MINIMAL"
+        recovery = r.get("recovery_rate", r["p_after_fail"])
+        pseudo_r2 = r.get("pseudo_r2", 0)
+        print(f"{r['name']:<20} {pd_str:>12} {ml_str:>14} {recovery*100:>9.1f}% {pseudo_r2:>8.3f}")
+
+    # Recovery rate details
+    print("\n" + "-" * 95)
+    print("Recovery Rate: P(success | prev_fail) at mid-song position")
+    print("-" * 95)
+
+    for r in results:
+        print(f"{r['name']:<20} P(S|F)={r['p_after_fail']*100:>5.1f}%  "
+              f"P(S|S)={r['p_after_success']*100:>5.1f}%  "
+              f"OR(prev)={r['or_prev']:>5.1f}x")
+
+
+def compute_markov_marginal(b0: float, b1: float, b2: float, pi_0: float, n_steps: int = 100) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute theoretical marginal P(success | position) by iterating Markov chain.
+
+    The transition model gives conditional probabilities:
+        P(S | position, prev=S) = expit(b0 + b1*position + b2*1)
+        P(S | position, prev=F) = expit(b0 + b1*position + b2*0)
+
+    The marginal at each position is computed by:
+        pi_{t+1} = P(S|S, pos) * pi_t + P(S|F, pos) * (1 - pi_t)
+
+    This captures the self-reinforcing nature of Mode Locking:
+    early failures propagate forward, causing exponential-like decay.
+
+    Args:
+        b0, b1, b2: Transition model parameters
+        pi_0: Initial P(success) at position 0
+        n_steps: Number of position steps
+
+    Returns:
+        positions: Array of normalized positions (0 to 1)
+        marginals: Array of P(success) at each position
+    """
+    positions = np.linspace(0, 1, n_steps)
+    marginals = np.zeros(n_steps)
+    marginals[0] = pi_0
+
+    for t in range(1, n_steps):
+        pos = positions[t]
+
+        # Transition probabilities at this position
+        p_s_given_s = 1 / (1 + np.exp(-(b0 + b1 * pos + b2 * 1)))  # P(S | prev=S)
+        p_s_given_f = 1 / (1 + np.exp(-(b0 + b1 * pos + b2 * 0)))  # P(S | prev=F)
+
+        # Marginal update: weighted by probability of being in each state
+        pi_prev = marginals[t - 1]
+        marginals[t] = p_s_given_s * pi_prev + p_s_given_f * (1 - pi_prev)
+
+    return positions, marginals
+
+
+def plot_success_rate_by_position(
+    csv_paths: Dict[str, str],
+    output_path: Optional[str] = None,
+    n_empirical_bins: int = 50,
+) -> None:
+    """
+    Plot MV2H Evaluability vs normalized position with Markov chain theoretical curve.
+
+    Shows:
+    - Theoretical marginal from Markov chain simulation (solid line)
+    - Empirical data points (scatter)
+
+    The theoretical curve is derived from the transition model parameters
+    by iterating the Markov chain forward from the initial success rate.
+
+    Args:
+        csv_paths: Dict mapping system name to CSV path
         output_path: Path to save the plot
-        zeng_csv_path: Path to Zeng's per-chunk results CSV
+        n_empirical_bins: Number of bins for empirical data visualization
     """
     try:
         import matplotlib.pyplot as plt
-        from scipy.optimize import curve_fit
-        from scipy.stats import linregress
+        import pandas as pd
+        import statsmodels.formula.api as smf
     except ImportError:
-        print("matplotlib and scipy required: pip install matplotlib scipy")
+        print("matplotlib, pandas, and statsmodels required")
         return
 
-    # =========================================================================
-    # Process MT3 data
-    # =========================================================================
-    by_index_mt3 = defaultdict(list)
-    for r in mt3_results:
-        by_index_mt3[r.chunk_index].append(r)
-
-    mt3_indices = sorted(by_index_mt3.keys())
-    mt3_success_rates = []
-    mt3_sample_counts = []
-
-    for idx in mt3_indices:
-        chunk_results = by_index_mt3[idx]
-        successful = [r for r in chunk_results if r.status == "success"]
-        success_rate = len(successful) / len(chunk_results) if chunk_results else 0
-        mt3_success_rates.append(success_rate)
-        mt3_sample_counts.append(len(chunk_results))
-
-    mt3_indices = np.array(mt3_indices)
-    mt3_success_rates = np.array(mt3_success_rates)
-    mt3_sample_counts = np.array(mt3_sample_counts)
-
-    # =========================================================================
-    # Process Zeng data (if provided)
-    # =========================================================================
-    zeng_indices = None
-    zeng_success_rates = None
-    zeng_mean = None
-
-    if zeng_csv_path and Path(zeng_csv_path).exists():
-        # Load Zeng per-chunk results
-        zeng_results = []
-        with open(zeng_csv_path, "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                # Get measure_idx (chunk position)
-                measure_idx = 0
-                if row.get("measure_idx"):
-                    try:
-                        measure_idx = int(row["measure_idx"])
-                    except ValueError:
-                        pass
-                elif row.get("task_id") and "." in row["task_id"]:
-                    # Parse from task_id: Bach#Prelude#bwv_875#Ahfat01M.10
-                    try:
-                        measure_idx = int(row["task_id"].rsplit(".", 1)[1])
-                    except (ValueError, IndexError):
-                        pass
-
-                status = row.get("status", "unknown")
-                zeng_results.append((measure_idx, status))
-
-        # Group by measure index
-        by_index_zeng = defaultdict(list)
-        for idx, status in zeng_results:
-            by_index_zeng[idx].append(status)
-
-        zeng_indices_list = sorted(by_index_zeng.keys())
-        zeng_success_rates_list = []
-
-        for idx in zeng_indices_list:
-            statuses = by_index_zeng[idx]
-            success_rate = sum(1 for s in statuses if s == "success") / len(statuses)
-            zeng_success_rates_list.append(success_rate)
-
-        zeng_indices = np.array(zeng_indices_list)
-        zeng_success_rates = np.array(zeng_success_rates_list)
-
-        # Calculate overall mean for Zeng
-        total_success = sum(1 for idx, status in zeng_results if status == "success")
-        zeng_mean = total_success / len(zeng_results)
-        print(f"Zeng: {total_success}/{len(zeng_results)} = {zeng_mean*100:.1f}% overall success rate")
-
-    # =========================================================================
-    # Curve Fitting for MT3: Compare Exponential vs Weibull
-    # =========================================================================
-
-    def exponential_decay(x, a, b):
-        """Exponential decay: f(x) = a * exp(-x/b)
-
-        Parameters:
-        - a: amplitude (initial success rate at x=0)
-        - b: decay constant (characteristic length where rate drops to a*e^(-1))
-        """
-        return a * np.exp(-x / b)
-
-    def weibull_decay(x, a, b, c):
-        """Weibull decay: f(x) = a * exp(-(x/b)^c)
-
-        Parameters:
-        - a: amplitude (initial success rate at x=0)
-        - b: scale parameter (characteristic position where rate drops to a*e^(-1))
-        - c: shape parameter (c>1: accelerating decay, c<1: decelerating decay)
-        """
-        return a * np.exp(-((x / b) ** c))
-
-    print(f"\n{'='*60}")
-    print("MT3 Curve Fitting Comparison")
-    print(f"{'='*60}")
-    print(f"  Data: {len(mt3_indices)} positions, {sum(mt3_sample_counts)} total chunks")
-    print(f"  Samples per position: min={min(mt3_sample_counts)}, max={max(mt3_sample_counts)}, mean={np.mean(mt3_sample_counts):.1f}")
-
-    # --- Exponential Fit ---
-    try:
-        popt_exp, _ = curve_fit(
-            exponential_decay, mt3_indices, mt3_success_rates,
-            p0=[0.5, 100],
-            bounds=([0, 1], [1, 1000]),
-            sigma=1/np.sqrt(mt3_sample_counts + 1),
-            maxfev=5000
-        )
-        mt3_fitted_exp = exponential_decay(mt3_indices, *popt_exp)
-
-        ss_res_exp = np.sum((mt3_success_rates - mt3_fitted_exp) ** 2)
-        ss_tot = np.sum((mt3_success_rates - np.mean(mt3_success_rates)) ** 2)
-        r2_exp = 1 - (ss_res_exp / ss_tot)
-        rmse_exp = np.sqrt(np.mean((mt3_success_rates - mt3_fitted_exp) ** 2))
-        # AIC for model comparison (lower is better)
-        n = len(mt3_success_rates)
-        aic_exp = n * np.log(ss_res_exp / n) + 2 * 2  # 2 parameters
-
-        print(f"\n  [1] Exponential: f(x) = a * exp(-x/b)")
-        print(f"      Parameters: a={popt_exp[0]:.4f}, b={popt_exp[1]:.2f}")
-        print(f"      R² = {r2_exp:.4f}, RMSE = {rmse_exp:.4f}, AIC = {aic_exp:.2f}")
-    except Exception as e:
-        print(f"  Exponential fit failed: {e}")
-        r2_exp = -999
-        aic_exp = 999
-
-    # --- Weibull Fit ---
-    try:
-        popt_weibull, _ = curve_fit(
-            weibull_decay, mt3_indices, mt3_success_rates,
-            p0=[0.5, 100, 1],
-            bounds=([0, 1, 0.1], [1, 500, 5]),
-            sigma=1/np.sqrt(mt3_sample_counts + 1),
-            maxfev=5000
-        )
-        mt3_fitted_weibull = weibull_decay(mt3_indices, *popt_weibull)
-
-        ss_res_weibull = np.sum((mt3_success_rates - mt3_fitted_weibull) ** 2)
-        r2_weibull = 1 - (ss_res_weibull / ss_tot)
-        rmse_weibull = np.sqrt(np.mean((mt3_success_rates - mt3_fitted_weibull) ** 2))
-        aic_weibull = n * np.log(ss_res_weibull / n) + 2 * 3  # 3 parameters
-
-        print(f"\n  [2] Weibull: f(x) = a * exp(-(x/b)^c)")
-        print(f"      Parameters: a={popt_weibull[0]:.4f}, b={popt_weibull[1]:.2f}, c={popt_weibull[2]:.4f}")
-        print(f"      R² = {r2_weibull:.4f}, RMSE = {rmse_weibull:.4f}, AIC = {aic_weibull:.2f}")
-    except Exception as e:
-        print(f"  Weibull fit failed: {e}")
-        r2_weibull = -999
-        aic_weibull = 999
-
-    # --- Model Selection ---
-    print(f"\n  {'─'*50}")
-    print(f"  Model Comparison:")
-    print(f"  {'─'*50}")
-    print(f"  | Model       | R²     | RMSE   | AIC     |")
-    print(f"  |-------------|--------|--------|---------|")
-    print(f"  | Exponential | {r2_exp:.4f} | {rmse_exp:.4f} | {aic_exp:7.2f} |")
-    print(f"  | Weibull     | {r2_weibull:.4f} | {rmse_weibull:.4f} | {aic_weibull:7.2f} |")
-
-    if aic_weibull < aic_exp:
-        print(f"\n  ✓ BEST MODEL: Weibull (lower AIC by {aic_exp - aic_weibull:.2f})")
-        mt3_fitted = mt3_fitted_weibull
-        mt3_fit_label = f"Weibull (a={popt_weibull[0]:.2f}, b={popt_weibull[1]:.0f}, c={popt_weibull[2]:.2f})"
-        popt = popt_weibull
-        r_squared = r2_weibull
-    else:
-        print(f"\n  ✓ BEST MODEL: Exponential (lower AIC by {aic_weibull - aic_exp:.2f})")
-        mt3_fitted = mt3_fitted_exp
-        mt3_fit_label = f"Exponential (a={popt_exp[0]:.2f}, b={popt_exp[1]:.0f})"
-        popt = popt_exp
-        r_squared = r2_exp
-
-    # =========================================================================
-    # Zeng trend test (Linear regression to prove NO position dependence)
-    # =========================================================================
-    if zeng_indices is not None and len(zeng_indices) > 2:
-        # Get sample counts for Zeng
-        zeng_sample_counts = []
-        for idx in zeng_indices:
-            zeng_sample_counts.append(len(by_index_zeng[idx]))
-        zeng_sample_counts = np.array(zeng_sample_counts)
-
-        # Linear regression: evaluability ~ position
-        slope, intercept, r_value, p_value, std_err = linregress(zeng_indices, zeng_success_rates)
-
-        print(f"\n{'='*60}")
-        print("Zeng Linear Regression (H0: no position dependence)")
-        print(f"{'='*60}")
-        print(f"  Slope = {slope*100:.4f}%/measure")
-        print(f"  Intercept = {intercept*100:.2f}%")
-        print(f"  R² = {r_value**2:.6f}")
-        print(f"  p-value = {p_value:.4f}")
-        print(f"  95% CI for slope: [{(slope-1.96*std_err)*100:.4f}%, {(slope+1.96*std_err)*100:.4f}%]")
-        print(f"  Sample counts per position: min={min(zeng_sample_counts)}, max={max(zeng_sample_counts)}, mean={np.mean(zeng_sample_counts):.1f}")
-
-        if p_value > 0.05:
-            print(f"  ✓ CONCLUSION: p={p_value:.3f} > 0.05, NO significant trend (constant model valid)")
-        else:
-            print(f"  ✗ CONCLUSION: p={p_value:.3f} < 0.05, significant trend detected")
-
-    # =========================================================================
-    # Plot
-    # =========================================================================
+    # Publication quality settings
     plt.rcParams.update({
         "font.family": "sans-serif",
         "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
@@ -660,582 +579,179 @@ def plot_evaluability_comparison(
         "xtick.labelsize": 10,
         "ytick.labelsize": 10,
         "axes.linewidth": 1.2,
-        "lines.linewidth": 2.5,
         "figure.dpi": 300,
     })
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    # Colors
-    color_mt3 = "#648FFF"      # Blue
-    color_zeng = "#228B22"     # Green (Forest Green)
-
-    # Plot MT3: scatter + Weibull fit
-    ax.scatter(mt3_indices, mt3_success_rates * 100, alpha=0.3, s=15,
-               color=color_mt3, edgecolors="none", rasterized=True,
-               label="_nolegend_")
-    ax.plot(mt3_indices, mt3_fitted * 100, color=color_mt3, linewidth=2.5,
-            label=f"MT3 + MuseScore ({mt3_fit_label})")
-
-    # Plot Zeng: scatter + constant line
-    if zeng_indices is not None and zeng_success_rates is not None:
-        ax.scatter(zeng_indices, zeng_success_rates * 100, alpha=0.3, s=15,
-                   color=color_zeng, edgecolors="none", rasterized=True,
-                   label="_nolegend_")
-        ax.axhline(y=zeng_mean * 100, color=color_zeng, linewidth=2.5,
-                   linestyle="-", label=f"Zeng (constant = {zeng_mean*100:.1f}%)")
-    else:
-        # Fallback: just draw constant line at default value
-        ax.axhline(y=88.2, color=color_zeng, linewidth=2.5,
-                   linestyle="-", label="Zeng (constant = 88.2%)")
-
-    # Formatting
-    ax.set_xlabel("Chunk Position (measure number)")
-    ax.set_ylabel("Evaluability / Success Rate (%)")
-    ax.set_title("Evaluability vs Chunk Position: Pipeline vs E2E", fontweight="bold")
-
-    max_idx = max(mt3_indices)
-    if zeng_indices is not None:
-        max_idx = max(max_idx, max(zeng_indices))
-    ax.set_xlim(0, max_idx + 10)
-    ax.set_ylim(0, 105)
-
-    ax.legend(loc="upper right", frameon=True, fancybox=False, edgecolor="black")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.grid(True, alpha=0.3, linestyle="--")
-
-    plt.tight_layout()
-
-    if output_path:
-        pdf_path = output_path.replace(".png", ".pdf")
-        plt.savefig(pdf_path, format="pdf", bbox_inches="tight")
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        print(f"Plot saved to: {pdf_path} and {output_path}")
-    else:
-        plt.show()
-
-    plt.close()
-
-
-def analyze_cumulative_error(
-    results: List[ChunkResult],
-    output_path: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Analyze whether MT3+MuseScore exhibits cumulative error.
-
-    Three complementary analyses:
-
-    1. Transition Matrix: P(fail|prev_fail) vs P(fail|prev_success)
-       - If cumulative error: P(fail|prev_fail) >> P(fail|prev_success)
-       - Failure should be "sticky"
-
-    2. Run Length Analysis: Distribution of consecutive success/fail runs
-       - If cumulative error: long fail runs, short recovery
-
-    3. Time to First Failure: Kaplan-Meier survival analysis
-       - If cumulative error: Weibull c > 1 (accelerating hazard)
-
-    Args:
-        results: List of chunk results
-        output_path: Path to save analysis plots
-
-    Returns:
-        Dictionary with analysis results
-    """
-    try:
-        import matplotlib.pyplot as plt
-        from scipy.optimize import curve_fit
-    except ImportError:
-        print("matplotlib and scipy required: pip install matplotlib scipy")
-        return {}
-
-    # =========================================================================
-    # Group by (piece_id, performance) and build sequences
-    # =========================================================================
-    by_performance = defaultdict(list)
-    for r in results:
-        key = (r.piece_id, r.performance)
-        by_performance[key].append(r)
-
-    print(f"\n{'='*70}")
-    print("CUMULATIVE ERROR ANALYSIS")
-    print(f"{'='*70}")
-    print(f"Total performances: {len(by_performance)}")
-
-    # Build success/fail sequences for each performance
-    # sequence[i] = 1 if success, 0 if fail
-    sequences = []
-    for (piece_id, perf), chunks in by_performance.items():
-        chunks_sorted = sorted(chunks, key=lambda x: x.chunk_index)
-        seq = [1 if c.status == "success" else 0 for c in chunks_sorted]
-        sequences.append({
-            "piece_id": piece_id,
-            "performance": perf,
-            "sequence": seq,
-            "length": len(seq),
-        })
-
-    avg_length = np.mean([s["length"] for s in sequences])
-    print(f"Average sequence length: {avg_length:.1f} chunks")
-
-    # =========================================================================
-    # Analysis 1: Transition Matrix
-    # =========================================================================
-    # Count transitions: success->success, success->fail, fail->success, fail->fail
-    transitions = {"SS": 0, "SF": 0, "FS": 0, "FF": 0}
-
-    for s in sequences:
-        seq = s["sequence"]
-        for i in range(len(seq) - 1):
-            prev, curr = seq[i], seq[i + 1]
-            if prev == 1 and curr == 1:
-                transitions["SS"] += 1
-            elif prev == 1 and curr == 0:
-                transitions["SF"] += 1
-            elif prev == 0 and curr == 1:
-                transitions["FS"] += 1
-            else:  # prev == 0 and curr == 0
-                transitions["FF"] += 1
-
-    # Calculate conditional probabilities
-    total_after_success = transitions["SS"] + transitions["SF"]
-    total_after_fail = transitions["FS"] + transitions["FF"]
-
-    p_fail_given_success = transitions["SF"] / total_after_success if total_after_success > 0 else 0
-    p_fail_given_fail = transitions["FF"] / total_after_fail if total_after_fail > 0 else 0
-    p_success_given_fail = transitions["FS"] / total_after_fail if total_after_fail > 0 else 0
-
-    print(f"\n{'-'*50}")
-    print("Analysis 1: Transition Matrix")
-    print(f"{'-'*50}")
-    print(f"\nTransition counts:")
-    print(f"  Success -> Success: {transitions['SS']:,}")
-    print(f"  Success -> Fail:    {transitions['SF']:,}")
-    print(f"  Fail -> Success:    {transitions['FS']:,}")
-    print(f"  Fail -> Fail:       {transitions['FF']:,}")
-    print(f"\nConditional probabilities:")
-    print(f"  P(fail | prev_success) = {p_fail_given_success*100:.2f}%")
-    print(f"  P(fail | prev_fail)    = {p_fail_given_fail*100:.2f}%")
-    print(f"  P(success | prev_fail) = {p_success_given_fail*100:.2f}%  <- 'Recovery rate'")
-
-    # Sticky ratio: how much more likely to fail after a fail vs after a success
-    sticky_ratio = p_fail_given_fail / p_fail_given_success if p_fail_given_success > 0 else float('inf')
-    print(f"\n  Sticky ratio = P(fail|fail) / P(fail|success) = {sticky_ratio:.2f}")
-
-    if sticky_ratio > 1.5:
-        print(f"  *** Sticky ratio > 1.5: Failure is STICKY (cumulative error SUPPORTED) ***")
-    else:
-        print(f"  Sticky ratio <= 1.5: Failure is NOT particularly sticky")
-
-    # =========================================================================
-    # Analysis 2: Run Length Analysis
-    # =========================================================================
-    success_runs = []  # lengths of consecutive success runs
-    fail_runs = []     # lengths of consecutive fail runs
-
-    for s in sequences:
-        seq = s["sequence"]
-        if not seq:
-            continue
-
-        current_val = seq[0]
-        current_run = 1
-
-        for i in range(1, len(seq)):
-            if seq[i] == current_val:
-                current_run += 1
-            else:
-                # End of run
-                if current_val == 1:
-                    success_runs.append(current_run)
-                else:
-                    fail_runs.append(current_run)
-                current_val = seq[i]
-                current_run = 1
-
-        # Don't forget the last run
-        if current_val == 1:
-            success_runs.append(current_run)
-        else:
-            fail_runs.append(current_run)
-
-    print(f"\n{'-'*50}")
-    print("Analysis 2: Run Length Analysis")
-    print(f"{'-'*50}")
-    print(f"\nSuccess runs: n={len(success_runs)}")
-    print(f"  Mean length: {np.mean(success_runs):.2f}")
-    print(f"  Median:      {np.median(success_runs):.1f}")
-    print(f"  Max:         {max(success_runs)}")
-    print(f"  Distribution: {np.percentile(success_runs, [25, 50, 75, 90, 95])}")
-
-    print(f"\nFail runs: n={len(fail_runs)}")
-    print(f"  Mean length: {np.mean(fail_runs):.2f}")
-    print(f"  Median:      {np.median(fail_runs):.1f}")
-    print(f"  Max:         {max(fail_runs)}")
-    print(f"  Distribution: {np.percentile(fail_runs, [25, 50, 75, 90, 95])}")
-
-    # If cumulative error: fail runs should be longer than expected from random
-    # Expected run length under independence = 1 / P(transition)
-    expected_fail_run = 1 / p_success_given_fail if p_success_given_fail > 0 else float('inf')
-    print(f"\n  Expected fail run length (if independent): {expected_fail_run:.2f}")
-    print(f"  Actual mean fail run length: {np.mean(fail_runs):.2f}")
-
-    if np.mean(fail_runs) > expected_fail_run * 1.2:
-        print(f"  *** Fail runs are LONGER than expected (cumulative error SUPPORTED) ***")
-    else:
-        print(f"  Fail runs are close to expected (no strong cumulative effect)")
-
-    # =========================================================================
-    # Analysis 3: Time to First Failure (Kaplan-Meier style)
-    # =========================================================================
-    # For each performance, find position of first failure
-    first_failures = []
-    for s in sequences:
-        seq = s["sequence"]
-        first_fail_pos = None
-        for i, val in enumerate(seq):
-            if val == 0:
-                first_fail_pos = i
-                break
-        if first_fail_pos is not None:
-            first_failures.append(first_fail_pos)
-        else:
-            # Never failed - censored at end of sequence
-            first_failures.append(len(seq))  # right-censored
-
-    print(f"\n{'-'*50}")
-    print("Analysis 3: Time to First Failure")
-    print(f"{'-'*50}")
-    print(f"\nFirst failure position:")
-    print(f"  Mean: {np.mean(first_failures):.2f}")
-    print(f"  Median: {np.median(first_failures):.1f}")
-    print(f"  Min: {min(first_failures)}, Max: {max(first_failures)}")
-
-    # Compute survival curve: S(t) = P(first failure > t)
-    max_t = max(first_failures)
-    survival_t = list(range(max_t + 1))
-    survival_prob = []
-    for t in survival_t:
-        n_survived = sum(1 for ff in first_failures if ff > t)
-        survival_prob.append(n_survived / len(first_failures))
-
-    survival_t = np.array(survival_t)
-    survival_prob = np.array(survival_prob)
-
-    # Fit Weibull survival: S(t) = exp(-(t/b)^c)
-    def weibull_survival(t, b, c):
-        return np.exp(-((t / b) ** c))
-
-    # Filter out zeros for fitting
-    mask = survival_prob > 0.01
-    t_fit = survival_t[mask]
-    s_fit = survival_prob[mask]
-
-    try:
-        popt, _ = curve_fit(
-            weibull_survival, t_fit, s_fit,
-            p0=[50, 1],
-            bounds=([1, 0.1], [500, 10]),
-            maxfev=5000
-        )
-        weibull_b, weibull_c = popt
-
-        # Goodness of fit
-        fitted = weibull_survival(t_fit, *popt)
-        ss_res = np.sum((s_fit - fitted) ** 2)
-        ss_tot = np.sum((s_fit - np.mean(s_fit)) ** 2)
-        r2 = 1 - (ss_res / ss_tot)
-
-        print(f"\nWeibull survival fit: S(t) = exp(-(t/b)^c)")
-        print(f"  b (scale) = {weibull_b:.2f}")
-        print(f"  c (shape) = {weibull_c:.4f}")
-        print(f"  R² = {r2:.4f}")
-        print(f"\n  *** Shape parameter c = {weibull_c:.4f} ***")
-
-        if weibull_c > 1:
-            print(f"  c > 1: ACCELERATING hazard (cumulative error SUPPORTED)")
-            print(f"         The longer you survive, the MORE likely to fail next")
-        elif weibull_c < 1:
-            print(f"  c < 1: DECELERATING hazard (infant mortality)")
-            print(f"         Early failures, then stabilizes")
-        else:
-            print(f"  c = 1: CONSTANT hazard (memoryless/exponential)")
-
-    except Exception as e:
-        print(f"Weibull fit failed: {e}")
-        weibull_b, weibull_c, r2 = None, None, None
-
-    # =========================================================================
-    # Plot all three analyses
-    # =========================================================================
-    if output_path:
-        plt.rcParams.update({
-            "font.family": "sans-serif",
-            "font.size": 10,
-            "axes.labelsize": 11,
-            "axes.titlesize": 12,
-            "legend.fontsize": 9,
-            "figure.dpi": 300,
-        })
-
-        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-
-        # Plot 1: Transition probabilities
-        ax1 = axes[0]
-        labels = ["P(F|S)", "P(F|F)", "P(S|F)"]
-        values = [p_fail_given_success * 100, p_fail_given_fail * 100, p_success_given_fail * 100]
-        colors = ["#648FFF", "#DC267F", "#228B22"]
-        bars = ax1.bar(labels, values, color=colors, edgecolor="black", linewidth=1)
-        ax1.set_ylabel("Probability (%)")
-        ax1.set_title("(a) Transition Probabilities", fontweight="bold")
-        ax1.set_ylim(0, 100)
-        for bar, val in zip(bars, values):
-            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 2,
-                     f"{val:.1f}%", ha="center", fontsize=9)
-
-        # Plot 2: Run length distribution
-        ax2 = axes[1]
-        ax2.hist(success_runs, bins=30, alpha=0.6, label=f"Success (mean={np.mean(success_runs):.1f})",
-                 color="#228B22", edgecolor="black", linewidth=0.5)
-        ax2.hist(fail_runs, bins=30, alpha=0.6, label=f"Fail (mean={np.mean(fail_runs):.1f})",
-                 color="#DC267F", edgecolor="black", linewidth=0.5)
-        ax2.set_xlabel("Run Length")
-        ax2.set_ylabel("Frequency")
-        ax2.set_title("(b) Run Length Distribution", fontweight="bold")
-        ax2.legend()
-        ax2.set_xlim(0, min(100, max(max(success_runs), max(fail_runs))))
-
-        # Plot 3: Survival curve
-        ax3 = axes[2]
-        ax3.step(survival_t, survival_prob * 100, where="post", color="#648FFF",
-                 linewidth=2, label="Empirical")
-        if weibull_c is not None:
-            t_smooth = np.linspace(0, max(t_fit), 200)
-            ax3.plot(t_smooth, weibull_survival(t_smooth, weibull_b, weibull_c) * 100,
-                     color="#DC267F", linewidth=2, linestyle="--",
-                     label=f"Weibull (c={weibull_c:.2f})")
-        ax3.set_xlabel("Position (chunks from start)")
-        ax3.set_ylabel("Survival Probability (%)")
-        ax3.set_title("(c) Time to First Failure", fontweight="bold")
-        ax3.legend()
-        ax3.set_xlim(0, min(150, max(survival_t)))
-        ax3.set_ylim(0, 105)
-
-        for ax in axes:
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-
-        plt.tight_layout()
-
-        pdf_path = output_path.replace(".png", ".pdf")
-        plt.savefig(pdf_path, format="pdf", bbox_inches="tight")
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        print(f"\nPlot saved to: {pdf_path} and {output_path}")
-        plt.close()
-
-    # =========================================================================
-    # Summary
-    # =========================================================================
-    print(f"\n{'='*70}")
-    print("SUMMARY: Cumulative Error Hypothesis")
-    print(f"{'='*70}")
-
-    evidence_for = 0
-    evidence_against = 0
-
-    print("\n| Test | Result | Interpretation |")
-    print("|------|--------|----------------|")
-
-    # Test 1: Sticky ratio
-    if sticky_ratio > 1.5:
-        print(f"| Sticky ratio | {sticky_ratio:.2f} | Failure is sticky (supports) |")
-        evidence_for += 1
-    else:
-        print(f"| Sticky ratio | {sticky_ratio:.2f} | Not sticky (against) |")
-        evidence_against += 1
-
-    # Test 2: Fail run length
-    if np.mean(fail_runs) > expected_fail_run * 1.2:
-        print(f"| Fail run length | {np.mean(fail_runs):.1f} > {expected_fail_run:.1f} | Longer than expected (supports) |")
-        evidence_for += 1
-    else:
-        print(f"| Fail run length | {np.mean(fail_runs):.1f} ~ {expected_fail_run:.1f} | As expected (against) |")
-        evidence_against += 1
-
-    # Test 3: Weibull shape
-    if weibull_c is not None:
-        if weibull_c > 1.2:
-            print(f"| Weibull c | {weibull_c:.2f} | Accelerating hazard (supports) |")
-            evidence_for += 1
-        elif weibull_c < 0.8:
-            print(f"| Weibull c | {weibull_c:.2f} | Decelerating hazard (against) |")
-            evidence_against += 1
-        else:
-            print(f"| Weibull c | {weibull_c:.2f} | Near constant (neutral) |")
-
-    print(f"\nEvidence for cumulative error: {evidence_for}/3")
-    print(f"Evidence against: {evidence_against}/3")
-
-    if evidence_for >= 2:
-        print("\n*** CONCLUSION: Cumulative error hypothesis is SUPPORTED ***")
-    elif evidence_against >= 2:
-        print("\n*** CONCLUSION: Cumulative error hypothesis is NOT SUPPORTED ***")
-    else:
-        print("\n*** CONCLUSION: Mixed evidence, no strong conclusion ***")
-
-    return {
-        "transitions": transitions,
-        "p_fail_given_success": p_fail_given_success,
-        "p_fail_given_fail": p_fail_given_fail,
-        "sticky_ratio": sticky_ratio,
-        "mean_success_run": np.mean(success_runs),
-        "mean_fail_run": np.mean(fail_runs),
-        "weibull_b": weibull_b,
-        "weibull_c": weibull_c,
-        "evidence_for": evidence_for,
-        "evidence_against": evidence_against,
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    # Colors for each system (formal names for publication)
+    # Using IBM/Wong colorblind-safe palette
+    styles = {
+        "MT3 + MuseScore": {"color": "#DC267F", "label": "MT3 + MuseScore (Pipeline)"},
+        "Transkun + Beyer": {"color": "#FE6100", "label": "Transkun + Beyer et al. (Pipeline)"},
+        "Zeng (E2E)": {"color": "#648FFF", "label": "Zeng et al. (E2E)"},
     }
 
-
-def plot_pipeline_vs_e2e_mode_locking(
-    mt3_results: List[ChunkResult],
-    zeng_csv_path: str,
-    output_path: Optional[str] = None,
-) -> None:
-    """
-    Compare Mode Locking between Pipeline (MT3) and E2E (Zeng) methods.
-
-    Key insight: Pipeline methods get "locked" into failure mode early,
-    while E2E methods can recover from failures.
-
-    Creates a figure with:
-    (a) Recovery Rate comparison: P(success | prev_fail)
-    (b) First-chunk effect comparison
-
-    Args:
-        mt3_results: List of MT3 chunk results
-        zeng_csv_path: Path to Zeng results CSV
-        output_path: Path to save the plot
-    """
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib required")
-        return
-
-    # =========================================================================
-    # Process MT3 data
-    # =========================================================================
-    mt3_by_perf = defaultdict(list)
-    for r in mt3_results:
-        key = (r.piece_id, r.performance)
-        mt3_by_perf[key].append(r)
-
-    mt3_transitions = {"SS": 0, "SF": 0, "FS": 0, "FF": 0}
-    mt3_songs = []
-
-    for (piece, perf), chunks in mt3_by_perf.items():
-        chunks_sorted = sorted(chunks, key=lambda x: x.chunk_index)
-        seq = [1 if c.status == "success" else 0 for c in chunks_sorted]
-        if len(seq) < 2:
+    for name, csv_path in csv_paths.items():
+        if not Path(csv_path).exists():
+            print(f"Warning: {csv_path} not found, skipping {name}")
             continue
-        mt3_songs.append({
-            "sequence": seq,
-            "first_success": seq[0] == 1,
-        })
-        for i in range(len(seq) - 1):
-            prev, curr = seq[i], seq[i + 1]
-            key = ("S" if prev else "F") + ("S" if curr else "F")
-            mt3_transitions[key] += 1
 
-    # =========================================================================
-    # Process Zeng data
-    # =========================================================================
-    zeng_by_perf = defaultdict(list)
-    with open(zeng_csv_path, "r") as f:
-        import csv
-        reader = csv.DictReader(f)
-        for row in reader:
-            task_id = row.get("task_id", "")
-            if "#" in task_id:
-                parts = task_id.rsplit("#", 1)
-                if len(parts) == 2 and "." in parts[1]:
-                    piece = parts[0]
-                    perf = parts[1].rsplit(".", 1)[0]
-                    chunk_idx = int(parts[1].rsplit(".", 1)[1])
-                    zeng_by_perf[(piece, perf)].append({
-                        "chunk_idx": chunk_idx,
-                        "status": row.get("status", "unknown"),
+        df = pd.read_csv(csv_path)
+        df["success"] = (df["status"] == "success").astype(int)
+
+        # Parse song_id and chunk_index from task_id
+        if "task_id" in df.columns:
+            df["song_id"] = df["task_id"].apply(
+                lambda x: x.rsplit(".", 1)[0] if "." in x else x
+            )
+            df["chunk_index"] = df["task_id"].apply(
+                lambda x: int(x.rsplit(".", 1)[1]) if "." in x else 0
+            )
+
+        # Compute normalized position within each song
+        song_lengths = df.groupby("song_id")["chunk_index"].max()
+        df["song_length"] = df["song_id"].map(song_lengths)
+        df["position_norm"] = df["chunk_index"] / df["song_length"]
+
+        # Get initial success rate (first chunk of each song)
+        first_chunks = df[df["chunk_index"] == 1]
+        pi_0 = first_chunks["success"].mean() if len(first_chunks) > 0 else df["success"].mean()
+
+        # Fit transition model
+        df_sorted = df.sort_values(["song_id", "chunk_index"]).reset_index(drop=True)
+        df_sorted["prev_success"] = df_sorted.groupby("song_id")["success"].shift(1)
+        df_model = df_sorted.dropna(subset=["prev_success"]).copy()
+        df_model["prev_success"] = df_model["prev_success"].astype(int)
+
+        try:
+            model = smf.logit("success ~ position_norm + prev_success", data=df_model)
+            result = model.fit(disp=0)
+            b0 = result.params["Intercept"]
+            b1 = result.params["position_norm"]
+            b2 = result.params["prev_success"]
+        except Exception as e:
+            print(f"Could not fit model for {name}: {e}")
+            continue
+
+        # Compute theoretical marginal via Markov chain
+        positions, marginals = compute_markov_marginal(b0, b1, b2, pi_0)
+
+        style = styles.get(name, {"color": "gray"})
+        color = style["color"]
+
+        # Compute measure-level evaluability
+        # Each chunk covers 5 measures with stride=1, so measures overlap across chunks
+        # For measure m: evaluability = mean(success) for all chunks containing m
+        measure_data = []
+
+        for song_id in df["song_id"].unique():
+            song_df = df[df["song_id"] == song_id].copy()
+            if len(song_df) == 0:
+                continue
+
+            # Determine measure range for this song
+            # chunk_index corresponds to start_measure (1-indexed, 5-bar chunks)
+            min_chunk = song_df["chunk_index"].min()
+            max_chunk = song_df["chunk_index"].max()
+            # Last chunk covers measures [max_chunk, max_chunk+4]
+            max_measure = max_chunk + 4
+
+            # For each measure, find chunks that contain it
+            for measure in range(min_chunk, max_measure + 1):
+                # Chunk with start_measure=s covers measures [s, s+4]
+                # So measure m is in chunk s if s <= m <= s+4, i.e., m-4 <= s <= m
+                containing_chunks = song_df[
+                    (song_df["chunk_index"] >= measure - 4) &
+                    (song_df["chunk_index"] <= measure)
+                ]
+
+                if len(containing_chunks) > 0:
+                    evaluability = containing_chunks["success"].mean()
+                    # Normalized position: measure / total_measures
+                    pos_norm = measure / max_measure
+                    measure_data.append({
+                        "song_id": song_id,
+                        "measure": measure,
+                        "position_norm": pos_norm,
+                        "evaluability": evaluability,
                     })
 
-    zeng_transitions = {"SS": 0, "SF": 0, "FS": 0, "FF": 0}
-    zeng_songs = []
+        if measure_data:
+            measure_df = pd.DataFrame(measure_data)
 
-    for (piece, perf), chunks in zeng_by_perf.items():
-        chunks_sorted = sorted(chunks, key=lambda x: x["chunk_idx"])
-        seq = [1 if c["status"] == "success" else 0 for c in chunks_sorted]
-        if len(seq) < 2:
-            continue
-        zeng_songs.append({
-            "sequence": seq,
-            "first_success": seq[0] == 1,
-        })
-        for i in range(len(seq) - 1):
-            prev, curr = seq[i], seq[i + 1]
-            key = ("S" if prev else "F") + ("S" if curr else "F")
-            zeng_transitions[key] += 1
+            # Compute empirical mean with bootstrap CI using position bins
+            n_bins = 50
+            measure_df["pos_bin"] = pd.cut(
+                measure_df["position_norm"], bins=n_bins, labels=False
+            )
 
-    # =========================================================================
-    # Calculate metrics
-    # =========================================================================
-    # Recovery rate: P(success | prev_fail)
-    mt3_recovery = mt3_transitions["FS"] / (mt3_transitions["FS"] + mt3_transitions["FF"]) \
-        if (mt3_transitions["FS"] + mt3_transitions["FF"]) > 0 else 0
-    zeng_recovery = zeng_transitions["FS"] / (zeng_transitions["FS"] + zeng_transitions["FF"]) \
-        if (zeng_transitions["FS"] + zeng_transitions["FF"]) > 0 else 0
+            # Compute mean and bootstrap CI for each bin
+            bin_stats = []
+            for bin_idx in range(n_bins):
+                bin_data = measure_df[measure_df["pos_bin"] == bin_idx]["evaluability"].values
+                if len(bin_data) >= 5:
+                    mean_val = np.mean(bin_data)
+                    # Bootstrap CI
+                    n_bootstrap = 1000
+                    np.random.seed(42)
+                    boot_means = [
+                        np.mean(np.random.choice(bin_data, size=len(bin_data), replace=True))
+                        for _ in range(n_bootstrap)
+                    ]
+                    ci_low = np.percentile(boot_means, 2.5)
+                    ci_high = np.percentile(boot_means, 97.5)
+                    bin_stats.append({
+                        "pos": (bin_idx + 0.5) / n_bins,
+                        "mean": mean_val,
+                        "ci_low": ci_low,
+                        "ci_high": ci_high,
+                    })
 
-    # =========================================================================
-    # Plot: Single panel showing Recovery Rate
-    # =========================================================================
-    plt.rcParams.update({
-        "font.family": "sans-serif",
-        "font.size": 12,
-        "axes.labelsize": 13,
-        "axes.titlesize": 14,
-        "legend.fontsize": 11,
-        "figure.dpi": 300,
-    })
+            if bin_stats:
+                stats_df = pd.DataFrame(bin_stats)
 
-    fig, ax = plt.subplots(figsize=(6, 5))
+                # Plot empirical CI ribbon
+                ax.fill_between(
+                    stats_df["pos"],
+                    stats_df["ci_low"] * 100,
+                    stats_df["ci_high"] * 100,
+                    color=color,
+                    alpha=0.2,
+                    linewidth=0,
+                )
 
-    color_pipeline = "#DC267F"  # Magenta for Pipeline
-    color_e2e = "#228B22"       # Green for E2E
+                # Plot empirical mean line (dashed)
+                ax.plot(
+                    stats_df["pos"],
+                    stats_df["mean"] * 100,
+                    color=color,
+                    linewidth=1.5,
+                    linestyle="--",
+                    alpha=0.7,
+                )
 
-    # Recovery Rate comparison
-    methods = ["MT3+MuseScore\n(Pipeline)", "Zeng\n(E2E)"]
-    recovery_rates = [mt3_recovery * 100, zeng_recovery * 100]
-    n_samples = [
-        mt3_transitions["FS"] + mt3_transitions["FF"],
-        zeng_transitions["FS"] + zeng_transitions["FF"],
-    ]
-    colors = [color_pipeline, color_e2e]
+        # Plot theoretical marginal
+        ax.plot(
+            positions,
+            marginals * 100,
+            color=color,
+            linewidth=2.5,
+            label=style.get("label", name),
+            alpha=0.9,
+        )
 
-    bars = ax.bar(methods, recovery_rates, color=colors, edgecolor="black", linewidth=1.5, width=0.6)
-
-    for bar, val, n in zip(bars, recovery_rates, n_samples):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 2,
-                f"{val:.1f}%\n(n={n:,})", ha="center", fontsize=11, fontweight="bold")
-
-    ax.set_ylabel("Recovery Rate: P(success | prev_fail)", fontsize=13)
-    ax.set_title("Mode Locking: Pipeline vs E2E", fontweight="bold", fontsize=14)
+    # Plot formatting
+    ax.axhline(y=50, color="gray", linestyle="--", linewidth=1, alpha=0.5)
+    ax.set_xlabel("Position within Song (normalized)")
+    ax.set_ylabel("MV2H Evaluability (%)")
+    ax.set_title("Pipeline Systems Exhibit Cumulative Error Propagation", fontweight="bold")
+    ax.set_xlim(0, 1)
     ax.set_ylim(0, 100)
-    ax.axhline(y=50, color="gray", linestyle="--", alpha=0.5, linewidth=1.5)
-    ax.text(1.35, 52, "Random (50%)", fontsize=10, color="gray", va="bottom")
+    ax.legend(loc="lower left", frameon=True, fancybox=False, edgecolor="black")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.tick_params(axis="x", labelsize=11)
+    ax.grid(axis="y", alpha=0.3, linestyle="-")
 
     plt.tight_layout()
 
@@ -1243,358 +759,11 @@ def plot_pipeline_vs_e2e_mode_locking(
         pdf_path = output_path.replace(".png", ".pdf")
         plt.savefig(pdf_path, format="pdf", bbox_inches="tight")
         plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        print(f"Pipeline vs E2E plot saved to: {pdf_path} and {output_path}")
+        print(f"Success rate plot saved to: {pdf_path} and {output_path}")
     else:
         plt.show()
 
     plt.close()
-
-
-def plot_mode_locking(
-    results: List[ChunkResult],
-    output_path: Optional[str] = None,
-) -> None:
-    """
-    Visualize Mode Locking phenomenon in MT3+MuseScore pipeline.
-
-    Shows that success/failure is determined early and persists throughout the song,
-    rather than accumulating errors over time.
-
-    Creates a figure with:
-    (a) Per-song success pattern heatmap (sorted by success rate)
-    (b) First-chunk conditional analysis
-    (c) Transition probability diagram
-
-    Args:
-        results: List of chunk results
-        output_path: Path to save the plot
-    """
-    try:
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        from matplotlib.colors import LinearSegmentedColormap
-    except ImportError:
-        print("matplotlib required: pip install matplotlib")
-        return
-
-    # =========================================================================
-    # Prepare data
-    # =========================================================================
-    by_performance = defaultdict(list)
-    for r in results:
-        key = (r.piece_id, r.performance)
-        by_performance[key].append(r)
-
-    # Build per-song data
-    song_data = []
-    for (piece_id, perf), chunks in by_performance.items():
-        chunks_sorted = sorted(chunks, key=lambda x: x.chunk_index)
-        seq = [1 if c.status == "success" else 0 for c in chunks_sorted]
-        success_rate = np.mean(seq)
-        first_success = seq[0] == 1 if seq else False
-        song_data.append({
-            "piece_id": piece_id,
-            "performance": perf,
-            "sequence": seq,
-            "length": len(seq),
-            "success_rate": success_rate,
-            "first_success": first_success,
-        })
-
-    # Sort by success rate for heatmap
-    song_data_sorted = sorted(song_data, key=lambda x: -x["success_rate"])
-
-    # =========================================================================
-    # Calculate statistics
-    # =========================================================================
-    # First-chunk conditional
-    first_success_songs = [s for s in song_data if s["first_success"]]
-    first_fail_songs = [s for s in song_data if not s["first_success"]]
-
-    rest_rate_after_success = np.mean([
-        np.mean(s["sequence"][1:]) if len(s["sequence"]) > 1 else 0
-        for s in first_success_songs
-    ]) if first_success_songs else 0
-
-    rest_rate_after_fail = np.mean([
-        np.mean(s["sequence"][1:]) if len(s["sequence"]) > 1 else 0
-        for s in first_fail_songs
-    ]) if first_fail_songs else 0
-
-    # Transition probabilities
-    transitions = {"SS": 0, "SF": 0, "FS": 0, "FF": 0}
-    for s in song_data:
-        seq = s["sequence"]
-        for i in range(len(seq) - 1):
-            prev, curr = seq[i], seq[i + 1]
-            key = ("S" if prev else "F") + ("S" if curr else "F")
-            transitions[key] += 1
-
-    total_after_s = transitions["SS"] + transitions["SF"]
-    total_after_f = transitions["FS"] + transitions["FF"]
-    p_ss = transitions["SS"] / total_after_s if total_after_s > 0 else 0
-    p_ff = transitions["FF"] / total_after_f if total_after_f > 0 else 0
-
-    # =========================================================================
-    # Plot
-    # =========================================================================
-    plt.rcParams.update({
-        "font.family": "sans-serif",
-        "font.size": 10,
-        "axes.labelsize": 11,
-        "axes.titlesize": 12,
-        "legend.fontsize": 9,
-        "figure.dpi": 300,
-    })
-
-    fig = plt.figure(figsize=(12, 5))
-
-    # Layout: heatmap takes 60%, other two share 40%
-    gs = fig.add_gridspec(1, 3, width_ratios=[1.5, 1, 1], wspace=0.3)
-
-    # -------------------------------------------------------------------------
-    # (a) Heatmap: Per-song success pattern
-    # -------------------------------------------------------------------------
-    ax1 = fig.add_subplot(gs[0])
-
-    # Normalize sequences to same length (0-100%)
-    n_bins = 50
-    heatmap_data = []
-    for s in song_data_sorted:
-        seq = s["sequence"]
-        if len(seq) < 2:
-            continue
-        # Resample to n_bins
-        indices = np.linspace(0, len(seq) - 1, n_bins).astype(int)
-        resampled = [seq[i] for i in indices]
-        heatmap_data.append(resampled)
-
-    heatmap_array = np.array(heatmap_data)
-
-    # Custom colormap: red for fail, green for success
-    cmap = LinearSegmentedColormap.from_list("rg", ["#DC267F", "#228B22"])
-
-    im = ax1.imshow(heatmap_array, aspect="auto", cmap=cmap,
-                    extent=[0, 100, len(heatmap_data), 0])
-
-    ax1.set_xlabel("Position (% of song)")
-    ax1.set_ylabel("Songs (sorted by success rate)")
-    ax1.set_title("(a) Per-Song Success Pattern", fontweight="bold")
-
-    # Add colorbar legend
-    legend_elements = [
-        mpatches.Patch(facecolor="#228B22", label="Success"),
-        mpatches.Patch(facecolor="#DC267F", label="Fail"),
-    ]
-    ax1.legend(handles=legend_elements, loc="upper right", fontsize=8)
-
-    # -------------------------------------------------------------------------
-    # (b) First-chunk conditional
-    # -------------------------------------------------------------------------
-    ax2 = fig.add_subplot(gs[1])
-
-    categories = ["First chunk\nSUCCESS", "First chunk\nFAIL"]
-    values = [rest_rate_after_success * 100, rest_rate_after_fail * 100]
-    colors = ["#228B22", "#DC267F"]
-    counts = [len(first_success_songs), len(first_fail_songs)]
-
-    bars = ax2.bar(categories, values, color=colors, edgecolor="black", linewidth=1)
-
-    for bar, val, n in zip(bars, values, counts):
-        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 2,
-                 f"{val:.1f}%\n(n={n})", ha="center", fontsize=9)
-
-    ax2.set_ylabel("Rest of Song Success Rate (%)")
-    ax2.set_title("(b) First Chunk Determines Fate", fontweight="bold")
-    ax2.set_ylim(0, 70)
-    ax2.spines["top"].set_visible(False)
-    ax2.spines["right"].set_visible(False)
-
-    # -------------------------------------------------------------------------
-    # (c) Transition diagram
-    # -------------------------------------------------------------------------
-    ax3 = fig.add_subplot(gs[2])
-
-    # Draw two circles: Success state and Fail state
-    circle_s = plt.Circle((0.3, 0.5), 0.15, color="#228B22", alpha=0.8)
-    circle_f = plt.Circle((0.7, 0.5), 0.15, color="#DC267F", alpha=0.8)
-    ax3.add_patch(circle_s)
-    ax3.add_patch(circle_f)
-
-    ax3.text(0.3, 0.5, "S", ha="center", va="center", fontsize=16,
-             fontweight="bold", color="white")
-    ax3.text(0.7, 0.5, "F", ha="center", va="center", fontsize=16,
-             fontweight="bold", color="white")
-
-    # Self-loops (arrows back to same state)
-    # S -> S
-    ax3.annotate("", xy=(0.2, 0.65), xytext=(0.4, 0.65),
-                 arrowprops=dict(arrowstyle="->", color="#228B22", lw=2,
-                                connectionstyle="arc3,rad=0.5"))
-    ax3.text(0.3, 0.82, f"{p_ss*100:.0f}%", ha="center", fontsize=10,
-             fontweight="bold", color="#228B22")
-
-    # F -> F
-    ax3.annotate("", xy=(0.8, 0.65), xytext=(0.6, 0.65),
-                 arrowprops=dict(arrowstyle="->", color="#DC267F", lw=2,
-                                connectionstyle="arc3,rad=-0.5"))
-    ax3.text(0.7, 0.82, f"{p_ff*100:.0f}%", ha="center", fontsize=10,
-             fontweight="bold", color="#DC267F")
-
-    # Cross transitions (smaller, less prominent)
-    # S -> F
-    ax3.annotate("", xy=(0.55, 0.45), xytext=(0.45, 0.45),
-                 arrowprops=dict(arrowstyle="->", color="gray", lw=1.5))
-    ax3.text(0.5, 0.38, f"{(1-p_ss)*100:.0f}%", ha="center", fontsize=9, color="gray")
-
-    # F -> S
-    ax3.annotate("", xy=(0.45, 0.55), xytext=(0.55, 0.55),
-                 arrowprops=dict(arrowstyle="->", color="gray", lw=1.5))
-    ax3.text(0.5, 0.62, f"{(1-p_ff)*100:.0f}%", ha="center", fontsize=9, color="gray")
-
-    ax3.set_xlim(0, 1)
-    ax3.set_ylim(0, 1)
-    ax3.set_aspect("equal")
-    ax3.axis("off")
-    ax3.set_title("(c) Sticky Transitions", fontweight="bold")
-
-    # -------------------------------------------------------------------------
-    # Save
-    # -------------------------------------------------------------------------
-    plt.tight_layout()
-
-    if output_path:
-        pdf_path = output_path.replace(".png", ".pdf")
-        plt.savefig(pdf_path, format="pdf", bbox_inches="tight")
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        print(f"Mode locking plot saved to: {pdf_path} and {output_path}")
-    else:
-        plt.show()
-
-    plt.close()
-
-
-def plot_phase_drift(
-    results: List[ChunkResult],
-    output_path: Optional[str] = None,
-    window_size: int = 20,
-) -> None:
-    """
-    Plot Phase Drift visualization: Success Rate and MV2H vs Chunk Position.
-
-    Uses a sliding window to smooth the data and show the trend clearly.
-
-    Args:
-        results: List of chunk results
-        output_path: Path to save the plot (if None, displays interactively)
-        window_size: Window size for rolling average
-    """
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib required for plotting: pip install matplotlib")
-        return
-
-    # Group results by chunk_index
-    by_index = defaultdict(list)
-    for r in results:
-        by_index[r.chunk_index].append(r)
-
-    # Compute per-index metrics
-    indices = sorted(by_index.keys())
-    success_rates = []
-    mv2h_scores = []
-
-    for idx in indices:
-        chunk_results = by_index[idx]
-        successful = [r for r in chunk_results if r.status == "success"]
-        success_rate = len(successful) / len(chunk_results) if chunk_results else 0
-        success_rates.append(success_rate)
-
-        # MV2H for successful chunks only
-        if successful:
-            mv2h = np.mean([r.mv2h_custom for r in successful])
-        else:
-            mv2h = 0
-        mv2h_scores.append(mv2h)
-
-    # Convert to numpy arrays
-    indices = np.array(indices)
-    success_rates = np.array(success_rates)
-    mv2h_scores = np.array(mv2h_scores)
-
-    # Compute rolling average
-    def rolling_mean(arr, window):
-        cumsum = np.cumsum(np.insert(arr, 0, 0))
-        return (cumsum[window:] - cumsum[:-window]) / window
-
-    if len(indices) > window_size:
-        roll_indices = indices[window_size - 1:]
-        roll_success = rolling_mean(success_rates, window_size)
-        roll_mv2h = rolling_mean(mv2h_scores, window_size)
-    else:
-        roll_indices = indices
-        roll_success = success_rates
-        roll_mv2h = mv2h_scores
-
-    # Publication quality settings
-    plt.rcParams.update({
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-        "font.size": 10,
-        "axes.labelsize": 11,
-        "axes.titlesize": 12,
-        "legend.fontsize": 9,
-        "xtick.labelsize": 9,
-        "ytick.labelsize": 9,
-        "axes.linewidth": 1.2,
-        "lines.linewidth": 2,
-        "figure.dpi": 300,
-    })
-
-    # Figure size: 7 inch wide (double column), 5 inch tall
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 5), sharex=True)
-
-    # Colors: colorblind-friendly (IBM Design)
-    color_scatter = "#648FFF"  # blue
-    color_line = "#DC267F"     # magenta
-
-    # Plot 1: Success Rate
-    ax1.scatter(indices, success_rates * 100, alpha=0.25, s=8,
-                color=color_scatter, edgecolors="none", rasterized=True)
-    ax1.plot(roll_indices, roll_success * 100, color=color_line, linewidth=2,
-             label=f"Rolling mean (n={window_size})")
-    ax1.set_ylabel("Success Rate (%)")
-    ax1.set_title("(a) Evaluation Success Rate", loc="left", fontweight="bold")
-    ax1.legend(loc="upper right", frameon=True, fancybox=False, edgecolor="black")
-    ax1.set_ylim(0, 100)
-    ax1.set_xlim(0, max(indices) + 10)
-    ax1.spines["top"].set_visible(False)
-    ax1.spines["right"].set_visible(False)
-
-    # Plot 2: MV2H Score
-    ax2.scatter(indices, mv2h_scores * 100, alpha=0.25, s=8,
-                color=color_scatter, edgecolors="none", rasterized=True)
-    ax2.plot(roll_indices, roll_mv2h * 100, color=color_line, linewidth=2,
-             label=f"Rolling mean (n={window_size})")
-    ax2.set_xlabel("Chunk Position (measure number)")
-    ax2.set_ylabel("MV2H Score (%)")
-    ax2.set_title("(b) MV2H Score (successful chunks)", loc="left", fontweight="bold")
-    ax2.legend(loc="upper right", frameon=True, fancybox=False, edgecolor="black")
-    ax2.set_ylim(0, 100)
-    ax2.spines["top"].set_visible(False)
-    ax2.spines["right"].set_visible(False)
-
-    plt.tight_layout()
-
-    if output_path:
-        # Save both PDF (vector) and PNG (raster)
-        pdf_path = output_path.replace(".png", ".pdf")
-        plt.savefig(pdf_path, format="pdf", bbox_inches="tight")
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        print(f"Plot saved to: {pdf_path} (vector) and {output_path} (300 DPI)")
-    else:
-        plt.show()
 
 
 # =============================================================================
@@ -1603,18 +772,25 @@ def plot_phase_drift(
 
 # Default paths
 DEFAULT_CSV = "data/experiments/mt3/results/chunks_song.csv"
-DEFAULT_PIPELINE_VS_E2E_PLOT = "results/pipeline_vs_e2e.png"
-
-# Zeng per-chunk results (from piano-a2s evaluation)
-ZENG_CHUNK_CSV = "/home/bloggerwang/piano-a2s/results/chunk_results.csv"
+TRANSKUN_BEYER_CSV = "data/experiments/transkun_beyer/results/chunks.csv"
+ZENG_CSV = "data/experiments/zeng/results/chunks.csv"
+DEFAULT_SUCCESS_RATE_PLOT = "results/success_rate_by_position.png"
 
 
 def main():
     """
-    Analyze MT3 MV2H results with sensible defaults.
+    Analyze MV2H results with Mixed Transition Model.
 
-    Just run: poetry run python src/analysis/analyze_mv2h_results.py
+    Usage:
+        # Run full analysis with all systems
+        poetry run python src/analysis/analyze_mv2h_results.py
+
+        # Analyze specific CSV
+        poetry run python src/analysis/analyze_mv2h_results.py path/to/results.csv
     """
+    import warnings
+    warnings.filterwarnings("ignore")
+
     # Use command line arg if provided, otherwise default
     csv_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CSV
 
@@ -1624,32 +800,69 @@ def main():
         sys.exit(1)
 
     print(f"\n{'#' * 70}")
-    print(f"# Analyzing: {csv_path}")
+    print(f"# MV2H Results Analysis")
     print(f"{'#' * 70}")
 
-    # Load results
+    # Load and analyze MT3 results
     results = load_results_csv(csv_path)
-    print(f"Loaded {len(results)} chunk results")
+    print(f"Loaded {len(results)} chunk results from {csv_path}")
 
-    # Run analyses
+    # Run basic analyses
     summary = compute_overall_summary(results)
     print_overall_summary(summary)
 
     position_analysis = analyze_by_chunk_position(results)
     print_position_analysis(position_analysis)
 
-    composer_analysis = analyze_by_composer(results)
-    print_composer_analysis(composer_analysis)
+    # =========================================================================
+    # Logistic Transition Model Analysis (the key analysis!)
+    # =========================================================================
+    print(f"\n{'#' * 70}")
+    print("# Logistic Transition Model: Phase Drift + Mode Locking")
+    print(f"{'#' * 70}")
 
-    # Generate plots
-    Path(DEFAULT_PIPELINE_VS_E2E_PLOT).parent.mkdir(parents=True, exist_ok=True)
+    transition_results = []
 
-    # Pipeline vs E2E Mode Locking comparison (the key figure!)
-    plot_pipeline_vs_e2e_mode_locking(
-        mt3_results=results,
-        zeng_csv_path=ZENG_CHUNK_CSV,
-        output_path=DEFAULT_PIPELINE_VS_E2E_PLOT,
-    )
+    # MT3
+    if Path(DEFAULT_CSV).exists():
+        try:
+            r = run_transition_model(DEFAULT_CSV, "MT3 + MuseScore")
+            transition_results.append(r)
+            print(f"Analyzed: MT3 + MuseScore (n={r['n_obs']})")
+        except Exception as e:
+            print(f"Failed to analyze MT3: {e}")
+
+    # Transkun + Beyer
+    if Path(TRANSKUN_BEYER_CSV).exists():
+        try:
+            r = run_transition_model(TRANSKUN_BEYER_CSV, "Transkun + Beyer")
+            transition_results.append(r)
+            print(f"Analyzed: Transkun + Beyer (n={r['n_obs']})")
+        except Exception as e:
+            print(f"Failed to analyze Transkun + Beyer: {e}")
+
+    # Zeng
+    if Path(ZENG_CSV).exists():
+        try:
+            r = run_transition_model(ZENG_CSV, "Zeng (E2E)")
+            transition_results.append(r)
+            print(f"Analyzed: Zeng (n={r['n_obs']})")
+        except Exception as e:
+            print(f"Failed to analyze Zeng: {e}")
+
+    if transition_results:
+        print_transition_model_results(transition_results)
+
+        # Generate success rate by position plot (main figure)
+        csv_paths = {
+            "MT3 + MuseScore": DEFAULT_CSV,
+            "Transkun + Beyer": TRANSKUN_BEYER_CSV,
+            "Zeng (E2E)": ZENG_CSV,
+        }
+        plot_success_rate_by_position(
+            csv_paths,
+            output_path=DEFAULT_SUCCESS_RATE_PLOT,
+        )
 
 
 if __name__ == "__main__":

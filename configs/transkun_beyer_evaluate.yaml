@@ -1,0 +1,96 @@
+# =============================================================================
+# Transkun + Beyer SOTA Baseline Evaluation Configuration
+# =============================================================================
+#
+# This YAML config centralizes all paths and parameters for Transkun + Beyer
+# SOTA baseline MV2H evaluation. CLI arguments override values in this file.
+#
+# Pipeline:
+#   Audio -> Transkun (SOTA AMT) -> MIDI -> Beyer (ISMIR'24) -> MusicXML -> MV2H
+#
+# Usage:
+#   python -m src.baselines.transkun_beyer.transkun_beyer_evaluate \
+#       --config configs/transkun_beyer_evaluate.yaml
+#
+# =============================================================================
+
+# Evaluation mode: 'full' or 'chunks'
+#   full   - Evaluate entire songs (for comparison with Clef)
+#   chunks - 5-bar chunk evaluation (for comparison with Zeng et al.)
+mode: chunks
+
+# -----------------------------------------------------------------------------
+# Input paths
+# -----------------------------------------------------------------------------
+
+# Directory containing audio files (wav/mp3)
+# Supports ASAP-style structure: audio_dir/Composer/Work/Piece/performance.wav
+audio_dir: data/datasets/asap_test_set
+
+# ASAP dataset base directory (contains ground truth MIDI and MusicXML)
+# Note: GT files are in asap_test_set, which has symlinks to original ASAP
+gt_dir: data/datasets/asap_test_set
+
+# Zeng chunk CSV file (required for chunks mode)
+chunk_csv: src/evaluation/asap/test_chunk_set.csv
+
+# -----------------------------------------------------------------------------
+# Output paths
+# -----------------------------------------------------------------------------
+
+# Output directory for intermediate files (MIDI, MusicXML, chunks)
+output_dir: data/experiments/transkun_beyer
+
+# Output CSV file for per-item results
+output_csv: results/transkun_beyer/chunks.csv
+
+# -----------------------------------------------------------------------------
+# Tool paths
+# -----------------------------------------------------------------------------
+
+# MV2H Java tool bin directory
+mv2h_bin: MV2H/bin
+
+# MuseScore Studio 4.6.5 binary
+mscore_bin: tools/mscore
+
+# -----------------------------------------------------------------------------
+# Transkun settings
+# -----------------------------------------------------------------------------
+
+# Device for Transkun inference
+transkun_device: cuda
+
+# Transkun model version: 'v2', 'v2_aug', 'v2_no_ext'
+transkun_model: v2
+
+# -----------------------------------------------------------------------------
+# Beyer settings
+# -----------------------------------------------------------------------------
+
+# Path to Beyer checkpoint file
+# Download from: https://github.com/TimFelixBeyer/MIDI2ScoreTransformer/releases
+beyer_checkpoint: /home/bloggerwang/MIDI2ScoreTransformer/MIDI2ScoreTF.ckpt
+
+# Conda environment name with Beyer dependencies (Python 3.11)
+beyer_conda_env: beyer
+
+# Path to MIDI2ScoreTransformer repository
+beyer_repo: /home/bloggerwang/MIDI2ScoreTransformer
+
+# Device for Beyer inference
+beyer_device: cuda
+
+# -----------------------------------------------------------------------------
+# Evaluation settings
+# -----------------------------------------------------------------------------
+
+# Number of parallel workers for MV2H evaluation
+# Note: Inference is sequential (GPU-bound), only MV2H runs in parallel
+workers: 8
+
+# MV2H timeout for full song evaluation (seconds)
+timeout: 120
+
+# MV2H timeout for chunk evaluation (seconds)
+chunk_timeout: 10
