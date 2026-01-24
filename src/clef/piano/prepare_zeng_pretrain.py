@@ -40,6 +40,12 @@ from tqdm import tqdm
 
 from src.preprocessing.humsyn_processor import HumSynProcessor
 from src.preprocessing.musesyn_processor import MuseSynProcessor
+from src.score.clean_kern import clean_kern_sequence
+from src.score.kern_zeng_compat import (
+    expand_tuplets_to_zeng_vocab,
+    quantize_oov_tuplets,
+    apply_zeng_pitch_compat,
+)
 from src.utils import set_seed, SEED_DATA_AUGMENTATION
 
 # Register converter21 for robust humdrum parsing
@@ -184,6 +190,105 @@ def phase1_score_to_kern(
     return all_results
 
 
+def create_ground_truth_kern(
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    seed: int = 42,
+) -> Dict[str, str]:
+    """Create Zeng-vocab compatible ground truth kern files.
+
+    Applies full transformation pipeline:
+    1. clean_kern_sequence() - standardize tokens, convert dotted triplets, remove beams
+    2. apply_zeng_pitch_compat() - Zeng pitch/accidental compatibility:
+       - Split breves (0, 00) into tied whole notes
+       - Strip natural accidentals (n)
+       - Convert double accidentals (## → enharmonic, -- → enharmonic)
+       - Remove slur/phrase markers ((), {})
+       - Mark extreme pitches as <unk>
+    3. expand_tuplets_to_zeng_vocab() - expand 5/7/11-tuplets to standard durations
+    4. quantize_oov_tuplets() - IP-based quantization for remaining OOV durations
+    5. X%Y → <unk> - mark complex tuplet ratios as unknown
+
+    Args:
+        output_dir: Base output directory (reads from kern/, writes to kern_gt/)
+        seed: Random seed for reproducible quantization
+
+    Returns:
+        Dictionary of {filename: status}
+    """
+    import re
+
+    kern_dir = output_dir / "kern"
+    kern_gt_dir = output_dir / "kern_gt"
+    kern_gt_dir.mkdir(parents=True, exist_ok=True)
+
+    results = {}
+    kern_files = sorted(kern_dir.glob("*.krn"))
+
+    logger.info(f"Creating ground truth kern files: {len(kern_files)} files")
+
+    for kern_path in tqdm(kern_files, desc="Creating kern_gt"):
+        stem = kern_path.stem
+
+        try:
+            with open(kern_path, "r", encoding="utf-8") as f:
+                raw_kern = f.read()
+
+            # Step 1: Clean kern sequence (standardize tokens, dotted triplets, remove beams)
+            cleaned = clean_kern_sequence(raw_kern, warn_tuplet_ratio=False)
+
+            # Step 2: Apply Zeng pitch/accidental compatibility
+            # (split breves, strip n, convert ##/--, remove slur/phrase, mark extreme)
+            pitch_compat = apply_zeng_pitch_compat(cleaned)
+
+            # Step 3: Expand standard tuplets to Zeng vocab
+            expanded = expand_tuplets_to_zeng_vocab(pitch_compat)
+
+            # Step 4: Quantize remaining OOV tuplets with IP solver
+            quantized = quantize_oov_tuplets(expanded, seed=seed)
+
+            # Step 5: Mark X%Y tuplet ratios as <unk>
+            # Pattern: digits followed by % followed by digits (e.g., 56%3, 8%9)
+            def replace_tuplet_ratio(match):
+                # Keep pitch and other markers, replace duration with <unk>
+                token = match.group(0)
+                # Extract pitch part (letters after the duration)
+                pitch_match = re.search(r'[a-gA-Gr]', token)
+                if pitch_match:
+                    pitch_start = pitch_match.start()
+                    return '<unk>' + token[pitch_start:]
+                return '<unk>'
+
+            # Replace tokens with X%Y duration pattern
+            # Note: \.? handles dotted durations like 20%3.a
+            with_unk = re.sub(
+                r'\b\d+%\d+\.?[a-gA-Gr][^\s\t]*',
+                replace_tuplet_ratio,
+                quantized
+            )
+
+            # Step 6: Final pass for double accidentals
+            # Step 5 may create tokens like <unk>FF## that need conversion
+            ground_truth = apply_zeng_pitch_compat(with_unk)
+
+            # Write ground truth file
+            gt_path = kern_gt_dir / f"{stem}.krn"
+            with open(gt_path, "w", encoding="utf-8") as f:
+                f.write(ground_truth)
+
+            results[stem] = "success"
+
+        except Exception as e:
+            logger.error(f"Error processing {stem}: {e}")
+            results[stem] = f"error: {e}"
+
+    # Summary
+    success = sum(1 for v in results.values() if v == "success")
+    errors = sum(1 for v in results.values() if v.startswith("error"))
+    logger.info(f"Ground truth creation complete: {success} success, {errors} errors")
+
+    return results
+
+
 def _process_single_kern(args: Tuple) -> Dict[str, str]:
     """Worker function for parallel processing a single kern file.
 
@@ -212,7 +317,7 @@ def _process_single_kern(args: Tuple) -> Dict[str, str]:
         from midi2audio import FluidSynth
         has_zeng = False
 
-    from src.score.kern_repeat import expand_kern_repeats
+    from src.score.kern_repeat import expand_kern_repeats, sanitize_tuplet_durations
     from src.score.sanitize_piano_score import sanitize_score
 
     midi_dir = output_dir / "midi"
@@ -250,6 +355,10 @@ def _process_single_kern(args: Tuple) -> Dict[str, str]:
 
             # Expand repeats for audio generation
             expanded_kern = expand_kern_repeats(kern_content)
+
+            # Sanitize tuplet durations (removes dots from notes in tuplet regions)
+            # This prevents DurationException from music21 when parsing complex rhythms
+            expanded_kern = sanitize_tuplet_durations(expanded_kern)
 
             # Write expanded kern to temp file for music21 parsing
             with tempfile.NamedTemporaryFile(mode="w", suffix=".krn", delete=False) as tmp:
@@ -375,6 +484,7 @@ def phase2_kern_to_audio(
     tempo_enabled = aug_config['tempo_enabled']
     tempo_range = aug_config['tempo_range']
     train_soundfonts = aug_config['train_soundfonts']
+    test_soundfonts = aug_config['test_soundfonts']
     num_versions_config = aug_config['num_versions']
 
     if not transpose_enabled:
@@ -405,15 +515,22 @@ def phase2_kern_to_audio(
         df = pd.read_csv(valid_split_path)
         valid_split = set(df["name"].tolist())
 
-    # Check available soundfonts
-    available_soundfonts = [sf for sf in train_soundfonts if (soundfont_dir / sf).exists()]
+    # Check available soundfonts (train and test separately)
+    available_train_soundfonts = [sf for sf in train_soundfonts if (soundfont_dir / sf).exists()]
+    available_test_soundfonts = [sf for sf in test_soundfonts if (soundfont_dir / sf).exists()]
 
-    if not available_soundfonts:
-        logger.error(f"No soundfonts found in {soundfont_dir}")
+    if not available_train_soundfonts:
+        logger.error(f"No train soundfonts found in {soundfont_dir}")
         logger.info(f"Expected soundfonts: {train_soundfonts}")
         return {}
 
-    logger.info(f"Available soundfonts: {available_soundfonts}")
+    if not available_test_soundfonts:
+        logger.error(f"No test soundfonts found in {soundfont_dir}")
+        logger.info(f"Expected soundfonts: {test_soundfonts}")
+        return {}
+
+    logger.info(f"Available train soundfonts: {available_train_soundfonts}")
+    logger.info(f"Available test soundfonts: {available_test_soundfonts}")
 
     # Prepare task list
     kern_files = sorted(kern_dir.glob("*.krn"))
@@ -435,7 +552,9 @@ def phase2_kern_to_audio(
                     break
 
         n_versions = num_versions_config[split]
-        tasks.append((kern_path, output_dir, soundfont_dir, split, n_versions, available_soundfonts,
+        # Use train soundfonts for train, test soundfonts for valid/test
+        soundfonts_for_split = available_train_soundfonts if split == "train" else available_test_soundfonts
+        tasks.append((kern_path, output_dir, soundfont_dir, split, n_versions, soundfonts_for_split,
                       transpose_enabled, feasible_transposes, tempo_enabled, tempo_range, musesyn_dir))
 
     logger.info(f"Processing {len(tasks)} kern files with {workers} workers...")
@@ -597,6 +716,15 @@ def main():
         )
         success = sum(1 for v in phase1_results.values() if v == "success")
         logger.info(f"Phase 1 complete: {success}/{len(phase1_results)} successful")
+
+        # Create ground truth kern files (Zeng vocab compatible)
+        logger.info("=== Phase 1b: Creating Ground Truth Kern (Zeng Vocab) ===")
+        gt_results = create_ground_truth_kern(
+            output_dir=args.output_dir,
+            seed=42,
+        )
+        gt_success = sum(1 for v in gt_results.values() if v == "success")
+        logger.info(f"Phase 1b complete: {gt_success}/{len(gt_results)} successful")
 
     if args.phase is None or args.phase == 2:
         logger.info("=== Phase 2: Kern → Audio ===")

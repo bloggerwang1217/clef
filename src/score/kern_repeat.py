@@ -297,3 +297,92 @@ def get_expansion_info(kern_content: str) -> Dict:
         info['estimated_expansion_ratio'] = 1.0
 
     return info
+
+
+def sanitize_tuplet_durations(kern_content: str) -> str:
+    """Remove dots from notes within tuplet regions to avoid DurationException.
+
+    Problem:
+        music21/converter21 cannot represent dotted notes in tuplet contexts
+        because the resulting quarterLength (e.g., 2.25) cannot be expressed
+        as a simple fraction. This causes DurationException during parsing.
+
+    Solution:
+        Remove the dot from note durations within tuplet regions (*tuplet to *Xtuplet).
+        This is mathematically approximate but allows the kern to parse.
+
+        Example: 4.ee- in 3/2 tuplet → 4ee- (loses some duration precision)
+
+    Mathematical justification:
+        In a 3/2 tuplet, a dotted quarter (1.5 beats) theoretically becomes:
+        1.5 × (2/3) = 1.0 beats = quarter note
+        So removing the dot is actually close to the correct duration.
+
+    Args:
+        kern_content: Raw kern file content
+
+    Returns:
+        Kern content with dotted notes in tuplet regions converted to undotted
+    """
+    lines = kern_content.split('\n')
+    result_lines = []
+
+    # Track tuplet state per spine (column)
+    # Each spine can have independent tuplet regions
+    num_spines = 0
+    tuplet_active = []  # List[bool] per spine
+
+    for line in lines:
+        # Skip empty lines and comments
+        if not line.strip() or line.startswith('!'):
+            result_lines.append(line)
+            continue
+
+        # Count spines from first data line
+        if line.startswith('**'):
+            num_spines = len(line.split('\t'))
+            tuplet_active = [False] * num_spines
+            result_lines.append(line)
+            continue
+
+        # Handle interpretation lines (tuplet markers)
+        if line.startswith('*'):
+            parts = line.split('\t')
+
+            # Update tuplet state for each spine
+            for i, part in enumerate(parts):
+                if i < len(tuplet_active):
+                    if part == '*tuplet':
+                        tuplet_active[i] = True
+                    elif part == '*Xtuplet':
+                        tuplet_active[i] = False
+
+            result_lines.append(line)
+            continue
+
+        # Handle barlines
+        if line.startswith('='):
+            result_lines.append(line)
+            continue
+
+        # Process data lines - remove dots from notes in tuplet regions
+        parts = line.split('\t')
+        new_parts = []
+
+        for i, part in enumerate(parts):
+            if i < len(tuplet_active) and tuplet_active[i]:
+                # In tuplet region - remove dots from duration
+                # Pattern: number followed by dot, then pitch (letter)
+                # e.g., "4.ee-" → "4ee-", "8.ccL" → "8ccL"
+                new_part = re.sub(
+                    r'^(\d+)\.([A-Ga-gr])',
+                    r'\1\2',
+                    part
+                )
+                new_parts.append(new_part)
+            else:
+                new_parts.append(part)
+
+        result_lines.append('\t'.join(new_parts))
+
+    return '\n'.join(result_lines)

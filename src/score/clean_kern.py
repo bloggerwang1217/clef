@@ -200,8 +200,8 @@ def clean_kern_token(token: str, preserve_ties: bool = True, preserve_articulati
     Remove visual layout information from a single Kern token.
 
     Also handles duration tokens not in Zeng's LabelsMultiple vocabulary:
-    - '48.' (dotted 16th triplet) → '32' (32nd note) [EQUAL DURATION: 0.125 quarters]
-    - '0' (breve) → NOT CONVERTED (would break measure timing)
+    - Dotted triplets (LOSSLESS): 96.→64, 48.→32, 24.→16, 12.→8, 6.→4, 3.→2
+    - Breve (0, 00): Handled in kern_zeng_compat.py (split to preserve duration)
 
     Args:
         token: Raw Kern token from converter21 (e.g., '8rGG', '4g/', '8cc\\')
@@ -227,9 +227,27 @@ def clean_kern_token(token: str, preserve_ties: bool = True, preserve_articulati
         >>> clean_kern_token('48.ff')  # Dotted triplet conversion
         '32ff'
     """
+    # 0. Handle chord tokens (space-separated notes within a single token field)
+    #    e.g., "8ddd 12.dd" → "8ddd 8dd"
+    if ' ' in token and not token.startswith(('=', '*', '!')):
+        notes = token.split(' ')
+        cleaned_notes = [clean_kern_token(n, preserve_ties, preserve_articulation) for n in notes]
+        return ' '.join(cleaned_notes)
+
     # 1. Control tokens: barlines (=), interpretations (*), comments (!)
-    #    Return as-is (these are not encoded by LabelsMultiple)
-    if token.startswith(('=', '*', '!')):
+    #    Most are returned as-is, but some need cleaning.
+    if token.startswith(('=', '!')):
+        return token
+
+    # 1a. Interpretation tokens (*) - clean editorial markers from clefs
+    #     *clefG2yy → *clefG2 (yy = editorial/invisible marker)
+    #     *clefF4xx → *clefF4 (xx = similar editorial marker)
+    if token.startswith('*'):
+        if token.startswith('*clef'):
+            # Remove editorial markers (y, x suffixes) from clef tokens
+            # These indicate invisible/editorial clefs that music21 can't parse
+            cleaned = re.sub(r'([FGC]\d)[xy]+$', r'\1', token)
+            return cleaned
         return token
 
     # 2. Empty placeholder or special markers
@@ -246,9 +264,7 @@ def clean_kern_token(token: str, preserve_ties: bool = True, preserve_articulati
     #   Extended: "128","20","40","176","112"
     #
     # MISSING from vocab (causes KeyError):
-    #   - Dotted tuplets: 3., 6., 12., 24., 48.
-    #   - Quintuplet: 10
-    #   - Extreme values: 67, 127, 169, etc. (cadenza ornaments)
+    #   - Dotted triplets: 3., 6., 12., 24., 48., 96. → HANDLED BELOW (lossless)
     #
     # =========================================================================
     # 3a. DOTTED TUPLET CONVERSIONS (LOSSLESS - mathematically equivalent)
@@ -277,21 +293,39 @@ def clean_kern_token(token: str, preserve_ties: bool = True, preserve_articulati
     #
     #   These are EXACT conversions with ZERO duration loss.
     #
-    if token.startswith('48.'):
+    #   96. = dotted triplet 64th
+    #      = (1/96) * 1.5 = 1.5/96 = 1/64 = 64 (regular 64th)
+    #
+    # Extract leading tie/slur/phrase markers before checking duration
+    # e.g., "[[6.F" → prefix="[[", working="6.F"
+    tie_prefix = ''
+    working = token
+    while working and working[0] in '[({':
+        tie_prefix += working[0]
+        working = working[1:]
+
+    # Apply dotted triplet conversions on the working token
+    if working.startswith('96.'):
+        # 96. → 64 (dotted triplet 64th = regular 64th, EXACT)
+        working = '64' + working[3:]
+    elif working.startswith('48.'):
         # 48. → 32 (dotted triplet 32nd = regular 32nd, EXACT)
-        token = '32' + token[3:]
-    elif token.startswith('24.'):
+        working = '32' + working[3:]
+    elif working.startswith('24.'):
         # 24. → 16 (dotted triplet 16th = regular 16th, EXACT)
-        token = '16' + token[3:]
-    elif token.startswith('12.'):
+        working = '16' + working[3:]
+    elif working.startswith('12.'):
         # 12. → 8 (dotted triplet 8th = regular 8th, EXACT)
-        token = '8' + token[3:]
-    elif token.startswith('6.'):
+        working = '8' + working[3:]
+    elif working.startswith('6.'):
         # 6. → 4 (dotted triplet quarter = regular quarter, EXACT)
-        token = '4' + token[2:]
-    elif token.startswith('3.'):
+        working = '4' + working[2:]
+    elif working.startswith('3.'):
         # 3. → 2 (dotted triplet half = regular half, EXACT)
-        token = '2' + token[2:]
+        working = '2' + working[2:]
+
+    # Restore prefix and continue with other cleanups
+    token = tie_prefix + working
 
     # =========================================================================
     # 3b. QUINTUPLET (10) - HANDLED AT SEQUENCE LEVEL, NOT HERE
@@ -346,38 +380,10 @@ def clean_kern_token(token: str, preserve_ties: bool = True, preserve_articulati
     # (No conversion - will trigger KeyError → skip chunk, same as Zeng)
 
     # =========================================================================
-    # 3d. BREVE → WHOLE (converter21-specific issue)
+    # 3d. BREVE (0, 00) - Handled in kern_zeng_compat.py
     # =========================================================================
-    #
-    #   Why we convert breve to whole:
-    #   - converter21 sometimes outputs breve rests (0r) to fill empty measures
-    #   - This is a converter21-specific behavior (Verovio doesn't do this)
-    #   - Zeng's LabelsMultiple doesn't have '0' in vocabulary → KeyError
-    #
-    #   Why we DON'T split into two whole notes (1r 1r):
-    #   - Splitting changes token count (1 → 2), breaking Kern parsing
-    #   - The measure structure expects specific token counts
-    #   - A single token replacement is safer
-    #
-    #   Trade-off:
-    #   - Original: 0r = 8 quarters (breve rest)
-    #   - Replacement: 1r = 4 quarters (whole rest)
-    #   - Duration LOSS: 4 quarters (50%)
-    #
-    #   Justification:
-    #   - This only affects measures where converter21 "invented" a breve rest
-    #     to fill gaps in the MusicXML (e.g., Beethoven 21-1, M211)
-    #   - The original MusicXML didn't have this duration anyway
-    #   - A whole rest (1r) is semantically reasonable for "long silence"
-    #   - Impact: ~70 chunks in Beethoven 21-1
-    #
-    #   Alternative (not implemented):
-    #   - Use clean_kern_sequence() to split '0r' into '1r\n1r' at sequence level
-    #   - This preserves duration but changes measure structure
-    #
-    if token.startswith('0') and len(token) > 1 and token[1] in 'rA-Ga-g':
-        # Replace breve (0) with whole note (1), only if followed by note/rest
-        token = '1' + token[1:]
+    #   Breve and longa are split into tied whole notes in
+    #   kern_zeng_compat.split_breves_in_sequence() to preserve exact duration.
 
     # =========================================================================
     # 4. REST POSITION CLEANUP (CRITICAL FIX for KeyError: 'rGG')
@@ -410,6 +416,30 @@ def clean_kern_token(token: str, preserve_ties: bool = True, preserve_articulati
     #    ? : uncertainty marker (editor unsure about this note)
     #    These are pure visual hints with no audible effect
     token = re.sub(r'[XyzN*=?]', '', token)
+
+    # =========================================================================
+    # 5c. ACCIDENTAL NORMALIZATION (redundant natural signs)
+    # =========================================================================
+    #    In music notation, a natural sign can precede an accidental to explicitly
+    #    cancel a previous accidental before applying a new one. This is visually
+    #    explicit but semantically redundant:
+    #
+    #    n# or #n = sharp (natural then sharp, or sharp after natural)
+    #    n- or -n = flat (natural then flat)
+    #    nn = natural (double natural = natural)
+    #
+    #    Examples from chopin_first_editions:
+    #    - ffn# → ff# (F with natural-then-sharp = F#)
+    #    - b-n → b- (B-flat with natural = B-flat... actually this might be typo)
+    #    - ann → an (A with double-natural = A-natural)
+    #
+    #    Note: We normalize the accidental AFTER the pitch letters are consumed
+    #    Pattern matches: pitch letters followed by redundant accidental combos
+    token = re.sub(r'n#', '#', token)   # natural + sharp = sharp
+    token = re.sub(r'#n', '#', token)   # sharp + natural = sharp (rare)
+    token = re.sub(r'n-', '-', token)   # natural + flat = flat
+    token = re.sub(r'-n', '-', token)   # flat + natural = flat (rare)
+    token = re.sub(r'nn', 'n', token)   # double natural = natural
 
     # =========================================================================
     # 6. ARTICULATION AND ORNAMENT MARKS
@@ -461,21 +491,15 @@ def clean_kern_token(token: str, preserve_ties: bool = True, preserve_articulati
         token = re.sub(r"[TMSmstpP'~^><;:`Oxvuw&@ijZ+W$!|]", '', token)
 
     # =========================================================================
-    # 7. BEAM MARKERS (optional: Zeng's model may or may not use these)
+    # 7. BEAM MARKERS (visual only, removed for Zeng compatibility)
     # =========================================================================
-    #    L, J, k, K are beam start/end markers
-    #    Uncomment if your LabelsMultiple doesn't include these
-    # token = re.sub(r'[LJkK]', '', token)
+    #    L = beam start, J = beam end, k = partial beam back, K = partial beam forward
+    #    These are visual layout markers with no audible effect.
+    #    Removed here; use extract_visual_info() to get beam info for Visual Aux Head.
+    token = re.sub(r'[LJkK]', '', token)
 
     # =========================================================================
-    # 8. SLUR/PHRASE MARKERS (optional)
-    # =========================================================================
-    #    ( ) { } are slur/phrase start/end markers
-    #    Uncomment if your LabelsMultiple doesn't include these
-    # token = re.sub(r'[(){}]', '', token)
-
-    # =========================================================================
-    # 9. TIE MARKERS (usually preserved in Zeng's encoding)
+    # 8. TIE MARKERS (usually preserved in Zeng's encoding)
     # =========================================================================
     #    [ ] _ are tie start/continue/end markers
     #    Only remove if preserve_ties=False
@@ -483,7 +507,7 @@ def clean_kern_token(token: str, preserve_ties: bool = True, preserve_articulati
         token = re.sub(r'[\[\]_]', '', token)
 
     # =========================================================================
-    # 10. UNICODE / NON-ASCII CLEANUP (always remove)
+    # 9. UNICODE / NON-ASCII CLEANUP (always remove)
     # =========================================================================
     #    Kern standard is ASCII-only. Any Unicode is likely encoding errors
     #    from HumSyn data (e.g., …, π, Ω found in Mozart/Beethoven sonatas).

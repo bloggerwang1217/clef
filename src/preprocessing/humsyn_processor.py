@@ -24,7 +24,12 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from src.score.clean_kern import clean_kern_sequence, extract_visual_from_sequence, strip_non_kern_spines
+from src.score.clean_kern import (
+    clean_kern_sequence,
+    extract_visual_from_sequence,
+    strip_non_kern_spines,
+)
+from src.score.kern_zeng_compat import expand_tuplets_to_zeng_vocab
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +92,11 @@ class HumSynProcessor:
         self.preset = preset
 
         # Determine what filters to apply based on preset
-        self.filter_chopin = preset in {"clef-piano-base", "clef-piano-full"}
+        # Always filter Chopin (selected_chopin.txt) - no reason to include duplicates
+        self.filter_chopin = True
         self.strip_joplin = preset == "clef-piano-base"
+        # clef-piano-base: expand septuplets to tied binary (Zeng vocab workaround)
+        self.expand_septuplets = preset == "clef-piano-base"
         # clef-piano-base: remove all non-kern; clef-piano-full: keep **dynam
         self.keep_dynam = preset == "clef-piano-full"
 
@@ -208,6 +216,11 @@ class HumSynProcessor:
 
         # Apply unified kern cleaning (removes visual markers)
         kern_cleaned = clean_kern_sequence(kern_raw, warn_tuplet_ratio=False)
+
+        # Expand tuplets to Zeng vocab (clef-piano-base only)
+        # This is a Zeng vocab workaround for non-standard tuplets
+        if self.expand_septuplets:
+            kern_cleaned = expand_tuplets_to_zeng_vocab(kern_cleaned)
 
         return kern_cleaned, visual_info
 
