@@ -1,0 +1,72 @@
+{
+  "_comment": "Zeng et al. data augmentation settings for clef-piano-base",
+
+  "transpose": {
+    "enabled": false,
+    "_comment": [
+      "Transpose augmentation is DISABLED for clef-piano-base.",
+      "Reasons:",
+      "1. Piano voicing is key-specific - transposing disrupts idiomatic patterns",
+      "2. Zeng's implementation had a multiprocessing bug causing only ~2 unique transposes",
+      "3. Real recordings (ASAP evaluation set) are not transposed",
+      "4. Soundfont + tempo augmentation provide sufficient variation",
+      "See: docs/decision-record.md for full discussion"
+    ],
+    "feasible_transposes": {
+      "_note": "Kept for reference, but not used when enabled=false",
+      "-6": [0, "-m2", "-m3", "M2", "M3"],
+      "-5": [0, "-m2", "-m3", "M2", "M3"],
+      "-4": [0, "-m2", "-M2", "-m3", "M2", "M3"],
+      "-3": [0, "-m2", "-M2", "-m3", "M2", "m3", "M3"],
+      "-2": [0, "-m2", "-M2", "-m3", "-M3", "M2", "m3", "M3"],
+      "-1": [0, "-m2", "-M2", "-m3", "-M3", "m2", "M2", "m3", "M3"],
+      "0":  [0, "-m2", "-M2", "-m3", "-M3", "m2", "M2", "m3", "M3"],
+      "1":  [0, "-m2", "-M2", "-m3", "-M3", "m2", "M2", "m3", "M3"],
+      "2":  [0, "-m2", "-M2", "-m3", "-M3", "m2", "M2", "m3", "M3"],
+      "3":  [0, "-M2", "-m3", "-M3", "m2", "M2", "m3", "M3"],
+      "4":  [0, "-M2", "-m3", "-M3", "m2", "M2", "m3"],
+      "5":  [0, "-M2", "-M3", "m2", "M2", "m3"],
+      "6":  [0, "-M2", "-M3", "m2", "m3"],
+      "7":  [0, "-M2", "-M3", "m2", "m3"]
+    }
+  },
+
+  "tempo": {
+    "enabled": true,
+    "min_scale": 0.85,
+    "max_scale": 1.15
+  },
+
+  "soundfonts": {
+    "train": [
+      "TimGM6mb.sf2",
+      "FluidR3_GM.sf2",
+      "UprightPianoKW-20220221.sf2",
+      "SalamanderGrandPiano-V3+20200602.sf2"
+    ],
+    "test": [
+      "SalamanderGrandPiano-V3+20200602.sf2"
+    ]
+  },
+
+  "loudness": {
+    "enabled": true,
+    "target_lufs": -15
+  },
+
+  "num_versions": {
+    "_comment": [
+      "Zeng original: train=10 with random soundfont per version (causes duplicates).",
+      "Our choice: train=4, one version per soundfont (TimGM6mb, FluidR3, Upright, Salamander).",
+      "Each version gets a fixed soundfont but random tempo scaling (0.85-1.15).",
+      "Rationale:",
+      "1. Avoids duplicate soundfont combinations (v2 and v3 both FluidR3 is wasteful)",
+      "2. Maintains tempo variation (same spirit as Zeng)",
+      "3. Cleaner augmentation, faster generation (3,724 vs 9,112 files)",
+      "4. Better reviewer defense: less data + better results = architecture wins"
+    ],
+    "train": 4,
+    "valid": 1,
+    "test": 1
+  }
+}

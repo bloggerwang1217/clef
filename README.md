@@ -150,6 +150,12 @@ Example:
 - **Spectrogram**: nnAudio (GPU-accelerated)
 - **Model**: PyTorch, Hugging Face Transformers
 
+### System Dependencies
+```bash
+# Required for audio synthesis (MIDI → Audio)
+sudo apt-get install fluidsynth  # Ubuntu/Debian (v2.2.5)
+```
+
 ### Key Dependencies (managed by Poetry)
 ```
 # Core ML
@@ -167,7 +173,7 @@ music21 ^9.1        # MusicXML handling
 
 # Optional Groups
 [separation] demucs ^4.0      # Source separation
-[synthesis]  pyfluidsynth     # MIDI → Audio rendering
+[synthesis]  pyfluidsynth     # MIDI → Audio rendering (requires fluidsynth CLI)
 ```
 
 ## Current Status

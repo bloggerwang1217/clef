@@ -84,14 +84,20 @@ class MIDIProcess:
         except Exception:
             print(f"Error in saving midi file {path}")
 
-    def process(self, path: str, temp_path: str = "temp/temp.mid"):
-        """Full processing pipeline."""
+    def process(self, path: str, temp_path: str = "temp/temp.mid", tempo_range: tuple = (0.85, 1.15)):
+        """Full processing pipeline.
+
+        Args:
+            path: Output path for processed MIDI
+            temp_path: Temporary file path for intermediate processing
+            tempo_range: Tuple of (min_scale, max_scale) for tempo augmentation
+        """
         self.cut_last_pedal()
         self.cut_initial_blank()
         # Save to get correct length
         self.midi.save(temp_path)
         self.midi = MidiFile(temp_path)
-        scaling, original_length = self.random_scaling()
+        scaling, original_length = self.random_scaling(range=tempo_range)
         if scaling is not None:
             self.save(path)
         return scaling, original_length

@@ -245,8 +245,30 @@ grace_notes = ['q', 'Q', 'P']  # 加在 duration prefix
 
 ---
 
+## Random Seeds
+
+為確保可重複性並公平比較 Zeng，使用相同的 seed 設定：
+
+| 階段 | Seed | 說明 |
+|------|------|------|
+| Data Augmentation | `0` | 用於 transpose、soundfont 選擇等 |
+| Training | `1234` | 用於 model init、dataloader shuffle 等 |
+
+```python
+from src.utils import set_seed, SEED_DATA_AUGMENTATION, SEED_TRAINING
+
+# Data preprocessing
+set_seed(SEED_DATA_AUGMENTATION)  # 0
+
+# Training
+set_seed(SEED_TRAINING)  # 1234
+```
+
+---
+
 ## 待確認事項
 
+- [x] ~~Seed 設定~~ (已完成: `src/utils/seed.py`)
 - [ ] converter21 轉換全部 210 個 MuseSyn 的成功率
 - [ ] Grace note tokens 的具體格式（`8qc` 或 `q8c`？）
 - [ ] EPR synthesis 的實作細節
