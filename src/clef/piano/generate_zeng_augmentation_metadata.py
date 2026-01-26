@@ -2,16 +2,33 @@
 Generate Augmentation Metadata
 ==============================
 
-Reproduces the random augmentation choices made during Phase 2 audio generation.
-Since seeds are deterministic, we can recreate the exact transpose intervals
-without re-parsing any files.
+Generates metadata for Phase 2 audio synthesis, including:
+1. Augmentation settings (transpose, soundfont, tempo_range)
+2. Kern measure boundaries (for chunking during training)
+
+The alignment timing (audio_measures, tempo_scaling, duration_sec) will be
+added by prepare_zeng_pretrain.py during Phase 2 audio synthesis.
 
 Output: data/experiments/clef_piano_base/augmentation_metadata.json
 {
-    "musesyn_SongName_v0~SoundFont.wav": {
-        "transpose": "M2",      # or 0 for no transpose
+    "beethoven_sonatas_01-1_v0~FluidR3_GM": {
+        "kern_file": "beethoven_sonatas_01-1.krn",
         "soundfont": "FluidR3_GM.sf2",
-        "split": "train"
+        "split": "train",
+        "transpose": 0,
+        "tempo_range": [0.85, 1.15],
+        "kern_measures": [
+            {"measure": 1, "line_start": 25, "line_end": 29},
+            {"measure": 2, "line_start": 30, "line_end": 38},
+            ...
+        ],
+        # === Added by Phase 2 ===
+        "tempo_scaling": 0.923,
+        "duration_sec": 195.3,
+        "audio_measures": [
+            {"measure": 1, "start_sec": 0.0, "end_sec": 2.71},
+            ...
+        ]
     },
     ...
 }
@@ -24,8 +41,9 @@ import hashlib
 import json
 import logging
 import random
+import re
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 import pandas as pd
 
@@ -132,6 +150,97 @@ def get_key_signature_from_kern(kern_path: Path) -> int:
     return 0  # Default to C major
 
 
+def extract_kern_measures(kern_path: Path) -> List[Dict[str, Any]]:
+    """Extract measure boundaries from kern file.
+
+    Parses barlines (=N, =N-, =N:|!, etc.) to find measure numbers and line ranges.
+    Used for chunking during training - we cut at measure boundaries.
+
+    Args:
+        kern_path: Path to kern file
+
+    Returns:
+        List of measure info dicts:
+        [
+            {"measure": 1, "line_start": 25, "line_end": 29},
+            {"measure": 2, "line_start": 30, "line_end": 38},
+            ...
+        ]
+        line_start is the first data line of the measure (after the barline)
+        line_end is the last data line before the next barline (or end of file)
+    """
+    measures = []
+    current_measure = None
+    measure_start_line = None
+
+    # Pattern to match barlines: =N, =N-, =N:|!, ==, etc.
+    # Captures the measure number if present
+    barline_pattern = re.compile(r'^=(\d+)?')
+
+    with open(kern_path, 'r', encoding='utf-8', errors='replace') as f:
+        lines = f.readlines()
+
+    for line_num, line in enumerate(lines, start=1):
+        line = line.strip()
+
+        # Skip empty lines and comments
+        if not line or line.startswith('!'):
+            continue
+
+        # Check for barline
+        first_token = line.split('\t')[0]
+        match = barline_pattern.match(first_token)
+
+        if match:
+            # Found a barline
+            measure_num_str = match.group(1)
+
+            # Close previous measure
+            if current_measure is not None and measure_start_line is not None:
+                measures.append({
+                    "measure": current_measure,
+                    "line_start": measure_start_line,
+                    "line_end": line_num - 1,  # End before this barline
+                })
+
+            # Start new measure
+            if measure_num_str:
+                current_measure = int(measure_num_str)
+            elif current_measure is not None:
+                # Barline without number (e.g., == for final barline)
+                current_measure += 1
+            else:
+                current_measure = 1
+
+            measure_start_line = line_num + 1  # Start after barline
+
+        elif first_token.startswith('*'):
+            # Interpretation line (metadata) - not part of measure content
+            # But update measure_start_line if we haven't started the measure yet
+            if measure_start_line == line_num:
+                measure_start_line = line_num + 1
+            continue
+
+    # Close the last measure
+    if current_measure is not None and measure_start_line is not None:
+        # Find the last non-empty, non-comment, non-spine-terminator line
+        last_data_line = len(lines)
+        for i in range(len(lines) - 1, measure_start_line - 2, -1):
+            line = lines[i].strip()
+            if line and not line.startswith('!') and not line.startswith('*-'):
+                last_data_line = i + 1
+                break
+
+        if last_data_line >= measure_start_line:
+            measures.append({
+                "measure": current_measure,
+                "line_start": measure_start_line,
+                "line_end": last_data_line,
+            })
+
+    return measures
+
+
 def generate_metadata(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     metadata_dir: Path = DEFAULT_METADATA_DIR,
@@ -177,8 +286,28 @@ def generate_metadata(
     kern_files = sorted(kern_dir.glob("*.krn"))
     metadata = {}
 
+    # Load skip list (files with quality issues)
+    skip_files = set()
+    skip_list_path = metadata_dir / "skip_files.txt"
+    if skip_list_path.exists():
+        with open(skip_list_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    skip_files.add(line)
+        if skip_files:
+            logger.info(f"Skipping {len(skip_files)} files from skip_files.txt")
+
+    # Cache for kern_measures (shared across versions of same kern file)
+    kern_measures_cache = {}
+
     for kern_path in kern_files:
         stem = kern_path.stem
+
+        # Skip files with quality issues
+        if stem in skip_files:
+            logger.debug(f"Skipping {stem} (in skip_files.txt)")
+            continue
 
         # Determine split
         split = "train"
@@ -195,6 +324,11 @@ def generate_metadata(
         # Get key signature
         original_key = get_key_signature_from_kern(kern_path)
         original_key = max(-6, min(7, original_key))  # Clamp to valid range
+
+        # Extract kern measures (cached - same for all versions)
+        if stem not in kern_measures_cache:
+            kern_measures_cache[stem] = extract_kern_measures(kern_path)
+        kern_measures = kern_measures_cache[stem]
 
         # Reproduce random seed (same as _process_single_kern)
         # Use hashlib.md5 for deterministic hashing across Python sessions
@@ -220,10 +354,11 @@ def generate_metadata(
                 soundfont = test_soundfonts[0]
 
             # Build audio name (same as _process_single_kern)
+            # Note: key is without .wav extension for easier lookup
             version_suffix = f"_v{version}" if n_versions > 1 else ""
-            audio_name = f"{stem}{version_suffix}~{soundfont[:-4]}.wav"
+            audio_key = f"{stem}{version_suffix}~{soundfont[:-4]}"
 
-            metadata[audio_name] = {
+            metadata[audio_key] = {
                 "kern_file": f"{stem}.krn",
                 "transpose": transpose,
                 "soundfont": soundfont,
@@ -232,6 +367,11 @@ def generate_metadata(
                 "original_key": original_key,
                 "tempo_augmented": tempo_enabled and split == "train",
                 "tempo_range": list(tempo_range) if (tempo_enabled and split == "train") else None,
+                "kern_measures": kern_measures,
+                # === To be filled by Phase 2 ===
+                "tempo_scaling": None,
+                "duration_sec": None,
+                "audio_measures": None,
             }
 
     return metadata
@@ -283,6 +423,8 @@ def main():
     # Summary
     splits = {}
     transpose_counts = {"0": 0, "transposed": 0}
+    total_measures = 0
+    unique_kern_files = set()
 
     for info in metadata.values():
         split = info["split"]
@@ -293,9 +435,15 @@ def main():
         else:
             transpose_counts["transposed"] += 1
 
-    logger.info(f"Generated metadata for {len(metadata)} audio files")
-    logger.info(f"Splits: {splits}")
-    logger.info(f"Transpose: {transpose_counts}")
+        if info["kern_file"] not in unique_kern_files:
+            unique_kern_files.add(info["kern_file"])
+            total_measures += len(info["kern_measures"])
+
+    logger.info(f"Generated metadata for {len(metadata)} audio entries")
+    logger.info(f"  Unique kern files: {len(unique_kern_files)}")
+    logger.info(f"  Total measures: {total_measures}")
+    logger.info(f"  Splits: {splits}")
+    logger.info(f"  Transpose: {transpose_counts}")
     logger.info(f"Saved to: {output_path}")
 
 

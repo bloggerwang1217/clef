@@ -57,12 +57,14 @@ class MIDIProcess:
                     break
 
     def random_scaling(self, range=(0.85, 1.15)):
-        """Apply random tempo scaling for data augmentation."""
+        """Apply random tempo scaling for data augmentation.
+
+        Note: Removed Zeng's 4-12 second length constraint, which was designed
+        for 5-bar chunks. For full-song processing, we apply tempo_range directly.
+        """
         original_length = self.midi.length
-        lower_bound = max(range[0], 4.0 / original_length)
-        upper_bound = min(range[1], 12.0 / original_length)
-        if lower_bound > upper_bound:
-            return None, original_length
+        lower_bound = range[0]
+        upper_bound = range[1]
         if self.split == "test" or self.split == "valid":
             if lower_bound > 1:
                 scaling = lower_bound

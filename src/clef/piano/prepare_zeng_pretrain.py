@@ -46,6 +46,7 @@ from src.score.kern_zeng_compat import (
     quantize_oov_tuplets,
     apply_zeng_pitch_compat,
 )
+from src.score.sanitize_kern import fix_kern_spine_timing
 from src.utils import set_seed, SEED_DATA_AUGMENTATION
 
 # Register converter21 for robust humdrum parsing
@@ -127,6 +128,239 @@ def get_key_signature(score: m21.stream.Score) -> int:
     except Exception as e:
         logger.debug(f"Could not extract key signature: {e}")
     return 0  # Default to C major
+
+
+def extract_measure_times(score: m21.stream.Score) -> List[Dict[str, Any]]:
+    """Extract measure timing information from a music21 score.
+
+    Uses the score's tempo markings to convert offsets to seconds.
+    Handles tempo changes within the piece.
+
+    Args:
+        score: music21 Score object
+
+    Returns:
+        List of measure info:
+        [
+            {"measure": 1, "start_sec": 0.0, "end_sec": 2.5},
+            {"measure": 2, "start_sec": 2.5, "end_sec": 5.1},
+            ...
+        ]
+    """
+    measures_info = []
+    seen_measures = set()
+
+    # Get the first part (assume all parts have same measure structure)
+    if not score.parts:
+        return measures_info
+
+    part = score.parts[0]
+
+    # Get all tempo marks from the flattened score, sorted by offset
+    flat_score = score.flatten()
+    tempo_marks = list(flat_score.getElementsByClass(m21.tempo.MetronomeMark))
+    tempo_marks.sort(key=lambda t: t.offset)
+
+    # Build tempo map: list of (offset, qpm) tuples
+    tempo_map = []
+    for tm in tempo_marks:
+        tempo_map.append((tm.offset, tm.number))
+
+    # Default tempo if none specified
+    if not tempo_map:
+        tempo_map = [(0.0, 120.0)]
+
+    def get_tempo_at_offset(offset: float) -> float:
+        """Get tempo (qpm) at a given offset."""
+        qpm = tempo_map[0][1]  # Default to first tempo
+        for t_offset, t_qpm in tempo_map:
+            if t_offset <= offset:
+                qpm = t_qpm
+            else:
+                break
+        return qpm
+
+    def offset_to_seconds(offset: float) -> float:
+        """Convert offset in quarter notes to seconds, handling tempo changes."""
+        seconds = 0.0
+        prev_offset = 0.0
+        prev_qpm = tempo_map[0][1]
+
+        for t_offset, t_qpm in tempo_map:
+            if t_offset >= offset:
+                break
+            # Add time from prev_offset to t_offset at prev_qpm
+            seconds += (t_offset - prev_offset) * (60.0 / prev_qpm)
+            prev_offset = t_offset
+            prev_qpm = t_qpm
+
+        # Add remaining time from prev_offset to target offset
+        seconds += (offset - prev_offset) * (60.0 / prev_qpm)
+        return seconds
+
+    for measure in part.getElementsByClass(m21.stream.Measure):
+        measure_num = measure.number
+        if measure_num in seen_measures:
+            continue
+        seen_measures.add(measure_num)
+
+        try:
+            # Get offset in quarter notes
+            offset_start = measure.offset
+            offset_end = offset_start + measure.duration.quarterLength
+
+            # Convert to seconds
+            start_sec = offset_to_seconds(offset_start)
+            end_sec = offset_to_seconds(offset_end)
+
+            measures_info.append({
+                "measure": measure_num,
+                "start_sec": round(start_sec, 4),
+                "end_sec": round(end_sec, 4),
+            })
+        except Exception:
+            # Fallback: skip this measure
+            continue
+
+    # Sort by measure number
+    measures_info.sort(key=lambda x: x["measure"])
+
+    return measures_info
+
+
+def extract_measure_times_from_kern(kern_content: str) -> List[Dict[str, Any]]:
+    """Fallback: Extract measure times directly from kern content.
+
+    Used when converter21 fails to create a valid music21 score.
+    Parses barlines and durations directly from the kern text.
+
+    Args:
+        kern_content: Raw kern file content (should be already expanded)
+
+    Returns:
+        List of measure info like extract_measure_times()
+    """
+    import re
+
+    # Duration mapping: kern duration -> quarter note length
+    DURATION_MAP = {
+        '00': 8.0, '0': 4.0, '1': 4.0, '2': 2.0, '4': 1.0,
+        '8': 0.5, '16': 0.25, '32': 0.125, '64': 0.0625,
+        '3': 4.0/3, '6': 2.0/3, '12': 1.0/3, '24': 0.5/3, '48': 0.25/3,
+    }
+
+    lines = kern_content.split('\n')
+    measures_info = []
+
+    # State
+    current_offset = 0.0  # in quarter notes
+    current_tempo = 120.0  # BPM
+    current_measure_start = 0.0
+    current_measure_num = 0
+    time_sig_quarters = 4.0  # quarters per measure (default 4/4)
+
+    # Tempo map for offset -> seconds conversion
+    tempo_changes = [(0.0, 120.0)]  # (offset, bpm)
+
+    def offset_to_seconds(offset: float) -> float:
+        """Convert quarter note offset to seconds."""
+        seconds = 0.0
+        prev_offset = 0.0
+        prev_bpm = tempo_changes[0][1]
+        for t_offset, t_bpm in tempo_changes:
+            if t_offset >= offset:
+                break
+            seconds += (t_offset - prev_offset) * (60.0 / prev_bpm)
+            prev_offset = t_offset
+            prev_bpm = t_bpm
+        seconds += (offset - prev_offset) * (60.0 / prev_bpm)
+        return seconds
+
+    def parse_duration(token: str) -> float:
+        """Parse kern token duration."""
+        match = re.match(r'^(\d+)', token)
+        if not match:
+            return 0.0
+        dur_str = match.group(1)
+        base_dur = DURATION_MAP.get(dur_str, 1.0)
+        # Apply dots
+        dots = token.count('.')
+        if dots > 0:
+            multiplier = sum(0.5 ** i for i in range(dots + 1))
+            base_dur *= multiplier
+        return base_dur
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('!'):
+            continue
+
+        # Parse tempo
+        if '*MM' in line:
+            match = re.search(r'\*MM=?(\d+)', line)
+            if match:
+                current_tempo = float(match.group(1))
+                tempo_changes.append((current_offset, current_tempo))
+
+        # Parse time signature
+        if '*M' in line and '/' in line:
+            match = re.search(r'\*M(\d+)/(\d+)', line)
+            if match:
+                num, denom = int(match.group(1)), int(match.group(2))
+                time_sig_quarters = num * (4.0 / denom)
+
+        # Barline - record measure
+        if line.startswith('='):
+            parts = line.split('\t')
+            bar_part = parts[0]
+
+            # Extract measure number
+            match = re.match(r'=+(\d+)?', bar_part)
+            if match:
+                measure_end = current_offset
+                if current_measure_num > 0 or '-' in bar_part:
+                    # Record previous measure
+                    measures_info.append({
+                        "measure": current_measure_num,
+                        "start_sec": round(offset_to_seconds(current_measure_start), 4),
+                        "end_sec": round(offset_to_seconds(measure_end), 4),
+                    })
+                # Start new measure
+                current_measure_start = current_offset
+                if match.group(1):
+                    current_measure_num = int(match.group(1))
+                else:
+                    current_measure_num += 1
+            continue
+
+        # Skip interpretation lines
+        if line.startswith('*'):
+            continue
+
+        # Data line - find max duration
+        parts = line.split('\t')
+        max_dur = 0.0
+        for part in parts:
+            if part == '.' or not part:
+                continue
+            # Handle chords (space-separated)
+            for subtoken in part.split():
+                if 'r' in subtoken or re.search(r'[a-gA-G]', subtoken):
+                    dur = parse_duration(subtoken)
+                    max_dur = max(max_dur, dur)
+
+        if max_dur > 0:
+            current_offset += max_dur
+
+    # Record last measure
+    if current_measure_num > 0:
+        measures_info.append({
+            "measure": current_measure_num,
+            "start_sec": round(offset_to_seconds(current_measure_start), 4),
+            "end_sec": round(offset_to_seconds(current_offset), 4),
+        })
+
+    return measures_info
 
 
 def phase1_score_to_kern(
@@ -233,8 +467,12 @@ def create_ground_truth_kern(
             with open(kern_path, "r", encoding="utf-8") as f:
                 raw_kern = f.read()
 
+            # Step 0: Fix spine timing (insert rests to sync spines)
+            # This ensures kern_gt timing matches audio timing
+            spine_fixed = fix_kern_spine_timing(raw_kern)
+
             # Step 1: Clean kern sequence (standardize tokens, dotted triplets, remove beams)
-            cleaned = clean_kern_sequence(raw_kern, warn_tuplet_ratio=False)
+            cleaned = clean_kern_sequence(spine_fixed, warn_tuplet_ratio=False)
 
             # Step 2: Apply Zeng pitch/accidental compatibility
             # (split breves, strip n, convert ##/--, remove slur/phrase, mark extreme)
@@ -289,7 +527,7 @@ def create_ground_truth_kern(
     return results
 
 
-def _process_single_kern(args: Tuple) -> Dict[str, str]:
+def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
     """Worker function for parallel processing a single kern file.
 
     Args:
@@ -298,7 +536,10 @@ def _process_single_kern(args: Tuple) -> Dict[str, str]:
                         tempo_enabled, tempo_range, musesyn_dir)
 
     Returns:
-        Dictionary of {audio_name: status}
+        Tuple of:
+        - results: Dictionary of {audio_name: status}
+        - alignment: Dictionary of {audio_key: alignment_info}
+          alignment_info contains: tempo_scaling, duration_sec, audio_measures
     """
     (kern_path, output_dir, soundfont_dir, split, num_versions, available_soundfonts,
      transpose_enabled, feasible_transposes, tempo_enabled, tempo_range, musesyn_dir) = args
@@ -317,13 +558,16 @@ def _process_single_kern(args: Tuple) -> Dict[str, str]:
         from midi2audio import FluidSynth
         has_zeng = False
 
-    from src.score.kern_repeat import expand_kern_repeats, sanitize_tuplet_durations
+    from src.score.sanitize_kern import sanitize_kern_for_audio
     from src.score.sanitize_piano_score import sanitize_score
 
     midi_dir = output_dir / "midi"
     audio_dir = output_dir / "audio"
     stem = kern_path.stem
     results = {}
+    alignment_info = {}  # {audio_key: {tempo_scaling, duration_sec, audio_measures}}
+
+    logger.debug(f"Processing: {stem}")
 
     # Set reproducible seed based on filename
     # NOTE: Use hashlib.md5 instead of hash() because Python's hash() is
@@ -335,6 +579,8 @@ def _process_single_kern(args: Tuple) -> Dict[str, str]:
     # Check if this is a MuseSyn file
     is_musesyn = stem.startswith("musesyn_")
 
+    expanded_kern = None  # For fallback measure extraction
+
     try:
         if is_musesyn:
             # For MuseSyn: use original XML + sanitize_score
@@ -343,35 +589,35 @@ def _process_single_kern(args: Tuple) -> Dict[str, str]:
             xml_path = musesyn_dir / "xml" / f"{original_name}.xml"
 
             if not xml_path.exists():
-                return {f"{stem}_v0": f"error: XML not found - {xml_path}"}
+                return {f"{stem}_v0": f"error: XML not found - {xml_path}"}, {}
 
             score = m21.converter.parse(str(xml_path))
             sanitize_score(score)
         else:
-            # For HumSyn: use kern file with repeat expansion
+            # For HumSyn: use kern file with repeat expansion and sanitization
             # Original kern with repeat markers is preserved as ground truth
             with open(kern_path, "r", encoding="utf-8") as f:
                 kern_content = f.read()
 
-            # Expand repeats for audio generation
-            expanded_kern = expand_kern_repeats(kern_content)
+            # Sanitize kern for audio generation:
+            # 1. Expand repeats
+            # 2. Fix tuplet durations
+            # 3. Fix spine timing inconsistencies
+            expanded_kern = sanitize_kern_for_audio(kern_content)
 
-            # Sanitize tuplet durations (removes dots from notes in tuplet regions)
-            # This prevents DurationException from music21 when parsing complex rhythms
-            expanded_kern = sanitize_tuplet_durations(expanded_kern)
-
-            # Write expanded kern to temp file for music21 parsing
+            # Write sanitized kern to temp file for music21 parsing
             with tempfile.NamedTemporaryFile(mode="w", suffix=".krn", delete=False) as tmp:
                 tmp.write(expanded_kern)
                 expanded_kern_path = tmp.name
 
             score = m21.converter.parse(expanded_kern_path, format="humdrum")
+            sanitize_score(score)
 
             # Clean up temp file
             Path(expanded_kern_path).unlink(missing_ok=True)
 
     except Exception as e:
-        return {f"{stem}_v0": f"error: parse failed - {e}"}
+        return {f"{stem}_v0": f"error: parse failed - {e}"}, {}
 
     # Get key signature for transpose selection
     original_key = get_key_signature(score)
@@ -407,9 +653,11 @@ def _process_single_kern(args: Tuple) -> Dict[str, str]:
         midi_path = midi_dir / midi_name
         audio_path = audio_dir / audio_name
 
-        if audio_path.exists():
-            results[audio_name] = "skipped (exists)"
-            continue
+        # Audio key for metadata (without .wav extension)
+        audio_key = f"{stem}{version_suffix}~{soundfont[:-4]}"
+
+        # Check if audio already exists
+        audio_exists = audio_path.exists()
 
         try:
             # Apply transpose if needed
@@ -418,42 +666,149 @@ def _process_single_kern(args: Tuple) -> Dict[str, str]:
             else:
                 transposed_score = score
 
-            # Write MIDI
-            midi_path.parent.mkdir(parents=True, exist_ok=True)
-            transposed_score.write("midi", fp=str(midi_path))
+            # Extract measure times (for alignment - needed even for skipped files)
+            measure_times = extract_measure_times(transposed_score)
 
-            if not midi_path.exists():
+            # Fallback: if score parsing failed, extract from kern directly
+            if not measure_times and expanded_kern:
+                measure_times = extract_measure_times_from_kern(expanded_kern)
+
+            # Calculate tempo scaling (deterministic based on seed)
+            # For existing files, we simulate what MIDIProcess would do
+            tempo_scaling = 1.0  # Default: no scaling
+            if tempo_enabled and split == "train":
+                # Simulate MIDIProcess.random_scaling logic
+                # The score length approximates MIDI length
+                try:
+                    score_length = transposed_score.duration.quarterLength
+                    # Estimate original_length in seconds using first tempo
+                    flat_score = transposed_score.flatten()
+                    tempo_marks = list(flat_score.getElementsByClass(m21.tempo.MetronomeMark))
+                    if tempo_marks:
+                        qpm = tempo_marks[0].number
+                    else:
+                        qpm = 120.0
+                    original_length = score_length * (60.0 / qpm)
+
+                    # Same logic as MIDIProcess.random_scaling
+                    import numpy as np
+                    lower_bound = max(tempo_range[0], 4.0 / original_length)
+                    upper_bound = min(tempo_range[1], 12.0 / original_length)
+                    if lower_bound <= upper_bound:
+                        tempo_scaling = np.random.uniform(lower_bound, upper_bound)
+                except Exception:
+                    tempo_scaling = 1.0
+
+            # Calculate audio_measures (apply tempo scaling to measure times)
+            audio_measures = []
+            for m in measure_times:
+                audio_measures.append({
+                    "measure": m["measure"],
+                    "start_sec": round(m["start_sec"] * tempo_scaling, 4),
+                    "end_sec": round(m["end_sec"] * tempo_scaling, 4),
+                })
+
+            # Calculate duration from last measure end time
+            duration_sec = audio_measures[-1]["end_sec"] if audio_measures else 0.0
+
+            # Skip audio generation if file already exists
+            # But still collect alignment info for metadata update
+            if audio_exists:
+                results[audio_name] = "skipped (exists)"
+                alignment_info[audio_key] = {
+                    "tempo_scaling": round(tempo_scaling, 6),
+                    "duration_sec": round(duration_sec, 4),
+                    "audio_measures": audio_measures,
+                }
+                continue
+
+            # Write MIDI (with flatten fallback for converter21 rhythm analysis issues)
+            midi_path.parent.mkdir(parents=True, exist_ok=True)
+            midi_written = False
+            try:
+                transposed_score.write("midi", fp=str(midi_path))
+                if midi_path.exists():
+                    print(f"[MIDI OK] {midi_path.name}", flush=True)
+                    midi_written = True
+                else:
+                    print(f"[MIDI FAIL] {midi_path.name} - file not created", flush=True)
+            except Exception as e:
+                print(f"[MIDI FAIL] {midi_path.name} - {e}", flush=True)
+
+            # Fallback: flatten score to remove complex spine structures
+            if not midi_written:
+                try:
+                    flat_for_midi = transposed_score.flatten()
+                    flat_for_midi.insert(0, m21.instrument.Piano())
+                    flat_for_midi.write("midi", fp=str(midi_path))
+                    if midi_path.exists():
+                        print(f"[MIDI FALLBACK OK] {midi_path.name}", flush=True)
+                        midi_written = True
+                    else:
+                        print(f"[MIDI FALLBACK FAIL] {midi_path.name} - file not created", flush=True)
+                except Exception as e:
+                    print(f"[MIDI FALLBACK FAIL] {midi_path.name} - {e}", flush=True)
+
+            if not midi_written:
                 results[audio_name] = "error: midi write failed"
                 continue
 
             # Apply tempo scaling via MIDIProcess (Zeng-style)
             if has_zeng and tempo_enabled:
+                temp_midi_path = midi_dir / f"temp_{stem}_{version}.mid"
                 midi_proc = MIDIProcess(str(midi_path), split)
                 scaling, original_length = midi_proc.process(
                     str(midi_path),
-                    str(midi_dir / f"temp_{stem}_{version}.mid"),
+                    str(temp_midi_path),
                     tempo_range=tempo_range,
                 )
+                # Clean up temp file
+                if temp_midi_path.exists():
+                    temp_midi_path.unlink()
+                # Update with actual scaling (should match our simulation)
+                if scaling is not None:
+                    tempo_scaling = scaling
+                    # Recalculate audio_measures with actual scaling
+                    audio_measures = []
+                    for m in measure_times:
+                        audio_measures.append({
+                            "measure": m["measure"],
+                            "start_sec": round(m["start_sec"] * tempo_scaling, 4),
+                            "end_sec": round(m["end_sec"] * tempo_scaling, 4),
+                        })
+                    duration_sec = audio_measures[-1]["end_sec"] if audio_measures else 0.0
 
             # Render MIDI -> Audio with loudness normalization
             sf_path = soundfont_dir / soundfont
             fs = FluidSynth(str(sf_path), sample_rate=44100)
 
-            if has_zeng:
-                compressor = create_default_compressor()
-                render_one_midi(fs, compressor, str(midi_path), str(audio_path))
-            else:
-                fs.midi_to_audio(str(midi_path), str(audio_path))
+            try:
+                if has_zeng:
+                    compressor = create_default_compressor()
+                    render_one_midi(fs, compressor, str(midi_path), str(audio_path))
+                else:
+                    fs.midi_to_audio(str(midi_path), str(audio_path))
 
-            if audio_path.exists():
-                results[audio_name] = "success"
-            else:
-                results[audio_name] = "error: audio not created"
+                if audio_path.exists():
+                    print(f"[AUDIO OK] {audio_path.name}", flush=True)
+                    results[audio_name] = "success"
+                    # Store alignment info for newly generated files
+                    alignment_info[audio_key] = {
+                        "tempo_scaling": round(tempo_scaling, 6),
+                        "duration_sec": round(duration_sec, 4),
+                        "audio_measures": audio_measures,
+                    }
+                else:
+                    print(f"[AUDIO FAIL] {audio_path.name} - file not created", flush=True)
+                    results[audio_name] = "error: audio not created"
+            except Exception as e:
+                print(f"[AUDIO FAIL] {audio_path.name} - {e}", flush=True)
+                results[audio_name] = f"error: audio render failed - {e}"
 
         except Exception as e:
             results[audio_name] = f"error: {e}"
 
-    return results
+    return results, alignment_info
 
 
 def phase2_kern_to_audio(
@@ -515,6 +870,18 @@ def phase2_kern_to_audio(
         df = pd.read_csv(valid_split_path)
         valid_split = set(df["name"].tolist())
 
+    # Load skip list (files with quality issues)
+    skip_files = set()
+    skip_list_path = metadata_dir / "skip_files.txt"
+    if skip_list_path.exists():
+        with open(skip_list_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    skip_files.add(line)
+        if skip_files:
+            logger.info(f"Skipping {len(skip_files)} files from skip_files.txt")
+
     # Check available soundfonts (train and test separately)
     available_train_soundfonts = [sf for sf in train_soundfonts if (soundfont_dir / sf).exists()]
     available_test_soundfonts = [sf for sf in test_soundfonts if (soundfont_dir / sf).exists()]
@@ -539,6 +906,11 @@ def phase2_kern_to_audio(
     for kern_path in kern_files:
         stem = kern_path.stem
 
+        # Skip files with quality issues
+        if stem in skip_files:
+            logger.debug(f"Skipping {stem} (in skip_files.txt)")
+            continue
+
         # Determine split
         split = "train"
         for test_name in test_split:
@@ -561,24 +933,68 @@ def phase2_kern_to_audio(
 
     all_results = {}
 
+    # Load metadata once at the beginning for incremental updates
+    metadata_path = output_dir / "augmentation_metadata.json"
+    metadata = {}
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load metadata, starting fresh: {e}")
+
+    updated_count = 0
+    save_interval = 10  # Save metadata every N kern files
+
+    def update_metadata_incremental(alignment: dict) -> int:
+        """Update metadata in memory with alignment info. Returns count of updates."""
+        count = 0
+        for audio_key, align_info in alignment.items():
+            if audio_key in metadata:
+                metadata[audio_key]["tempo_scaling"] = align_info["tempo_scaling"]
+                metadata[audio_key]["duration_sec"] = align_info["duration_sec"]
+                metadata[audio_key]["audio_measures"] = align_info["audio_measures"]
+                count += 1
+        return count
+
+    def save_metadata():
+        """Save metadata to disk."""
+        if metadata:
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+
     if workers == 1:
-        # Sequential processing
-        for task in tqdm(tasks, desc="Processing kern files"):
-            results = _process_single_kern(task)
+        # Sequential processing with incremental metadata updates
+        for i, task in enumerate(tqdm(tasks, desc="Processing kern files")):
+            results, alignment = _process_single_kern(task)
             all_results.update(results)
+            updated_count += update_metadata_incremental(alignment)
+
+            # Save periodically
+            if (i + 1) % save_interval == 0:
+                save_metadata()
     else:
-        # Parallel processing
+        # Parallel processing with incremental metadata updates (in main thread)
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_process_single_kern, task): task[0] for task in tasks}
 
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing kern files"):
+            for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Processing kern files")):
                 kern_path = futures[future]
                 try:
-                    results = future.result()
+                    results, alignment = future.result()
                     all_results.update(results)
+                    updated_count += update_metadata_incremental(alignment)
+
+                    # Save periodically
+                    if (i + 1) % save_interval == 0:
+                        save_metadata()
                 except Exception as e:
                     logger.error(f"Error processing {kern_path}: {e}")
                     all_results[kern_path.stem] = f"error: {e}"
+
+    # Final save
+    save_metadata()
+    logger.info(f"Updated {updated_count} entries in {metadata_path}")
 
     # Summary
     success = sum(1 for v in all_results.values() if v == "success")
