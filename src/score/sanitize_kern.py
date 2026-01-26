@@ -64,14 +64,9 @@ def parse_kern_duration(token: str) -> Optional[Fraction]:
     recip = int(match.group(1))
     dur = Fraction(8) if recip == 0 else Fraction(4, recip)
 
-    # Handle dots
-    after_num = token_clean[match.end():]
-    dots = 0
-    for c in after_num:
-        if c == '.':
-            dots += 1
-        elif c.isalpha() or c in '-#n':
-            break
+    # Handle dots - count all dots in token (dots can appear after pitch letter)
+    # e.g., "(4A." = slur + 4 + pitch A + dot, the dot is AFTER the letter
+    dots = token_clean.count('.')
     if dots > 0:
         dur = dur * (Fraction(2) - Fraction(1, 2**dots))
 
