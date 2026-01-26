@@ -754,19 +754,40 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
                 continue
 
             # Apply tempo scaling via MIDIProcess (Zeng-style)
+            tempo_scaling_success = True
             if has_zeng and tempo_enabled:
                 temp_midi_path = midi_dir / f"temp_{stem}_{version}.mid"
                 midi_proc = MIDIProcess(str(midi_path), split)
-                scaling, original_length = midi_proc.process(
+                result = midi_proc.process(
                     str(midi_path),
                     str(temp_midi_path),
                     tempo_range=tempo_range,
                 )
+                # Handle both old (2-tuple) and new (3-tuple) return format
+                if len(result) == 3:
+                    scaling, original_length, tempo_scaling_success = result
+                else:
+                    scaling, original_length = result
+                    tempo_scaling_success = True
                 # Clean up temp file
                 if temp_midi_path.exists():
                     temp_midi_path.unlink()
-                # Update with actual scaling (should match our simulation)
-                if scaling is not None:
+
+                # If tempo scaling failed, use original MIDI with tempo=1.0
+                # Still generate all 4 soundfont versions (v0-v3)
+                if not tempo_scaling_success:
+                    tempo_scaling = 1.0
+                    # Recalculate audio_measures with tempo=1.0
+                    audio_measures = []
+                    for m in measure_times:
+                        audio_measures.append({
+                            "measure": m["measure"],
+                            "start_sec": round(m["start_sec"], 4),
+                            "end_sec": round(m["end_sec"], 4),
+                        })
+                    duration_sec = audio_measures[-1]["end_sec"] if audio_measures else 0.0
+                elif scaling is not None:
+                    # Update with actual scaling (should match our simulation)
                     tempo_scaling = scaling
                     # Recalculate audio_measures with actual scaling
                     audio_measures = []
