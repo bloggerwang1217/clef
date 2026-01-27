@@ -154,6 +154,9 @@ Example:
 ```bash
 # Required for audio synthesis (MIDI → Audio)
 sudo apt-get install fluidsynth  # Ubuntu/Debian (v2.2.5)
+
+# Required for audio loading (torchaudio + torchcodec)
+sudo apt-get install ffmpeg      # Ubuntu/Debian (v4/5/6/7/8)
 ```
 
 ### Key Dependencies (managed by Poetry)

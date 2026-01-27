@@ -5,6 +5,8 @@ clef-piano-base Preprocessing Pipeline
 Prepares training data for clef-piano-base model:
 - Phase 1: Score → Kern (MuseSyn XML + HumSyn kern)
 - Phase 2: Kern → MIDI → Audio (with data augmentation)
+- Phase 2.5: Audio → Mel Spectrogram
+- Phase 3: Create training manifests (train/valid/test)
 
 Key differences from Zeng et al.:
 - converter21 instead of verovio (higher success rate)
@@ -19,10 +21,13 @@ Data augmentation matches Zeng et al.:
 - Loudness normalization (-15 LUFS)
 
 Usage:
-    python -m src.clef.piano.prepare_zeng_pretrain --phase 1  # Score → Kern
-    python -m src.clef.piano.prepare_zeng_pretrain --phase 2  # Kern → Audio
+    python -m src.clef.piano.prepare_zeng_pretrain --phase 1      # Score → Kern
+    python -m src.clef.piano.prepare_zeng_pretrain --phase 2      # Kern → Audio
+    python -m src.clef.piano.prepare_zeng_pretrain --phase 2.5    # Audio → Mel
+    python -m src.clef.piano.prepare_zeng_pretrain --phase 3      # Create manifests
     python -m src.clef.piano.prepare_zeng_pretrain --phase 2 --workers 8  # Parallel
-    python -m src.clef.piano.prepare_zeng_pretrain            # Full pipeline
+    python -m src.clef.piano.prepare_zeng_pretrain                # Full pipeline (1,2)
+    python -m src.clef.piano.prepare_zeng_pretrain --phase all    # All phases (1,2,2.5,3)
 """
 
 import hashlib
@@ -38,6 +43,8 @@ import music21 as m21
 import pandas as pd
 from tqdm import tqdm
 
+from src.audio.mel import load_mel_config, process_audio_file
+from src.datasets.syn.syn_manifest import create_manifest
 from src.preprocessing.humsyn_processor import HumSynProcessor
 from src.preprocessing.musesyn_processor import MuseSynProcessor
 from src.score.clean_kern import clean_kern_sequence
@@ -61,6 +68,7 @@ DEFAULT_OUTPUT_DIR = Path("data/experiments/clef_piano_base")
 DEFAULT_METADATA_DIR = Path("src/datasets/syn")
 DEFAULT_SOUNDFONT_DIR = Path("data/soundfonts/piano")
 DEFAULT_AUG_CONFIG = Path("configs/zeng_augmentation.json")
+DEFAULT_MODEL_CONFIG = Path("configs/clef_piano_base.yaml")
 
 
 def load_augmentation_config(config_path: Path = DEFAULT_AUG_CONFIG) -> Dict[str, Any]:
@@ -1012,6 +1020,127 @@ def phase2_kern_to_audio(
     return all_results
 
 
+# ============================================================
+# Phase 2.5: Audio → Mel Spectrogram
+# ============================================================
+
+def _process_one_audio_wrapper(args: Tuple) -> str:
+    """Worker function wrapper for multiprocessing mel generation.
+
+    Args:
+        args: Tuple of (audio_path, mel_path, sample_rate, n_mels,
+                        n_fft, hop_length, f_min, f_max)
+
+    Returns:
+        Status string: "generated", "skipped", "missing", or "failed"
+    """
+    (audio_path, mel_path, sample_rate, n_mels,
+     n_fft, hop_length, f_min, f_max) = args
+
+    status, _ = process_audio_file(
+        audio_path=audio_path,
+        mel_path=mel_path,
+        target_sample_rate=sample_rate,
+        n_mels=n_mels,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        f_min=f_min,
+        f_max=f_max,
+        normalize=True,
+        skip_existing=True,
+    )
+    return status
+
+
+def phase2_5_audio_to_mel(
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    model_config: Path = DEFAULT_MODEL_CONFIG,
+    workers: int = 4,
+) -> Dict[str, int]:
+    """Phase 2.5: Convert audio files to mel spectrograms.
+
+    Processes all audio files listed in augmentation_metadata.json and
+    saves mel spectrograms as .pt files.
+
+    Mel parameters are loaded from the model config file (data.audio section).
+
+    Args:
+        output_dir: Base output directory (contains audio/, writes to mel/)
+        model_config: Path to model config YAML (for mel parameters)
+        workers: Number of parallel workers
+
+    Returns:
+        Statistics dictionary with counts of generated, skipped, missing, failed
+    """
+    # Load mel parameters from config
+    mel_config = load_mel_config(model_config)
+    sample_rate = mel_config["sample_rate"]
+    n_mels = mel_config["n_mels"]
+    n_fft = mel_config["n_fft"]
+    hop_length = mel_config["hop_length"]
+    f_min = mel_config["f_min"]
+    f_max = mel_config["f_max"]
+
+    # Load metadata
+    metadata_path = output_dir / "augmentation_metadata.json"
+    if not metadata_path.exists():
+        logger.error(f"Metadata not found: {metadata_path}")
+        logger.info("Run Phase 2 first to generate augmentation_metadata.json")
+        return {"generated": 0, "skipped": 0, "missing": 0, "failed": 0}
+
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    mel_dir = output_dir / "mel"
+    mel_dir.mkdir(exist_ok=True)
+    audio_dir = output_dir / "audio"
+
+    logger.info(f"Phase 2.5: Converting {len(metadata)} audio files to mel spectrograms")
+    logger.info(f"Config: {model_config}")
+    logger.info(f"Parameters: sr={sample_rate}, n_mels={n_mels}, n_fft={n_fft}, "
+                f"hop={hop_length}, f_min={f_min}, f_max={f_max}")
+
+    # Prepare tasks (without key, just paths and params)
+    tasks = [
+        (
+            audio_dir / f"{key}.wav",
+            mel_dir / f"{key}.pt",
+            sample_rate, n_mels, n_fft, hop_length, f_min, f_max,
+        )
+        for key in metadata.keys()
+    ]
+
+    # Process with multiprocessing
+    stats = {"generated": 0, "skipped": 0, "missing": 0, "failed": 0}
+
+    if workers == 1:
+        # Sequential processing
+        for task in tqdm(tasks, desc="Generating mel"):
+            result = _process_one_audio_wrapper(task)
+            stats[result] += 1
+    else:
+        # Parallel processing
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            results = list(tqdm(
+                executor.map(_process_one_audio_wrapper, tasks),
+                total=len(tasks),
+                desc="Generating mel",
+            ))
+
+        for result in results:
+            stats[result] += 1
+
+    # Summary
+    logger.info(f"\nPhase 2.5 complete:")
+    logger.info(f"  Generated: {stats['generated']}")
+    logger.info(f"  Skipped:   {stats['skipped']}")
+    logger.info(f"  Missing:   {stats['missing']}")
+    logger.info(f"  Failed:    {stats['failed']}")
+    logger.info(f"  Total mel: {len(list(mel_dir.glob('*.pt')))}")
+
+    return stats
+
+
 def _match_split_name(processed_name: str, split_name: str) -> bool:
     """Check if a processed filename matches a split file entry.
 
@@ -1066,9 +1195,10 @@ def main():
     parser = argparse.ArgumentParser(description="clef-piano-base preprocessing pipeline")
     parser.add_argument(
         "--phase",
-        type=int,
-        choices=[1, 2],
-        help="Phase to run (1: Score→Kern, 2: Kern→Audio). If not specified, runs both.",
+        type=str,
+        choices=["1", "2", "2.5", "3", "all"],
+        help="Phase to run: 1 (Score→Kern), 2 (Kern→Audio), 2.5 (Audio→Mel), "
+             "3 (Create manifests), all (all phases). If not specified, runs 1 and 2.",
     )
     parser.add_argument(
         "--humsyn-dir",
@@ -1120,11 +1250,24 @@ def main():
         help="Processing preset: clef-piano-base (Chopin filter + Joplin strip), "
              "clef-piano-full (Chopin filter only), or none (default, no filtering)",
     )
+    parser.add_argument(
+        "--model-config",
+        type=Path,
+        default=DEFAULT_MODEL_CONFIG,
+        help="Model config YAML file (for mel parameters in Phase 2.5 and 3)",
+    )
 
     args = parser.parse_args()
 
+    # Determine which phases to run
+    phase = args.phase
+    run_phase1 = phase is None or phase == "1" or phase == "all"
+    run_phase2 = phase is None or phase == "2" or phase == "all"
+    run_phase2_5 = phase == "2.5" or phase == "all"
+    run_phase3 = phase == "3" or phase == "all"
+
     # Run requested phases
-    if args.phase is None or args.phase == 1:
+    if run_phase1:
         logger.info("=== Phase 1: Score → Kern ===")
         if args.preset:
             logger.info(f"Using preset: {args.preset}")
@@ -1149,7 +1292,7 @@ def main():
         gt_success = sum(1 for v in gt_results.values() if v == "success")
         logger.info(f"Phase 1b complete: {gt_success}/{len(gt_results)} successful")
 
-    if args.phase is None or args.phase == 2:
+    if run_phase2:
         logger.info("=== Phase 2: Kern → Audio ===")
         phase2_results = phase2_kern_to_audio(
             output_dir=args.output_dir,
@@ -1161,6 +1304,25 @@ def main():
         )
         success = sum(1 for v in phase2_results.values() if v == "success")
         logger.info(f"Phase 2 complete: {success}/{len(phase2_results)} successful")
+
+    if run_phase2_5:
+        logger.info("=== Phase 2.5: Audio → Mel ===")
+        phase2_5_stats = phase2_5_audio_to_mel(
+            output_dir=args.output_dir,
+            model_config=args.model_config,
+            workers=args.workers,
+        )
+        logger.info(f"Phase 2.5 complete: {phase2_5_stats['generated']} generated, "
+                    f"{phase2_5_stats['skipped']} skipped")
+
+    if run_phase3:
+        logger.info("=== Phase 3: Create Manifests ===")
+        phase3_counts = create_manifest(
+            data_dir=args.output_dir,
+            config_path=args.model_config,
+        )
+        total = sum(phase3_counts.values())
+        logger.info(f"Phase 3 complete: {total} total samples in manifests")
 
 
 if __name__ == "__main__":

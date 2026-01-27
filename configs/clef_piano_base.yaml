@@ -36,12 +36,16 @@ data:
   # Vocabulary: Zeng's LabelsMultiple + grace notes
   vocabulary: "zeng_extended"
 
-  # Audio features
+  # Audio features (mel spectrogram parameters)
+  # Matches Zeng's time resolution (100 fps) and frequency range for fair comparison
   audio:
     sample_rate: 16000
-    feature: "log_mel"  # Different from Zeng's VQT, but fair comparison
-    n_mels: 128
-    hop_length: 256
+    feature: "log_mel"    # Zeng uses VQT, but Mel enables Swin V2 pretrained weights
+    n_mels: 128           # Zeng: 480 bins (60 × 8 octaves)
+    n_fft: 2048
+    hop_length: 160       # 100 fps (same as Zeng)
+    f_min: 27.5           # A0 = 27.5 Hz (piano lowest, same as Zeng)
+    f_max: 7040.0         # f_max = fmin * 2^n_octaves = 27.5 * 256 = 7040 Hz (n_octaves = 8)
 
   # Augmentation (matching Zeng)
   augmentation:
