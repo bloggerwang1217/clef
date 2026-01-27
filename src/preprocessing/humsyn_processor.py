@@ -24,7 +24,11 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from src.score.clean_kern import clean_kern_sequence, extract_visual_from_sequence, strip_non_kern_spines
+from src.score.clean_kern import (
+    clean_kern_sequence,
+    extract_visual_from_sequence,
+    strip_non_kern_spines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +91,14 @@ class HumSynProcessor:
         self.preset = preset
 
         # Determine what filters to apply based on preset
-        self.filter_chopin = preset in {"clef-piano-base", "clef-piano-full"}
+        # Always filter Chopin (selected_chopin.txt) - no reason to include duplicates
+        self.filter_chopin = True
         self.strip_joplin = preset == "clef-piano-base"
         # clef-piano-base: remove all non-kern; clef-piano-full: keep **dynam
         self.keep_dynam = preset == "clef-piano-full"
+        # NOTE: Zeng vocab conversion (expand_tuplets_to_zeng_vocab) is NOT applied here.
+        # It's done in create_ground_truth_kern() for kern_gt/ only.
+        # kern/ keeps original timing for accurate MIDI/audio generation.
 
         # Load Chopin selection list (when filtering is enabled)
         self.selected_chopin: Optional[Set[str]] = None
@@ -116,14 +124,15 @@ class HumSynProcessor:
 
         Applied only when preset="clef-piano-base":
         - Remove **dynam spine (column 3)
-        - Remove repeat markers (*>[...]) - skip entire line
-        - Remove section markers (*>X) - skip entire line
+        - KEEP expansion labels (*>[...], *>norep[...]) - needed for repeat expansion
+        - KEEP section markers (*>A, *>I, etc.) - needed for repeat expansion
 
         Args:
             kern_raw: Raw kern file content
 
         Returns:
-            Processed kern content with only **kern spines
+            Processed kern content with only **kern spines, but with
+            expansion labels preserved for Phase 2 repeat expansion
         """
         lines = kern_raw.split("\n")
         processed_lines = []
@@ -134,19 +143,18 @@ class HumSynProcessor:
                 processed_lines.append(line)
                 continue
 
-            # Skip repeat markers: *>[I,A,A1,...] or *>norep[...]
+            # KEEP expansion labels: *>[I,A,A1,...] or *>norep[...]
+            # These are essential for expand_kern_repeats in Phase 2
             if re.match(r"^\*>\[.*\]", line) or re.match(r"^\*>norep\[.*\]", line):
+                processed_lines.append(line)
                 continue
 
             # Check if line has tabs (spine data)
             if "\t" in line:
                 parts = line.split("\t")
 
-                # Skip section markers (*>A, *>I, etc.) - all columns have same marker
-                if parts[0].startswith("*>") and not parts[0].startswith("*>["):
-                    continue
-
-                # Remove third column (**dynam) if it exists
+                # KEEP section markers (*>A, *>I, etc.) - needed for repeat expansion
+                # Just remove the third column (dynam) if present
                 if len(parts) >= 3:
                     # Keep only first two columns (left hand, right hand)
                     parts = parts[:2]
@@ -196,9 +204,10 @@ class HumSynProcessor:
         with open(krn_path, "r", encoding="utf-8", errors="replace") as f:
             kern_raw = f.read()
 
-        # Apply Joplin-specific stripping (clef-piano-base only)
-        if repo_name == "joplin" and self.strip_joplin:
-            kern_raw = self._strip_joplin_extras(kern_raw)
+        # NOTE: _strip_joplin_extras was removed because it broke spine tracking.
+        # It blindly kept only the first 2 columns, which corrupted spine split/merge
+        # structures. strip_non_kern_spines(keep_dynam=False) correctly handles
+        # spine operations and removes **dynam spines.
 
         # Strip non-kern spines (keep_dynam=True for clef-piano-full)
         kern_raw = strip_non_kern_spines(kern_raw, keep_dynam=self.keep_dynam)
@@ -291,7 +300,7 @@ def main():
     parser.add_argument(
         "--selected-chopin",
         type=Path,
-        default=Path("data/metadata/selected_chopin.txt"),
+        default=Path("src/datasets/syn/selected_chopin.txt"),
         help="Path to selected Chopin file list",
     )
     parser.add_argument(

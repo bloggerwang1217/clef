@@ -142,7 +142,55 @@ ASAP test split 的完整結構：
 | Zeng | (待產生) | (待產生) |
 | Clef | (待產生) | (待產生) |
 
+### Zeng 的兩個版本：Score vs EPR
+
+Zeng et al. (2024) 的 codebase 支援兩種 MIDI 生成模式（`midi_syn` 參數）：
+
+| 版本 | MIDI 來源 | Velocity | 特徵 |
+|------|----------|----------|------|
+| **Zeng-score** | verovio 直接轉換 | 90（固定） | 死板、無動態變化 |
+| **Zeng-EPR** | VirtuosoNet (15 composers) | 變化的 | 模擬人類演奏表情 |
+
+**EPR (Expressive Performance Rendering)** 的四個隨機化步驟：
+
+1. **Random Key Shift**: ±4 semitones
+2. **Random Composer**: 從 15 位虛擬作曲家隨機選擇（僅 EPR）
+3. **Random Tempo Scaling**: 0.85-1.15x
+4. **Random Soundfont**: 4 種鋼琴音色
+
+> **關鍵差異**：Score 版本的 MIDI velocity 全為 90（verovio 預設），完全沒有動態變化。EPR 版本透過 VirtuosoNet 模擬人類演奏的 onset、duration、velocity、pedal 變化。
+
+### 兩層比較策略 (Two-Tier Comparison)
+
+為了進行**控制變因的公平比較**，我們將實驗分為兩個層級：
+
+| 比較層級 | Clef | vs | Zeng | 控制變因 | 目的 |
+|----------|------|-----|------|----------|------|
+| **Tier 1: 架構比較** | clef-piano-base | vs | Zeng-score | 都用死板 MIDI（無 EPR） | 證明架構優越性 |
+| **Tier 2: SOTA 比較** | clef-piano-full | vs | Zeng-finetune | 都用完整 augmentation | 打敗 SOTA |
+
+### Table 0: 兩層比較總覽
+
+| Model | Training Data | Augmentation | MV2H | 結論 |
+|-------|---------------|--------------|------|------|
+| **Tier 1: Architecture** | | | | |
+| Zeng-score | Syn (Basic) | Transpose + Tempo + SF | TBD | 基準線 |
+| **Clef-piano-base** | Syn (Basic) | Tempo + SF | **> Zeng-score** | **架構勝利** |
+| | | | | |
+| **Tier 2: SOTA** | | | | |
+| Zeng-EPR | Syn (EPR) | VirtuosoNet + all | 69.4% (Real) | Pre-train only |
+| Zeng-finetune | Syn (EPR) + Real | VirtuosoNet + all | **74.2%** (Real) | 目前 SOTA |
+| **Clef-piano-full** | Syn + Real | Custom Rule-based | **> 75.0%** | **全面勝利** |
+
+> **說明**：
+> - **Tier 1** 比較的是「架構差異」：Swin + Transformer vs CNN + H-RNN
+> - **Tier 2** 比較的是「完整系統」：我們的 augmentation vs VirtuosoNet
+> - Clef-piano-base 不使用 EPR/VirtuosoNet，與 Zeng-score 公平比較
+> - Clef-piano-full 使用自己設計的 rule-based augmentation（velocity variation、sustain、reverb 等）
+
 ### 兩階段訓練 (Two-Stage Training)
+
+**Zeng 原始設定（EPR 版本）**：
 
 ```
 Stage 1: Pre-training (Synthetic Data)
@@ -157,6 +205,23 @@ Stage 1: Pre-training (Synthetic Data)
 
 Stage 2: Fine-tuning (Real Recordings)
 ├── Data: ASAP train split (14 首 / 58 段)
+└── Transfer learning from Stage 1
+```
+
+**Clef-piano-base 設定（Score 版本對照）**：
+
+```
+Stage 1: Pre-training (Synthetic Data)
+├── Data: MuseSyn (Pop) + HumSyn (Classical/Ragtime)
+├── Audio: verovio 直接轉換（無 EPR）
+├── MIDI Velocity: 90（固定，無動態）
+├── Augmentation:
+│   ├── Random tempo scaling (0.85-1.15x)
+│   └── Random soundfont (4 種鋼琴)
+└── 無 key shift（鋼琴 voicing 考量）
+
+Stage 2: Fine-tuning (Real Recordings)
+├── Data: ASAP train split
 └── Transfer learning from Stage 1
 ```
 

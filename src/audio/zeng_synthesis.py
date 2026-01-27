@@ -57,12 +57,14 @@ class MIDIProcess:
                     break
 
     def random_scaling(self, range=(0.85, 1.15)):
-        """Apply random tempo scaling for data augmentation."""
+        """Apply random tempo scaling for data augmentation.
+
+        Note: Removed Zeng's 4-12 second length constraint, which was designed
+        for 5-bar chunks. For full-song processing, we apply tempo_range directly.
+        """
         original_length = self.midi.length
-        lower_bound = max(range[0], 4.0 / original_length)
-        upper_bound = min(range[1], 12.0 / original_length)
-        if lower_bound > upper_bound:
-            return None, original_length
+        lower_bound = range[0]
+        upper_bound = range[1]
         if self.split == "test" or self.split == "valid":
             if lower_bound > 1:
                 scaling = lower_bound
@@ -84,17 +86,37 @@ class MIDIProcess:
         except Exception:
             print(f"Error in saving midi file {path}")
 
-    def process(self, path: str, temp_path: str = "temp/temp.mid"):
-        """Full processing pipeline."""
+    def process(self, path: str, temp_path: str = "temp/temp.mid", tempo_range: tuple = (0.85, 1.15)):
+        """Full processing pipeline.
+
+        Args:
+            path: Output path for processed MIDI
+            temp_path: Temporary file path for intermediate processing
+            tempo_range: Tuple of (min_scale, max_scale) for tempo augmentation
+
+        Returns:
+            Tuple of (scaling, original_length, success):
+            - scaling: The tempo scaling factor applied (or 1.0 if failed)
+            - original_length: Original MIDI length in seconds
+            - success: True if tempo scaling succeeded, False if failed (negative delta time)
+        """
         self.cut_last_pedal()
         self.cut_initial_blank()
         # Save to get correct length
-        self.midi.save(temp_path)
-        self.midi = MidiFile(temp_path)
-        scaling, original_length = self.random_scaling()
-        if scaling is not None:
-            self.save(path)
-        return scaling, original_length
+        try:
+            self.midi.save(temp_path)
+            self.midi = MidiFile(temp_path)
+            scaling, original_length = self.random_scaling(range=tempo_range)
+            if scaling is not None:
+                self.save(path)
+            return scaling, original_length, True
+        except ValueError as e:
+            if "negative" in str(e).lower():
+                # MIDI has negative delta time - can't apply tempo scaling
+                # Return failure flag so caller can fallback to original MIDI with tempo=1.0
+                print(f"[TEMPO SCALING FAILED] {path} - negative delta time, will use original MIDI", flush=True)
+                return 1.0, 0.0, False
+            raise
 
 
 def render_one_midi(

@@ -1,0 +1,77 @@
+# clef-piano-full Training Configuration
+#
+# Full capability version of clef
+# - Extended vocabulary with dynamics, articulations, etc.
+# - Same seeds as clef-piano-base for reproducibility
+
+# =============================================================================
+# Seeds (matching Zeng et al. for reproducibility)
+# =============================================================================
+seed:
+  data_augmentation: 0    # Used during data preprocessing/augmentation
+  training: 1234          # Used during model training
+
+# =============================================================================
+# Model Architecture
+# =============================================================================
+model:
+  name: "clef-piano-full"
+  encoder:
+    type: "swin"
+    # Swin encoder params TBD
+  decoder:
+    type: "transformer"
+    # Transformer decoder params TBD
+
+# =============================================================================
+# Data
+# =============================================================================
+data:
+  # Datasets
+  datasets:
+    - musesyn
+    - humsyn
+
+  # Vocabulary: Full clef vocabulary
+  vocabulary: "clef_full"
+  # Includes:
+  # - All Zeng tokens
+  # - Grace notes (q, Q, P)
+  # - Dynamics (p, f, mp, mf, cresc, dim, etc.)
+  # - Articulations (staccato, accent, etc.)
+
+  # Audio features
+  audio:
+    sample_rate: 16000
+    feature: "log_mel"
+    n_mels: 128
+    hop_length: 256
+
+  # Augmentation
+  augmentation:
+    transpose:
+      enabled: true
+    soundfonts:
+      - "TimGM6mb.sf2"
+      - "FluidR3_GM.sf2"
+      - "UprightPianoKW-20220221.sf2"
+      - "SalamanderGrandPiano-V3+20200602.sf2"
+    loudness_norm:
+      target_lufs: -15
+
+# =============================================================================
+# Training
+# =============================================================================
+training:
+  batch_size: 8
+  learning_rate: 1.0e-4
+  max_epochs: 100
+  # More params TBD
+
+# =============================================================================
+# Paths
+# =============================================================================
+paths:
+  data_dir: "data/datasets"
+  output_dir: "data/experiments/clef_piano_full"
+  checkpoint_dir: "checkpoints/clef_piano_full"

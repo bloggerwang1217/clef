@@ -73,6 +73,56 @@ def sanitize_score(score):
     except:
         pass
 
+    # 7. Fix incomplete repeat structures (MuseSyn MusicXML export bug)
+    try:
+        fix_incomplete_repeats(score)
+    except:
+        pass
+
+
+def fix_incomplete_repeats(score):
+    """
+    Remove incomplete repeat structures that cause 'badly formed repeats' error.
+
+    Problem: Some MusicXML files (especially MuseScore exports) have incomplete
+    repeat structures - e.g., a forward repeat without a matching backward repeat.
+    This causes music21's expandRepeats() to fail during MIDI export.
+
+    Example: musesyn_Dont_look_back_in_anger has <repeat direction="forward"/>
+    but no corresponding <repeat direction="backward"/>.
+
+    Solution: Detect unpaired repeats and remove them. This loses the repeat
+    semantics but allows MIDI export to succeed.
+
+    Returns:
+        int: Number of repeat elements removed
+    """
+    # Collect all bar.Repeat elements by part
+    removed_count = 0
+
+    for part in score.parts:
+        forwards = []
+        backwards = []
+
+        for el in part.recurse().getElementsByClass(m21.bar.Repeat):
+            if el.direction == 'start':
+                forwards.append(el)
+            elif el.direction == 'end':
+                backwards.append(el)
+
+        # If we have forwards without matching backwards (or vice versa), remove all
+        if len(forwards) != len(backwards):
+            # Remove all repeat elements from this part
+            for el in forwards + backwards:
+                try:
+                    if el.activeSite:
+                        el.activeSite.remove(el)
+                        removed_count += 1
+                except:
+                    pass
+
+    return removed_count
+
 
 def fix_smufl_text_expressions(score):
     """

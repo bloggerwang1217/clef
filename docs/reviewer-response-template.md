@@ -299,3 +299,204 @@ STEPn is clearly marked as **our contribution** to measure notation quality. We 
 **Core Argument**:
 
 > We evaluate systems **as designed** (respecting their native representations) while ensuring fairness through **unified evaluation at the symbolic level** (MusicXML → MIDI → MV2H). This protocol is rigorous, reproducible, and standard practice in music information retrieval research.
+
+---
+
+# Data Augmentation Defense
+
+本節說明為什麼 clef-piano-base 不使用 transpose augmentation。
+
+---
+
+## Question 6: Why Don't You Use Transpose Augmentation Like Zeng et al.?
+
+### Reviewer's Concern
+
+> "Zeng et al. use key-aware transpose augmentation. Why do you disable this? Aren't you reducing training data diversity?"
+
+### Our Response
+
+We intentionally disable transpose augmentation to **preserve piano voicing patterns**, which are inherently key-specific.
+
+**1. Musical Justification: Piano Voicing is Key-Specific**
+
+Piano arrangements are composed with specific keys in mind. Voicing patterns (chord inversions, hand positions, voice leading) are optimized for the original key:
+
+- Certain chord voicings only work in specific registers
+- Idiomatic piano patterns (e.g., Alberti bass, broken chord patterns) are designed for particular hand positions
+- Transposing disrupts these carefully crafted musical decisions
+
+Example: A left-hand accompaniment pattern in C major using C-E-G voicing becomes awkward when transposed to F# major (F#-A#-C#) due to black key clustering and hand position changes.
+
+**2. Technical Issue in Zeng's Implementation (Bug Discovery)**
+
+Upon analyzing Zeng et al.'s codebase (`piano-a2s/data_processing/render.py`), we discovered a **multiprocessing bug** that inadvertently limited their transpose diversity:
+
+```python
+# Zeng's code (lines 25, 580-582)
+set_seed(0)  # Set once at module level
+
+with multiprocessing.Pool(processes=5) as pool:
+    versions_list = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
+    pool.map(partial_work, versions_list)
+```
+
+**Problem**: When `fork()` creates worker processes, each inherits the **same random state**:
+
+| Worker | Versions | Starting Random State |
+|--------|----------|----------------------|
+| 1 | [0, 1] | S (after `set_seed(0)`) |
+| 2 | [2, 3] | S (identical!) |
+| 3 | [4, 5] | S (identical!) |
+| 4 | [6, 7] | S (identical!) |
+| 5 | [8, 9] | S (identical!) |
+
+**Result**:
+- Versions 0, 2, 4, 6, 8 receive **identical** transpose choices
+- Versions 1, 3, 5, 7, 9 receive **identical** transpose choices
+- **Zeng's "10 augmentations" effectively contain only ~2 unique transpose patterns**
+
+This accidental limitation may have actually **helped** their model by reducing voicing corruption.
+
+**3. Evaluation Fairness**
+
+Our evaluation benchmark (ASAP dataset) consists of real piano recordings that are **not transposed**. Training without transpose augmentation better matches the evaluation distribution.
+
+**4. Sufficient Variation from Other Augmentations**
+
+We retain meaningful augmentation through:
+
+| Augmentation | Effect | Preserved? |
+|--------------|--------|------------|
+| **Soundfont variation** | 4 different piano timbres | ✓ Yes |
+| **Tempo scaling** | 0.85x - 1.15x | ✓ Yes |
+| **Loudness normalization** | -15 LUFS | ✓ Yes |
+| **Transpose** | Key changes | ✗ Disabled |
+
+These provide acoustic variation without disrupting musical structure.
+
+---
+
+## Question 7: How Can You Fairly Compare with Zeng If You Use Different Augmentation?
+
+### Reviewer's Concern
+
+> "Your training data augmentation differs from Zeng's. Any performance difference could be attributed to this, not model architecture."
+
+### Our Response
+
+**1. Same Data Sources**
+
+Both models use identical data sources:
+- **HumSyn**: Humdrum scores from KernScores
+- **MuseSyn**: MuseScore community scores
+
+**2. Same Evaluation Protocol**
+
+- Evaluation on **ASAP dataset** (real recordings)
+- Same metrics (**MV2H**: Multi-pitch, Voice, Meter, Harmony, Note Value)
+- Neither model trained on ASAP
+
+**3. Architectural Comparison Remains Valid**
+
+If our model achieves better performance with **less aggressive augmentation**, this actually demonstrates **superior architectural generalization**. The comparison, if anything, **favors the baseline** (Zeng) by giving them potentially more training variation.
+
+**4. Exact Replication is Impossible Anyway**
+
+Even if we wanted to replicate Zeng's exact augmentation:
+
+| Barrier | Description |
+|---------|-------------|
+| Multiprocessing bug | Zeng's random results are non-deterministic across runs |
+| `os.listdir` order | File order depends on filesystem, not sorted |
+| Python `hash()` | Randomized across interpreter sessions (PYTHONHASHSEED) |
+| Pretrain data not public | Cannot verify their exact training files |
+
+**Conclusion**: Perfect replication is technically impossible. We make a principled, musically-justified choice instead.
+
+---
+
+## Question 8: Your Training Data is Different from Zeng's. How is This Fair?
+
+### Reviewer's Concern
+
+> "You regenerated training data rather than using Zeng's exact files. This invalidates the comparison."
+
+### Our Response
+
+**1. We Use the Same Data Sources**
+
+| Source | Zeng | Ours |
+|--------|------|------|
+| HumSyn (KernScores) | ✓ | ✓ |
+| MuseSyn (MuseScore) | ✓ | ✓ |
+| Test set (ASAP) | ✓ | ✓ |
+
+**2. We Fixed Documented Bugs in Preprocessing**
+
+Our preprocessing includes bug fixes that **improve** data quality:
+
+| Bug | Issue | Our Fix |
+|-----|-------|---------|
+| MuseSyn rhythm | Visual notation artifacts create rhythm inconsistencies | Use original XML + `sanitize_score()` |
+| Humdrum `*-` | Repeat expansion duplicates spine terminators | Filter terminators, add single at end |
+
+These fixes are transparent and improve ground truth quality.
+
+**3. The Evaluation is What Matters**
+
+Both models are evaluated on:
+- **Same benchmark**: ASAP dataset
+- **Same metrics**: MV2H
+- **Same protocol**: Our documented pipeline
+
+Training data differences are a **confound in any comparison** between independently trained models. The key is that evaluation conditions are identical.
+
+---
+
+## Question 9: Why Not Run an Ablation Study on Transpose Augmentation?
+
+### Reviewer's Concern
+
+> "You should demonstrate empirically that removing transpose helps, not just argue theoretically."
+
+### Our Response
+
+This is a valid suggestion. We offer the following:
+
+**1. Zeng's Bug Provides a Natural Ablation**
+
+Zeng's implementation effectively tested "~2 unique transposes" vs. "full transpose diversity" (if the bug didn't exist). Their model worked, suggesting limited transpose is sufficient or even preferable.
+
+**2. Computational Cost**
+
+Full training runs are expensive. We prioritize:
+- Architecture experiments (our main contribution)
+- Evaluation on multiple benchmarks
+
+**3. Commitment for Camera-Ready**
+
+If reviewers strongly request this, we can add an ablation comparing:
+
+| Setting | Description |
+|---------|-------------|
+| No transpose | Current (preserves voicing) |
+| 2 transposes | Mimics Zeng's effective augmentation |
+| 10 transposes | Full augmentation (if bug fixed) |
+
+We hypothesize that **no transpose** or **limited transpose** will perform best on real recordings (ASAP) due to preserved voicing patterns.
+
+---
+
+## Summary: Data Augmentation Defense
+
+| Challenge | Our Defense |
+|-----------|-------------|
+| Why no transpose? | Preserves piano voicing; Zeng's bug limited theirs to ~2 anyway |
+| Fair comparison? | Same data sources, same evaluation; we use less augmentation (harder for us) |
+| Different training data? | Same sources, fixed bugs, transparent methodology |
+| Need ablation? | Zeng's bug = natural ablation; will add if required |
+
+**Core Argument**:
+
+> Transpose augmentation disrupts piano voicing patterns, which are key-specific musical decisions. Our choice to disable transpose is **musically motivated** and, coincidentally, aligns with Zeng's **effective** (buggy) implementation. We retain soundfont and tempo augmentation for acoustic diversity while preserving musical structure. This decision improves evaluation fairness against real recordings (ASAP) that are not transposed.

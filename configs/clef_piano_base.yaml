@@ -1,0 +1,78 @@
+# clef-piano-base Training Configuration
+#
+# Fair comparison with Zeng et al. (2024)
+# - Uses Zeng's vocabulary (extended with grace notes)
+# - Same data augmentation strategy
+# - Same random seeds for reproducibility
+
+# =============================================================================
+# Seeds (matching Zeng et al.)
+# =============================================================================
+seed:
+  data_augmentation: 0    # Used during data preprocessing/augmentation
+  training: 1234          # Used during model training
+
+# =============================================================================
+# Model Architecture
+# =============================================================================
+model:
+  name: "clef-piano-base"
+  encoder:
+    type: "swin"
+    # Swin encoder params TBD
+  decoder:
+    type: "transformer"
+    # Transformer decoder params TBD
+
+# =============================================================================
+# Data
+# =============================================================================
+data:
+  # Datasets
+  datasets:
+    - musesyn
+    - humsyn
+
+  # Vocabulary: Zeng's LabelsMultiple + grace notes
+  vocabulary: "zeng_extended"
+
+  # Audio features (mel spectrogram parameters)
+  # Matches Zeng's time resolution (100 fps) and frequency range for fair comparison
+  audio:
+    sample_rate: 16000
+    feature: "log_mel"    # Zeng uses VQT, but Mel enables Swin V2 pretrained weights
+    n_mels: 128           # Zeng: 480 bins (60 × 8 octaves)
+    n_fft: 2048
+    hop_length: 160       # 100 fps (same as Zeng)
+    f_min: 27.5           # A0 = 27.5 Hz (piano lowest, same as Zeng)
+    f_max: 7040.0         # f_max = fmin * 2^n_octaves = 27.5 * 256 = 7040 Hz (n_octaves = 8)
+
+  # Augmentation (matching Zeng)
+  augmentation:
+    transpose:
+      enabled: true
+      # Per-song (not per-chunk like Zeng, due to full-song architecture)
+    soundfonts:
+      - "TimGM6mb.sf2"
+      - "FluidR3_GM.sf2"
+      - "UprightPianoKW-20220221.sf2"
+      - "SalamanderGrandPiano-V3+20200602.sf2"
+    loudness_norm:
+      target_lufs: -15
+
+# =============================================================================
+# Training
+# =============================================================================
+training:
+  batch_size: 8
+  learning_rate: 1.0e-4
+  max_epochs: 100
+  # More params TBD
+
+# =============================================================================
+# Paths
+# =============================================================================
+paths:
+  data_dir: "data/datasets"
+  output_dir: "data/experiments/clef_piano_base"
+  checkpoint_dir: "checkpoints/clef_piano_base"
