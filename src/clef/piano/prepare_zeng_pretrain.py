@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_HUMSYN_DIR = Path("data/datasets/HumSyn")
 DEFAULT_MUSESYN_DIR = Path("data/datasets/MuseSyn")
 DEFAULT_OUTPUT_DIR = Path("data/experiments/clef_piano_base")
-DEFAULT_METADATA_DIR = Path("data/metadata")
+DEFAULT_METADATA_DIR = Path("src/datasets/syn")
 DEFAULT_SOUNDFONT_DIR = Path("data/soundfonts/piano")
 DEFAULT_AUG_CONFIG = Path("configs/zeng_augmentation.json")
 

@@ -304,7 +304,7 @@ def main():
     parser.add_argument(
         "--selected-chopin",
         type=Path,
-        default=Path("data/metadata/selected_chopin.txt"),
+        default=Path("src/datasets/syn/selected_chopin.txt"),
         help="Path to selected Chopin file list",
     )
     parser.add_argument(

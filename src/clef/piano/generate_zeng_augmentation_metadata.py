@@ -52,7 +52,7 @@ from src.utils import set_seed, SEED_DATA_AUGMENTATION
 logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_DIR = Path("data/experiments/clef_piano_base")
-DEFAULT_METADATA_DIR = Path("data/metadata")
+DEFAULT_METADATA_DIR = Path("src/datasets/syn")
 DEFAULT_AUG_CONFIG = Path("configs/zeng_augmentation.json")
 
 
