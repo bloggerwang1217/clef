@@ -722,7 +722,7 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
                 }
                 continue
 
-            # Write MIDI (with flatten fallback for converter21 rhythm analysis issues)
+            # Write MIDI
             midi_path.parent.mkdir(parents=True, exist_ok=True)
             midi_written = False
             try:
@@ -734,20 +734,6 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
                     print(f"[MIDI FAIL] {midi_path.name} - file not created", flush=True)
             except Exception as e:
                 print(f"[MIDI FAIL] {midi_path.name} - {e}", flush=True)
-
-            # Fallback: flatten score to remove complex spine structures
-            if not midi_written:
-                try:
-                    flat_for_midi = transposed_score.flatten()
-                    flat_for_midi.insert(0, m21.instrument.Piano())
-                    flat_for_midi.write("midi", fp=str(midi_path))
-                    if midi_path.exists():
-                        print(f"[MIDI FALLBACK OK] {midi_path.name}", flush=True)
-                        midi_written = True
-                    else:
-                        print(f"[MIDI FALLBACK FAIL] {midi_path.name} - file not created", flush=True)
-                except Exception as e:
-                    print(f"[MIDI FALLBACK FAIL] {midi_path.name} - {e}", flush=True)
 
             if not midi_written:
                 results[audio_name] = "error: midi write failed"
