@@ -44,6 +44,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from src.audio.mel import load_mel_config, process_audio_file
+from src.clef.piano.generate_zeng_augmentation_metadata import generate_metadata
 from src.datasets.syn.syn_manifest import create_manifest
 from src.preprocessing.humsyn_processor import HumSynProcessor
 from src.preprocessing.musesyn_processor import MuseSynProcessor
@@ -685,26 +686,11 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
             tempo_scaling = 1.0  # Default: no scaling
             if tempo_enabled and split == "train":
                 # Simulate MIDIProcess.random_scaling logic
-                # The score length approximates MIDI length
-                try:
-                    score_length = transposed_score.duration.quarterLength
-                    # Estimate original_length in seconds using first tempo
-                    flat_score = transposed_score.flatten()
-                    tempo_marks = list(flat_score.getElementsByClass(m21.tempo.MetronomeMark))
-                    if tempo_marks:
-                        qpm = tempo_marks[0].number
-                    else:
-                        qpm = 120.0
-                    original_length = score_length * (60.0 / qpm)
-
-                    # Same logic as MIDIProcess.random_scaling
-                    import numpy as np
-                    lower_bound = max(tempo_range[0], 4.0 / original_length)
-                    upper_bound = min(tempo_range[1], 12.0 / original_length)
-                    if lower_bound <= upper_bound:
-                        tempo_scaling = np.random.uniform(lower_bound, upper_bound)
-                except Exception:
-                    tempo_scaling = 1.0
+                # NOTE: MIDIProcess.random_scaling removed Zeng's 4-12 second constraint
+                # (which was designed for 5-bar chunks). For full-song processing,
+                # we apply tempo_range directly without length-based bounds.
+                import numpy as np
+                tempo_scaling = np.random.uniform(tempo_range[0], tempo_range[1])
 
             # Calculate audio_measures (apply tempo scaling to measure times)
             audio_measures = []
@@ -947,15 +933,20 @@ def phase2_kern_to_audio(
 
     all_results = {}
 
-    # Load metadata once at the beginning for incremental updates
+    # Generate augmentation metadata first (creates fresh metadata with kern_measures)
+    # This replaces the old incremental load, ensuring metadata is always in sync with kern files
+    logger.info("Generating augmentation metadata...")
+    metadata = generate_metadata(
+        output_dir=output_dir,
+        metadata_dir=metadata_dir,
+        aug_config_path=aug_config_path,
+    )
     metadata_path = output_dir / "augmentation_metadata.json"
-    metadata = {}
-    if metadata_path.exists():
-        try:
-            with open(metadata_path, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-        except Exception as e:
-            logger.warning(f"Failed to load metadata, starting fresh: {e}")
+
+    # Save initial metadata
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    logger.info(f"Generated metadata for {len(metadata)} audio entries")
 
     updated_count = 0
     save_interval = 10  # Save metadata every N kern files

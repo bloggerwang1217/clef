@@ -1,12 +1,15 @@
 # clef-piano-base Training Configuration
+# =======================================
 #
-# Fair comparison with Zeng et al. (2024)
+# ISMIR 2026 target: Swin V2 + ClefAttention for piano transcription
+#
+# Fair comparison with Zeng et al. (2024):
 # - Uses Zeng's vocabulary (extended with grace notes)
-# - Same data augmentation strategy
-# - Same random seeds for reproducibility
+# - Same time resolution (100 fps)
+# - Same frequency range (A0 = 27.5 Hz)
 
 # =============================================================================
-# Seeds (matching Zeng et al.)
+# Seeds
 # =============================================================================
 seed:
   data_augmentation: 0    # Used during data preprocessing/augmentation
@@ -17,12 +20,40 @@ seed:
 # =============================================================================
 model:
   name: "clef-piano-base"
-  encoder:
-    type: "swin"
-    # Swin encoder params TBD
-  decoder:
-    type: "transformer"
-    # Transformer decoder params TBD
+
+  # Encoder: Swin V2 (frozen)
+  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"
+  swin_dims: [96, 192, 384, 768]
+  freeze_encoder: true
+
+  # Deformable Attention (CLEF: Content-aware Learned-prior Event Focusing)
+  d_model: 512
+  n_heads: 8
+  n_levels: 4
+  ff_dim: 2048
+  dropout: 0.1
+
+  # Square sampling + Content-Dependent Prior (key design)
+  n_points_freq: 2          # Frequency direction: local detail
+  n_points_time: 2          # Time direction: local detail
+  freq_offset_scale: 0.15   # +/-15% (unified for square sampling)
+  time_offset_scale: 0.15   # +/-15% (unified for square sampling)
+
+  # Content-Dependent Reference Points (key innovation)
+  use_time_prior: true      # time_prior(tgt_pos) -> time location
+  use_freq_prior: true      # freq_prior(tgt) -> freq region (stream tracking)
+  refine_range: 0.1         # +/-10% refinement
+
+  # Bridge
+  bridge_layers: 2
+
+  # Decoder
+  decoder_layers: 6
+  max_seq_len: 4096
+  vocab_size: 512           # ~220 factorized tokens + padding
+
+  # Training
+  label_smoothing: 0.0
 
 # =============================================================================
 # Data
@@ -36,22 +67,27 @@ data:
   # Vocabulary: Zeng's LabelsMultiple + grace notes
   vocabulary: "zeng_extended"
 
-  # Audio features (mel spectrogram parameters)
-  # Matches Zeng's time resolution (100 fps) and frequency range for fair comparison
+  # Audio features (matches Zeng's time resolution for fair comparison)
   audio:
     sample_rate: 16000
-    feature: "log_mel"    # Zeng uses VQT, but Mel enables Swin V2 pretrained weights
-    n_mels: 128           # Zeng: 480 bins (60 × 8 octaves)
+    feature: "log_mel"      # Zeng uses VQT, but Mel enables Swin V2 pretrained weights
+    n_mels: 128             # Zeng: 480 bins (60 x 8 octaves)
     n_fft: 2048
-    hop_length: 160       # 100 fps (same as Zeng)
-    f_min: 27.5           # A0 = 27.5 Hz (piano lowest, same as Zeng)
-    f_max: 7040.0         # f_max = fmin * 2^n_octaves = 27.5 * 256 = 7040 Hz (n_octaves = 8)
+    hop_length: 160         # 100 fps (same as Zeng)
+    f_min: 27.5             # A0 = 27.5 Hz (piano lowest, same as Zeng)
+    f_max: 7040.0           # 8 octaves from A0
+
+  # Chunking for long pieces
+  chunking:
+    enabled: true
+    chunk_frames: 24000     # 4 min @ 100 fps
+    overlap_frames: 12000   # 2 min overlap
+    min_chunk_ratio: 0.5    # Last chunk at least 2 min
 
   # Augmentation (matching Zeng)
   augmentation:
     transpose:
       enabled: true
-      # Per-song (not per-chunk like Zeng, due to full-song architecture)
     soundfonts:
       - "TimGM6mb.sf2"
       - "FluidR3_GM.sf2"
@@ -64,10 +100,31 @@ data:
 # Training
 # =============================================================================
 training:
-  batch_size: 8
+  distributed:
+    enabled: true
+    backend: "nccl"
+    num_gpus: 2
+
+  precision: "bf16"
+  batch_size: 2             # per GPU (30 sec audio = ~12 GB)
+  gradient_accumulation_steps: 4
+  effective_batch_size: 16  # 2 GPUs x 2 batch x 4 accum
+
   learning_rate: 1.0e-4
+  weight_decay: 0.01
   max_epochs: 100
-  # More params TBD
+  warmup_steps: 1000
+  gradient_clip: 1.0
+
+  save_every_n_epochs: 10
+  save_best: true
+  save_last: true
+  early_stopping_patience: 5
+
+  wandb:
+    enabled: true
+    project: "clef-piano-base"
+    tags: ["piano", "a2s", "swin", "clef-attention", "ddp"]
 
 # =============================================================================
 # Paths

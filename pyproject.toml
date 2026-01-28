@@ -46,6 +46,7 @@ midi2audio = "^0.1.1"
 mido = "^1.3.3"
 statsmodels = "^0.14.6"
 torchcodec = "0.9"
+wandb = "^0.24.0"
 
 [tool.poetry.group.separation]
 optional = true
