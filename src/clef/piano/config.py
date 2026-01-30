@@ -80,6 +80,7 @@ class ClefPianoConfig(ClefConfig):
             # Priors
             use_time_prior=model_cfg.get("use_time_prior", defaults.use_time_prior),
             use_freq_prior=model_cfg.get("use_freq_prior", defaults.use_freq_prior),
+            n_freq_groups=model_cfg.get("n_freq_groups", defaults.n_freq_groups),
             refine_range=model_cfg.get("refine_range", defaults.refine_range),
 
             # Architecture

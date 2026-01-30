@@ -137,12 +137,38 @@ class Trainer:
         self.train_loader = train_loader
         self.valid_loader = valid_loader
 
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=config.learning_rate if hasattr(config, 'learning_rate') else 1e-4,
-            weight_decay=config.weight_decay if hasattr(config, 'weight_decay') else 0.01,
-        )
+        # Optimizer with separate LR for offset-related parameters
+        # Following Deformable DETR: offset params use 0.1x LR
+        base_lr = config.learning_rate if hasattr(config, 'learning_rate') else 1e-4
+        offset_lr = base_lr * 0.1  # 0.1x for offset-related params
+        weight_decay = config.weight_decay if hasattr(config, 'weight_decay') else 0.01
+
+        # Separate offset-related parameters (sensitive to LR)
+        offset_param_names = [
+            'time_prior', 'freq_prior', 'reference_refine',  # Decoder reference points
+            'time_offset_proj', 'freq_offset_proj',          # Attention offsets
+        ]
+        offset_params = []
+        other_params = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(offset_name in name for offset_name in offset_param_names):
+                offset_params.append(param)
+                if self.rank == 0:
+                    logger.debug(f'Offset param (lr={offset_lr:.2e}): {name}')
+            else:
+                other_params.append(param)
+
+        if self.rank == 0:
+            logger.info(f'Optimizer: {len(offset_params)} offset params (lr={offset_lr:.2e}), '
+                       f'{len(other_params)} other params (lr={base_lr:.2e})')
+
+        self.optimizer = torch.optim.AdamW([
+            {'params': offset_params, 'lr': offset_lr},
+            {'params': other_params, 'lr': base_lr},
+        ], weight_decay=weight_decay)
 
         # Learning rate scheduler
         total_steps = len(train_loader) * (config.max_epochs if hasattr(config, 'max_epochs') else 50)
@@ -151,7 +177,7 @@ class Trainer:
 
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=config.learning_rate if hasattr(config, 'learning_rate') else 1e-4,
+            max_lr=[offset_lr, base_lr],  # Different max_lr for each param group
             total_steps=total_steps,
             pct_start=warmup_steps / total_steps,
             anneal_strategy='cos',
@@ -231,7 +257,7 @@ class Trainer:
                 num_batches += 1
                 self.global_step += 1
 
-                # Log to wandb
+                # Log to wandb (use commit=False to avoid step conflicts)
                 if self.use_wandb:
                     log_dict = {
                         'train/loss': accumulated_loss,
@@ -240,7 +266,7 @@ class Trainer:
                         'train/epoch': self.epoch,
                         'system/gpu_memory_gb': torch.cuda.max_memory_allocated(self.device) / 1024**3,
                     }
-                    wandb.log(log_dict, step=self.global_step, commit=True)
+                    wandb.log(log_dict, step=self.global_step)
 
                 # Update progress bar
                 pbar.set_postfix({
@@ -257,7 +283,7 @@ class Trainer:
                     if valid_metrics and self.rank == 0:
                         logger.info(f'Step {self.global_step}: valid_loss={valid_metrics["valid_loss"]:.4f}')
                         if self.use_wandb:
-                            wandb.log({'valid/loss': valid_metrics['valid_loss']}, step=self.global_step, commit=True)
+                            wandb.log({'valid/loss': valid_metrics['valid_loss']}, step=self.global_step)
                     self.model.train()
 
         avg_loss = total_loss / max(num_batches, 1)
@@ -392,7 +418,7 @@ class Trainer:
                     }
                     if 'valid_loss' in valid_metrics:
                         epoch_log['epoch/valid_loss'] = valid_metrics['valid_loss']
-                    wandb.log(epoch_log, step=self.global_step, commit=True)
+                    wandb.log(epoch_log, step=self.global_step)
 
             # Save checkpoint and check early stopping
             is_best = False

@@ -40,7 +40,11 @@ for k in keys:
     if val is None:
         print('$2')
         exit(0)
-print(val)
+# Convert Python True/False to shell true/false
+if isinstance(val, bool):
+    print(str(val).lower())
+else:
+    print(val)
 "
 }
 

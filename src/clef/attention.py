@@ -158,7 +158,7 @@ class ClefAttention(nn.Module):
     def forward(
         self,
         query: torch.Tensor,              # [B, N_q, D]
-        reference_points: torch.Tensor,   # [B, N_q, L, 2] normalized coords
+        reference_points: torch.Tensor,   # [B, N_q, H, L, 2] or [B, N_q, L, 2]
         value: torch.Tensor,              # [B, N_v, D]
         spatial_shapes: torch.Tensor,     # [L, 2] each level's (H, W)
         level_start_index: torch.Tensor,  # [L] start index in value for each level
@@ -168,7 +168,9 @@ class ClefAttention(nn.Module):
 
         Args:
             query: Decoder query embeddings [B, N_q, D]
-            reference_points: Normalized reference coordinates [B, N_q, L, 2]
+            reference_points: Normalized reference coordinates, either:
+                - [B, N_q, H, L, 2] per-head (from decoder with n_freq_groups > 1)
+                - [B, N_q, L, 2] shared across heads (from encoder self-attention)
                 where 2 = (time, freq) in [0, 1]
             value: Multi-scale encoder features [B, N_v, D]
             spatial_shapes: Spatial shape (H, W) for each level [L, 2]
@@ -219,8 +221,13 @@ class ClefAttention(nn.Module):
             spatial_shapes[..., 0].float(),  # H (freq)
         ], dim=-1)  # [L, 2]
 
-        # reference_points: [B, N_q, L, 2] -> [B, N_q, 1, L, 1, 2]
-        ref_expanded = reference_points[:, :, None, :, None, :]
+        # Handle both per-head [B, N_q, H, L, 2] and shared [B, N_q, L, 2] reference_points
+        if reference_points.dim() == 4:
+            # Shared: [B, N_q, L, 2] -> [B, N_q, 1, L, 1, 2]
+            ref_expanded = reference_points[:, :, None, :, None, :]
+        else:
+            # Per-head: [B, N_q, H, L, 2] -> [B, N_q, H, L, 1, 2]
+            ref_expanded = reference_points.unsqueeze(-2)
 
         # sampling_offsets: [B, N_q, H, L, K, 2]
         # offset_normalizer: [L, 2] -> [1, 1, 1, L, 1, 2]

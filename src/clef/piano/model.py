@@ -95,6 +95,7 @@ class ClefPianoBase(nn.Module):
             dropout=config.dropout,
             use_time_prior=config.use_time_prior,
             use_freq_prior=config.use_freq_prior,
+            n_freq_groups=config.n_freq_groups,
             refine_range=config.refine_range,
         )
 

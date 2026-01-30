@@ -49,6 +49,7 @@ class DeformableDecoderLayer(nn.Module):
         dropout: float = 0.1,
         use_time_prior: bool = True,
         use_freq_prior: bool = True,
+        n_freq_groups: int = 1,
         refine_range: float = 0.1,
     ):
         super().__init__()
@@ -56,6 +57,7 @@ class DeformableDecoderLayer(nn.Module):
         self.n_levels = n_levels
         self.use_time_prior = use_time_prior
         self.use_freq_prior = use_freq_prior
+        self.n_freq_groups = n_freq_groups
         self.refine_range = refine_range
 
         # 1. Causal Self-Attention (use F.scaled_dot_product_attention for Flash Attention)
@@ -99,9 +101,17 @@ class DeformableDecoderLayer(nn.Module):
 
         if use_freq_prior:
             # Predict frequency region from hidden state (content-dependent!)
-            self.freq_prior = nn.Linear(d_model, 1)
+            # n_freq_groups > 1: per-head freq_prior for multi-stream tracking
+            # e.g. n_freq_groups=4, n_heads=8 -> each group covers 2 heads
+            # Analogous to cochlear tonotopic organization: multiple parallel
+            # frequency trackers, each attending to different register
+            assert n_heads % n_freq_groups == 0, \
+                f"n_heads ({n_heads}) must be divisible by n_freq_groups ({n_freq_groups})"
+            self.heads_per_group = n_heads // n_freq_groups
+            self.freq_prior = nn.Linear(d_model, n_freq_groups)
         else:
             self.freq_prior = None
+            self.heads_per_group = n_heads
 
         # Content-based refinement (+/-10%)
         self.reference_refine = nn.Linear(d_model, 2)
@@ -207,22 +217,25 @@ class DeformableDecoderLayer(nn.Module):
         B: int,
         S: int,
     ) -> torch.Tensor:
-        """Compute content-dependent reference points.
+        """Compute content-dependent reference points (per-head).
 
         This is the key innovation of ClefAttention:
         - time_base: Predicted from position embedding (sequential progression)
         - freq_base: Predicted from hidden state (content-dependent!)
 
-        Human analogy:
-        - Position tells us "roughly when" in the piece we are
-        - Content tells us "which voice/register" we're focusing on
+        Per-head freq_prior (n_freq_groups > 1):
+        - Each group of heads can focus on a different frequency register
+        - Analogous to cochlear tonotopic organization
+        - e.g. Group 0 -> bass, Group 1 -> tenor, Group 2 -> alto, Group 3 -> soprano
+        - Enables simultaneous multi-stream tracking (superhuman!)
 
         Returns:
-            reference_points: [B, S, L, 2] where 2 = (time, freq)
+            reference_points: [B, S, H, L, 2] where 2 = (time, freq)
         """
         device = tgt.device
+        H = self.n_heads
 
-        # Time prior: from position embedding
+        # Time prior: from position embedding (shared across heads)
         if self.time_prior is not None and tgt_pos is not None:
             time_base = self.time_prior(tgt_pos).sigmoid()  # [1, S, 1] or [B, S, 1]
             # Expand to batch size if needed
@@ -233,26 +246,39 @@ class DeformableDecoderLayer(nn.Module):
             time_base = torch.linspace(0, 1, S, device=device)
             time_base = time_base.view(1, S, 1).expand(B, -1, -1)
 
+        # time_base: [B, S, 1] -> expand to [B, S, H, 1]
+        time_base = time_base.unsqueeze(2).expand(-1, -1, H, -1)  # [B, S, H, 1]
+
         # Freq prior: from hidden state (CONTENT-DEPENDENT!)
         if self.freq_prior is not None:
-            freq_base = self.freq_prior(tgt).sigmoid()  # [B, S, 1]
+            # n_freq_groups=1: [B, S, 1] (original shared behavior)
+            # n_freq_groups=4: [B, S, 4] (per-group different freq regions)
+            freq_groups = self.freq_prior(tgt).sigmoid()  # [B, S, n_freq_groups]
+
+            # Expand groups to heads: repeat_interleave
+            # e.g. groups [g0, g1, g2, g3] -> heads [g0, g0, g1, g1, g2, g2, g3, g3]
+            freq_base = freq_groups.repeat_interleave(
+                self.heads_per_group, dim=-1
+            )  # [B, S, H]
+            freq_base = freq_base.unsqueeze(-1)  # [B, S, H, 1]
         else:
             # Default: center of frequency axis
-            freq_base = torch.full((B, S, 1), 0.5, device=device)
+            freq_base = torch.full((B, S, H, 1), 0.5, device=device)
 
-        # Combine into base reference
-        base_ref = torch.cat([time_base, freq_base], dim=-1)  # [B, S, 2]
+        # Combine into base reference: [B, S, H, 2]
+        base_ref = torch.cat([time_base, freq_base], dim=-1)  # [B, S, H, 2]
 
-        # Content-based refinement (+/-10%)
+        # Content-based refinement (+/-10%), shared across heads
         refine = self.reference_refine(tgt).tanh() * self.refine_range  # [B, S, 2]
+        refine = refine.unsqueeze(2)  # [B, S, 1, 2] -> broadcast to H
 
         # Final reference point
-        reference_points = (base_ref + refine).clamp(0, 1)  # [B, S, 2]
+        reference_points = (base_ref + refine).clamp(0, 1)  # [B, S, H, 2]
 
         # Expand to all levels (shared reference across levels)
-        reference_points = reference_points[:, :, None, :].expand(
-            -1, -1, self.n_levels, -1
-        )  # [B, S, L, 2]
+        reference_points = reference_points.unsqueeze(3).expand(
+            -1, -1, -1, self.n_levels, -1
+        )  # [B, S, H, L, 2]
 
         return reference_points
 
@@ -274,6 +300,7 @@ class ClefDecoder(nn.Module):
         dropout: float = 0.1,
         use_time_prior: bool = True,
         use_freq_prior: bool = True,
+        n_freq_groups: int = 1,
         refine_range: float = 0.1,
     ):
         super().__init__()
@@ -291,6 +318,7 @@ class ClefDecoder(nn.Module):
                 dropout=dropout,
                 use_time_prior=use_time_prior,
                 use_freq_prior=use_freq_prior,
+                n_freq_groups=n_freq_groups,
                 refine_range=refine_range,
             )
             for _ in range(n_layers)

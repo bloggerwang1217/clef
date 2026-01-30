@@ -42,6 +42,7 @@ model:
   # Content-Dependent Reference Points (key innovation)
   use_time_prior: true      # time_prior(tgt_pos) -> time location
   use_freq_prior: true      # freq_prior(tgt) -> freq region (stream tracking)
+  n_freq_groups: 4          # Per-head freq_prior (4 groups x 2 heads = 8 heads)
   refine_range: 0.1         # +/-10% refinement
 
   # Bridge
@@ -107,13 +108,13 @@ training:
 
   precision: "bf16"
   batch_size: 2             # per GPU (30 sec audio = ~12 GB)
-  gradient_accumulation_steps: 4
-  effective_batch_size: 16  # 2 GPUs x 2 batch x 4 accum
+  gradient_accumulation_steps: 1
+  effective_batch_size: 4   # 2 GPUs x 2 batch x 1 accum
 
-  learning_rate: 1.0e-4
+  learning_rate: 2.0e-5      # Base LR; offset params use 0.1x (2e-6)
   weight_decay: 0.01
-  max_epochs: 100
-  warmup_steps: 1000
+  max_epochs: 50
+  warmup_steps: 5000        # ~5.3 epochs warmup (944 steps/epoch)
   gradient_clip: 1.0
 
   save_every_n_epochs: 10

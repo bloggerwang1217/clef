@@ -39,6 +39,7 @@ class ClefConfig:
     # Content-Dependent Reference Points
     use_time_prior: bool = True    # time_prior(tgt_pos) -> time location
     use_freq_prior: bool = True    # freq_prior(tgt) -> freq region
+    n_freq_groups: int = 1         # Per-head freq_prior groups (1=shared, n_heads=fully independent)
     refine_range: float = 0.1      # +/-10% refinement
 
     # === Bridge ===
