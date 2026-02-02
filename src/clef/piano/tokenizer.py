@@ -41,6 +41,7 @@ SPECIAL_TOKENS = {
     "<coc>": 4,      # Change of Column (multi-track separator)
     "<bar>": 5,      # Bar line
     "<b>": 6,        # Beat boundary
+    "<continue>": 7, # Chunk boundary (piece continues in next chunk)
 }
 
 # Duration tokens (Zeng vocab compatible)
@@ -405,7 +406,7 @@ class KernTokenizer:
         tokens = []
         for tid in token_ids:
             token = self.id_to_token.get(tid, "<unk>")
-            if skip_special and token in ["<pad>", "<sos>", "<eos>"]:
+            if skip_special and token in ["<pad>", "<sos>", "<eos>", "<continue>"]:
                 continue
             tokens.append(token)
 

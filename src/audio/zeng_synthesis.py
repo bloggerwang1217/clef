@@ -56,6 +56,30 @@ class MIDIProcess:
                     msg.time -= total_time_before_first_note
                     break
 
+    # Message types whose delta times are scaled for tempo augmentation.
+    # set_tempo / time_signature are NOT scaled (tempo map stays fixed;
+    # moving the events in tick-space achieves the speed change).
+    _SCALABLE_TYPES = frozenset([
+        "note_on", "note_off", "control_change", "program_change",
+        "marker",  # measure-boundary markers injected by the pipeline
+    ])
+
+    def apply_scaling(self, scaling: float):
+        """Apply a specific tempo scaling factor (no RNG).
+
+        Args:
+            scaling: Tempo scaling factor to apply to MIDI tick times.
+
+        Returns:
+            Tuple of (scaling, original_length) for compatibility.
+        """
+        original_length = self.midi.length
+        for track in self.midi.tracks:
+            for msg in track:
+                if msg.type in self._SCALABLE_TYPES:
+                    msg.time = int(msg.time * scaling)
+        return scaling, original_length
+
     def random_scaling(self, range=(0.85, 1.15)):
         """Apply random tempo scaling for data augmentation.
 
@@ -76,7 +100,7 @@ class MIDIProcess:
             scaling = np.random.uniform(lower_bound, upper_bound)
         for track in self.midi.tracks:
             for msg in track:
-                if msg.type in ["note_on", "note_off", "control_change", "program_change"]:
+                if msg.type in self._SCALABLE_TYPES:
                     msg.time = int(msg.time * scaling)
         return scaling, original_length
 
@@ -86,13 +110,17 @@ class MIDIProcess:
         except Exception:
             print(f"Error in saving midi file {path}")
 
-    def process(self, path: str, temp_path: str = "temp/temp.mid", tempo_range: tuple = (0.85, 1.15)):
+    def process(self, path: str, temp_path: str = "temp/temp.mid",
+                tempo_range: tuple = (0.85, 1.15), scaling: float = None):
         """Full processing pipeline.
 
         Args:
             path: Output path for processed MIDI
             temp_path: Temporary file path for intermediate processing
             tempo_range: Tuple of (min_scale, max_scale) for tempo augmentation
+            scaling: If provided, use this exact scaling factor instead of
+                drawing from RNG. This avoids RNG double-consumption when
+                the caller already drew the value.
 
         Returns:
             Tuple of (scaling, original_length, success):
@@ -101,15 +129,20 @@ class MIDIProcess:
             - success: True if tempo scaling succeeded, False if failed (negative delta time)
         """
         self.cut_last_pedal()
-        self.cut_initial_blank()
+        # NOTE: cut_initial_blank removed to preserve alignment between
+        # Score-derived measure timing and audio. The small silence before
+        # the first note is harmless for training.
         # Save to get correct length
         try:
             self.midi.save(temp_path)
             self.midi = MidiFile(temp_path)
-            scaling, original_length = self.random_scaling(range=tempo_range)
             if scaling is not None:
+                actual_scaling, original_length = self.apply_scaling(scaling)
+            else:
+                actual_scaling, original_length = self.random_scaling(range=tempo_range)
+            if actual_scaling is not None:
                 self.save(path)
-            return scaling, original_length, True
+            return actual_scaling, original_length, True
         except ValueError as e:
             if "negative" in str(e).lower():
                 # MIDI has negative delta time - can't apply tempo scaling

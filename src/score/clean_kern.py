@@ -664,11 +664,190 @@ def strip_non_kern_spines(content: str, keep_dynam: bool = False) -> str:
     return '\n'.join(result_lines)
 
 
+def _cue_token_to_rest(token: str) -> str:
+    """Convert a cue data token to a rest with the same duration.
+
+    Handles chords (space-separated notes) by keeping only the first
+    note's duration. Grace notes become grace rests.
+
+    Examples:
+        16gg  → 16r
+        32bb- → 32r
+        [4cc  → 4r        (strip tie — rest doesn't tie)
+        8ee 8eee → 8r     (chord → single rest)
+        16cc#q → 16qr     (grace note)
+        272%3e/ → 272%3r   (preserve tuplet ratio)
+    """
+    if not token or token == '.':
+        return token
+    # Take first note if chord
+    first = token.split()[0] if ' ' in token else token
+    # Strip prefix markers (tie, slur, phrase)
+    clean = first.lstrip('[({<>')
+    # Extract duration including dots and tuplet ratio (%N)
+    m = re.match(r'(\d+\.?(?:%\d+)?)', clean)
+    if not m:
+        return token  # unparseable, keep as-is
+    dur = m.group(1)
+    # Check for grace note (q/Q after duration)
+    rest_after = clean[len(dur):]
+    if 'q' in rest_after.lower():
+        return f'{dur}qr'
+    return f'{dur}r'
+
+
+def strip_cue_passages(sequence: str) -> str:
+    """Remove cue passage content from kern sequence.
+
+    Cue notes (*cue...*Xcue) are editorial annotations showing another
+    voice's part during rests. They produce no audio in MIDI synthesis.
+
+    Tracks per-column cue state through spine operations (*^ split, *v join)
+    so that *cue/*Xcue pairing works even when column indices shift.
+    """
+    lines = sequence.split('\n')
+
+    cue_active: list = []  # per-column bool: is cue active?
+    cue_map: dict = {}     # line_idx -> set of cue column indices
+    cue_open_lines: list = []   # (line_idx, col) where *cue opens
+    xcue_close_lines: list = [] # (line_idx, col) where *Xcue closes
+
+    for i, line in enumerate(lines):
+        if line.startswith('**'):
+            cue_active = [False] * len(line.split('\t'))
+            continue
+
+        if not line.startswith('*') or not line.strip():
+            # Data / barline / comment: record current cue state
+            if any(cue_active):
+                cue_map[i] = {c for c, a in enumerate(cue_active) if a}
+            continue
+
+        tokens = line.split('\t')
+
+        # Process *cue / *Xcue BEFORE spine operations
+        for si, tok in enumerate(tokens):
+            if si >= len(cue_active):
+                break
+            if re.match(r'^\*cue\b', tok):
+                cue_active[si] = True
+                cue_open_lines.append((i, si))
+            elif re.match(r'^\*Xcue\b', tok):
+                if cue_active[si]:
+                    cue_active[si] = False
+                else:
+                    # *Xcue on a non-cue column (spine ops shifted indices).
+                    # Close the nearest cue-active column instead.
+                    best = None
+                    best_dist = len(cue_active) + 1
+                    for c, a in enumerate(cue_active):
+                        if a and abs(c - si) < best_dist:
+                            best = c
+                            best_dist = abs(c - si)
+                    if best is not None:
+                        cue_active[best] = False
+                xcue_close_lines.append((i, si))
+
+        # Record tandem lines that have active cue or cue/Xcue markers
+        active_cols = {c for c, a in enumerate(cue_active) if a}
+        marker_cols = {si for si, tok in enumerate(tokens)
+                       if re.match(r'^\*(cue|Xcue)\b', tok)}
+        all_cols = active_cols | marker_cols
+        if all_cols:
+            if i not in cue_map:
+                cue_map[i] = set()
+            cue_map[i].update(all_cols)
+
+        # Handle spine operations: *^ (split) and *v (join)
+        has_split = any(t == '*^' for t in tokens)
+        has_join = any(t == '*v' for t in tokens)
+
+        if has_split:
+            new_cue = []
+            for si, tok in enumerate(tokens):
+                val = cue_active[si] if si < len(cue_active) else False
+                new_cue.append(val)
+                if tok == '*^':
+                    new_cue.append(val)  # both sub-spines inherit cue
+            cue_active = new_cue
+        elif has_join:
+            new_cue = []
+            si = 0
+            while si < len(tokens):
+                val = cue_active[si] if si < len(cue_active) else False
+                if tokens[si] == '*v':
+                    merged = val
+                    while si + 1 < len(tokens) and tokens[si + 1] == '*v':
+                        si += 1
+                        if si < len(cue_active):
+                            merged = merged or cue_active[si]
+                    new_cue.append(merged)
+                else:
+                    new_cue.append(val)
+                si += 1
+            cue_active = new_cue
+
+    if not cue_map:
+        return sequence
+
+    # Expand: scan backwards from *cue for *rscale on same column
+    for cue_line, cue_col in cue_open_lines:
+        for j in range(max(0, cue_line - 5), cue_line):
+            ln = lines[j]
+            if not ln.startswith('*') or ln.startswith('**'):
+                continue
+            toks = ln.split('\t')
+            if cue_col < len(toks) and re.match(r'^\*rscale:', toks[cue_col]):
+                if j not in cue_map:
+                    cue_map[j] = set()
+                cue_map[j].add(cue_col)
+
+    # Expand: scan forwards from *Xcue for *rscale on same column
+    for xcue_line, xcue_col in xcue_close_lines:
+        for j in range(xcue_line + 1, min(len(lines), xcue_line + 6)):
+            ln = lines[j]
+            if not ln.startswith('*') or ln.startswith('**'):
+                continue
+            toks = ln.split('\t')
+            if xcue_col < len(toks) and re.match(r'^\*rscale:', toks[xcue_col]):
+                if j not in cue_map:
+                    cue_map[j] = set()
+                cue_map[j].add(xcue_col)
+
+    # --- Pass 2: Strip cue content ---
+    for i, line in enumerate(lines):
+        if i not in cue_map:
+            continue
+        cue_spines = cue_map[i]
+
+        if line.startswith('*') and not line.startswith('**'):
+            tokens = line.split('\t')
+            new_tokens = list(tokens)
+            for si in cue_spines:
+                if si < len(tokens):
+                    tok = tokens[si]
+                    if re.match(r'^\*(cue|Xcue|rscale:)\b', tok):
+                        new_tokens[si] = '*'
+            lines[i] = '\t'.join(new_tokens)
+
+        elif not line.startswith(('=', '!')) and line.strip():
+            # Data line: replace cue tokens with rests of same duration.
+            # Rest fills the time slot correctly (matching silence in audio).
+            tokens = line.split('\t')
+            for si in cue_spines:
+                if si < len(tokens) and tokens[si] != '.':
+                    tokens[si] = _cue_token_to_rest(tokens[si])
+            lines[i] = '\t'.join(tokens)
+
+    return '\n'.join(lines)
+
+
 def clean_kern_sequence(
     sequence: str,
     preserve_ties: bool = True,
     preserve_articulation: bool = False,
     warn_tuplet_ratio: bool = True,
+    strip_cue: bool = True,
 ) -> str:
     """
     Clean an entire Kern sequence (one measure or multi-measure chunk).
@@ -690,6 +869,15 @@ def clean_kern_sequence(
         >>> clean_kern_sequence(seq, preserve_articulation=True)
         '8r\t4g\t8cc\t4.c~'
     """
+    # Step 0: Strip cue passages (*cue...*Xcue).
+    # Cue notes are editorial annotations (another voice's part shown during rests).
+    # They produce no audio in MIDI synthesis and should not be seen by the model.
+    # When processing pipelines that strip non-kern spines first, cue stripping
+    # must happen BEFORE spine stripping (to preserve correct spine indices).
+    # In that case, pass strip_cue=False here and call strip_cue_passages() separately.
+    if strip_cue:
+        sequence = strip_cue_passages(sequence)
+
     # Check for tuplet ratio notation (%) - will cause KeyError, Zeng also skips these
     if warn_tuplet_ratio and '%' in sequence:
         # Find the specific tokens with %

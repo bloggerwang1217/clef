@@ -29,6 +29,7 @@ from src.score.clean_kern import (
     extract_visual_from_sequence,
     strip_non_kern_spines,
 )
+from src.score.expand_repeat import expand_kern_repeats_with_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class HumSynProcessor:
         input_dir: Path,
         output_dir: Path,
         visual_dir: Optional[Path] = None,
+        repeat_map_dir: Optional[Path] = None,
         selected_chopin_path: Optional[Path] = None,
         preset: Optional[str] = None,
     ):
@@ -73,6 +75,8 @@ class HumSynProcessor:
             output_dir: Path to output directory for processed kern files
             visual_dir: Path to output directory for visual info JSON files.
                         If None, visual info is not saved.
+            repeat_map_dir: Path to output directory for repeat map JSON files.
+                        If None, repeat maps are not saved.
             selected_chopin_path: Path to selected_chopin.txt for filtering
             preset: Processing preset:
                 - "clef-piano-base": Chopin filter + Joplin remove **dynam & repeats
@@ -88,6 +92,9 @@ class HumSynProcessor:
         self.visual_dir = Path(visual_dir) if visual_dir else None
         if self.visual_dir:
             self.visual_dir.mkdir(parents=True, exist_ok=True)
+        self.repeat_map_dir = Path(repeat_map_dir) if repeat_map_dir else None
+        if self.repeat_map_dir:
+            self.repeat_map_dir.mkdir(parents=True, exist_ok=True)
         self.preset = preset
 
         # Determine what filters to apply based on preset
@@ -177,7 +184,7 @@ class HumSynProcessor:
 
     def process_one(
         self, krn_path: Path, repo_name: str
-    ) -> Optional[Tuple[str, List[List[Dict[str, Any]]]]]:
+    ) -> Optional[Tuple[str, List[List[Dict[str, Any]]], Dict]]:
         """Process a single kern file.
 
         Args:
@@ -185,8 +192,10 @@ class HumSynProcessor:
             repo_name: Name of the HumSyn repository
 
         Returns:
-            Tuple of (cleaned kern content, visual info), or None if file should be skipped.
+            Tuple of (cleaned kern content, visual info, repeat_map),
+            or None if file should be skipped.
             Visual info is extracted BEFORE cleaning to preserve stem/beam/position markers.
+            repeat_map can be used to fold the expanded kern back to the original structure.
         """
         filename = krn_path.name
 
@@ -209,16 +218,25 @@ class HumSynProcessor:
         # structures. strip_non_kern_spines(keep_dynam=False) correctly handles
         # spine operations and removes **dynam spines.
 
+        # NOTE: Do NOT strip cue passages here. kern/ must retain *cue notes
+        # so that converter21 can correctly compute spine offsets in Phase 2.
+        # Cue stripping happens in Phase 1b (kern_gt/) via clean_kern_sequence(strip_cue=True).
+
         # Strip non-kern spines (keep_dynam=True for clef-piano-full)
         kern_raw = strip_non_kern_spines(kern_raw, keep_dynam=self.keep_dynam)
 
         # CRITICAL: Extract visual info BEFORE cleaning (preserves stem/beam/position)
         visual_info = extract_visual_from_sequence(kern_raw)
 
-        # Apply unified kern cleaning (removes visual markers)
-        kern_cleaned = clean_kern_sequence(kern_raw, warn_tuplet_ratio=False)
+        # Apply unified kern cleaning (removes visual markers, keep cue for Phase 2)
+        kern_cleaned = clean_kern_sequence(kern_raw, warn_tuplet_ratio=False, strip_cue=False)
 
-        return kern_cleaned, visual_info
+        # Expand repeats so kern/ output matches MIDI/audio playback order.
+        # Expansion labels (*>[A,A,B,...], *>A, etc.) are consumed here;
+        # the resulting kern has no repeat markers, just linear content.
+        kern_expanded, repeat_map = expand_kern_repeats_with_mapping(kern_cleaned)
+
+        return kern_expanded, visual_info, repeat_map
 
     def process_all(self) -> Dict[str, str]:
         """Process all HumSyn repositories.
@@ -250,9 +268,9 @@ class HumSynProcessor:
                         results[output_name] = "skipped"
                         continue
 
-                    kern_cleaned, visual_info = result
+                    kern_cleaned, visual_info, repeat_map = result
 
-                    # Write cleaned kern
+                    # Write cleaned kern (repeat-expanded)
                     output_path = self.output_dir / output_name
                     with open(output_path, "w", encoding="utf-8") as f:
                         f.write(kern_cleaned)
@@ -262,6 +280,12 @@ class HumSynProcessor:
                         visual_path = self.visual_dir / output_name.replace(".krn", ".json")
                         with open(visual_path, "w", encoding="utf-8") as f:
                             json.dump(visual_info, f)
+
+                    # Write repeat map if repeat_map_dir is configured
+                    if self.repeat_map_dir:
+                        map_path = self.repeat_map_dir / output_name.replace(".krn", ".json")
+                        with open(map_path, "w", encoding="utf-8") as f:
+                            json.dump(repeat_map, f, indent=2, ensure_ascii=False)
 
                     results[output_name] = "success"
 

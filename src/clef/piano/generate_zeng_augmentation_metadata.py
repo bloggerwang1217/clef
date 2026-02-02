@@ -150,95 +150,9 @@ def get_key_signature_from_kern(kern_path: Path) -> int:
     return 0  # Default to C major
 
 
-def extract_kern_measures(kern_path: Path) -> List[Dict[str, Any]]:
-    """Extract measure boundaries from kern file.
-
-    Parses barlines (=N, =N-, =N:|!, etc.) to find measure numbers and line ranges.
-    Used for chunking during training - we cut at measure boundaries.
-
-    Args:
-        kern_path: Path to kern file
-
-    Returns:
-        List of measure info dicts:
-        [
-            {"measure": 1, "line_start": 25, "line_end": 29},
-            {"measure": 2, "line_start": 30, "line_end": 38},
-            ...
-        ]
-        line_start is the first data line of the measure (after the barline)
-        line_end is the last data line before the next barline (or end of file)
-    """
-    measures = []
-    current_measure = None
-    measure_start_line = None
-
-    # Pattern to match barlines: =N, =N-, =N:|!, ==, etc.
-    # Captures the measure number if present
-    barline_pattern = re.compile(r'^=(\d+)?')
-
-    with open(kern_path, 'r', encoding='utf-8', errors='replace') as f:
-        lines = f.readlines()
-
-    for line_num, line in enumerate(lines, start=1):
-        line = line.strip()
-
-        # Skip empty lines and comments
-        if not line or line.startswith('!'):
-            continue
-
-        # Check for barline
-        first_token = line.split('\t')[0]
-        match = barline_pattern.match(first_token)
-
-        if match:
-            # Found a barline
-            measure_num_str = match.group(1)
-
-            # Close previous measure
-            if current_measure is not None and measure_start_line is not None:
-                measures.append({
-                    "measure": current_measure,
-                    "line_start": measure_start_line,
-                    "line_end": line_num - 1,  # End before this barline
-                })
-
-            # Start new measure
-            if measure_num_str:
-                current_measure = int(measure_num_str)
-            elif current_measure is not None:
-                # Barline without number (e.g., == for final barline)
-                current_measure += 1
-            else:
-                current_measure = 1
-
-            measure_start_line = line_num + 1  # Start after barline
-
-        elif first_token.startswith('*'):
-            # Interpretation line (metadata) - not part of measure content
-            # But update measure_start_line if we haven't started the measure yet
-            if measure_start_line == line_num:
-                measure_start_line = line_num + 1
-            continue
-
-    # Close the last measure
-    if current_measure is not None and measure_start_line is not None:
-        # Find the last non-empty, non-comment, non-spine-terminator line
-        last_data_line = len(lines)
-        for i in range(len(lines) - 1, measure_start_line - 2, -1):
-            line = lines[i].strip()
-            if line and not line.startswith('!') and not line.startswith('*-'):
-                last_data_line = i + 1
-                break
-
-        if last_data_line >= measure_start_line:
-            measures.append({
-                "measure": current_measure,
-                "line_start": measure_start_line,
-                "line_end": last_data_line,
-            })
-
-    return measures
+# Canonical implementation lives in score.sanitize_kern to avoid circular
+# imports (clef.piano.__init__ pulls in model.py / transformers).
+from src.score.sanitize_kern import extract_kern_measures  # noqa: E402
 
 
 def generate_metadata(
@@ -267,6 +181,9 @@ def generate_metadata(
     else:
         logger.info("Tempo augmentation DISABLED")
 
+    # Read kern_measures from kern_gt/ (repeat-expanded) so measure counts
+    # align with audio_measures (which are generated from expanded audio)
+    kern_gt_dir = output_dir / "kern_gt"
     kern_dir = output_dir / "kern"
 
     # Load split files
@@ -325,9 +242,18 @@ def generate_metadata(
         original_key = get_key_signature_from_kern(kern_path)
         original_key = max(-6, min(7, original_key))  # Clamp to valid range
 
-        # Extract kern measures (cached - same for all versions)
+        # Extract kern_measures: line numbers from kern_gt (for ChunkedDataset slicing).
+        # Timing (start_sec, end_sec) is NOT computed here — it comes from Phase 2
+        # via extract_measure_times(Score), which is the single source of truth
+        # matching the rendered MIDI/audio.
         if stem not in kern_measures_cache:
-            kern_measures_cache[stem] = extract_kern_measures(kern_path)
+            kern_gt_path = kern_gt_dir / f"{stem}.krn"
+            if kern_gt_path.exists():
+                kern_measures_cache[stem] = extract_kern_measures(kern_gt_path)
+            else:
+                # Fallback to original kern if kern_gt not yet generated
+                logger.warning(f"kern_gt not found for {stem}, using kern/")
+                kern_measures_cache[stem] = extract_kern_measures(kern_path)
         kern_measures = kern_measures_cache[stem]
 
         # Reproduce random seed (same as _process_single_kern)

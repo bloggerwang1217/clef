@@ -347,6 +347,12 @@ class ClefCollator:
                 - labels: [B, max_S] target labels
                 - label_lengths: [B] original sequence lengths
         """
+        # Filter out None samples (skipped by ChunkedDataset due to
+        # missing alignment info)
+        batch = [s for s in batch if s is not None]
+        if not batch:
+            return None
+
         mels = []
         mel_lengths = []
         input_ids_list = []

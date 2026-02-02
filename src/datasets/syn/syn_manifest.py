@@ -89,16 +89,21 @@ def create_manifest(
                 missing_kern.add(entry["kern_file"])
                 continue
 
-        # Read actual n_frames from mel file (most reliable source of truth)
-        # This avoids bugs from duration_sec calculation in earlier phases
+        # Read n_frames from mel file (needed for tensor loading)
         mel = torch.load(mel_path, weights_only=True)
         n_frames = mel.shape[-1]
-        duration_sec = n_frames / (sample_rate / hop_length)  # Recalculate from actual frames
 
-        # Update metadata with correct duration (for future use)
-        old_duration = entry.get("duration_sec")
-        if old_duration is None or abs(old_duration - duration_sec) > 0.1:
-            metadata[key]["duration_sec"] = round(duration_sec, 4)
+        # duration_sec comes from Phase 2 (Score-based timing x tempo_scaling).
+        # Do NOT recalculate from mel frames — Score is the single source of truth
+        # for timing alignment with audio_measures/kern_measures.
+        duration_sec = entry.get("duration_sec")
+        if duration_sec is None:
+            # Fallback: Phase 2 didn't set it (shouldn't happen in normal flow)
+            duration_sec = n_frames / (sample_rate / hop_length)
+            logger.warning(f"{key}: duration_sec missing from Phase 2, using mel-based fallback")
+
+        # Update n_frames in metadata (lightweight, no timing overwrite)
+        if entry.get("n_frames") != n_frames:
             metadata[key]["n_frames"] = n_frames
             metadata_updated += 1
 

@@ -2,9 +2,12 @@
 Kern Sanitization for Audio Generation
 =======================================
 
-Combines all kern preprocessing steps needed for converter21/music21 parsing:
-1. Repeat expansion (expand_kern_repeats)
-2. Spine timing fix (fix_kern_spine_timing)
+Combines kern preprocessing steps needed for converter21/music21 parsing:
+1. Repeat expansion (via ``src.score.expand_repeat.expand_kern_repeats``)
+2. Spine timing fix (``fix_kern_spine_timing``)
+3. Measure extraction (``extract_kern_measures``)
+
+Repeat-related functions have been consolidated into ``src.score.expand_repeat``.
 
 Usage:
     from src.score.sanitize_kern import sanitize_kern_for_audio
@@ -284,435 +287,227 @@ def fix_kern_spine_timing(kern_content: str) -> str:
     return '\n'.join(new_lines)
 
 
-# =============================================================================
-# Kern Repeat Expansion
-# =============================================================================
-# Expands Humdrum repeat structures (expansion labels) for MIDI/Audio generation.
-#
-# Humdrum uses expansion labels like:
-#     *>[A,A,B,B1,B,B2,C,C1,C,C2,D,E,E,F]  # Full playback order
-#     *>norep[A,B,B2,C,C2,D,E,F]            # No-repeat version
-#     *>A, *>B, *>B1, etc.                  # Section markers
-#
-# This module expands kern content according to the expansion labels,
-# producing a "through-composed" version suitable for MIDI generation.
-#
-# The original kern file (with repeat markers) is preserved as ground truth,
-# while the expanded version is used only for audio synthesis.
-# =============================================================================
+def extract_kern_measures(kern_path=None, include_timing: bool = False,
+                          kern_content: str = None) -> List[Dict]:
+    """Extract measure line-ranges from kern file or content string.
 
+    Splits kern content at barlines to find line ranges for each measure region.
+    Used for ChunkedDataset — slicing kern_gt tokens at measure boundaries.
 
-def has_expansion_labels(kern_content: str) -> bool:
-    """Check if kern content has Humdrum expansion labels.
+    NOTE: The ``measure`` field is a local index (0-based if pickup exists,
+    1-based otherwise). It is NOT authoritative — the definitive measure
+    number and timing come from the music21 Score via ``extract_measure_times()``.
+    ChunkedDataset pairs kern_measures[i] with audio_measures[i] by **index**,
+    not by measure number.
 
     Args:
-        kern_content: Raw kern file content
+        kern_path: Path to kern file (str or Path). Mutually exclusive with kern_content.
+        include_timing: If True, include start_sec/end_sec (kern-parsed, approximate).
+                        For authoritative timing, use extract_measure_times(Score).
+        kern_content: Raw kern content string. If provided, kern_path is ignored.
 
     Returns:
-        True if expansion labels (*>[...]) are present
+        List of measure info dicts:
+        [
+            {"measure": 0, "line_start": 21, "line_end": 21},   # pickup (if any)
+            {"measure": 1, "line_start": 23, "line_end": 26},
+            ...
+        ]
+        line_start is the first data line of the measure (after the barline)
+        line_end is the last data line before the next barline (or end of file)
     """
-    return bool(re.search(r'\*>\[[^\]]+\]', kern_content))
+    measures = []
+    current_measure = None
+    measure_start_line = None
 
+    # Pattern to match barlines: =N, =N-, =N:|!, ==, etc.
+    # Captures the measure number if present
+    barline_pattern = re.compile(r'^=(\d+)?')
 
-def parse_expansion_order(kern_content: str) -> Optional[List[str]]:
-    """Extract the expansion order from kern content.
+    # Timing state (only used when include_timing=True)
+    current_offset = Fraction(0)       # cumulative offset in quarter notes
+    measure_start_offset = Fraction(0) # offset at start of current measure
+    tempo_changes: List[Tuple[Fraction, float]] = [(Fraction(0), 120.0)]  # (offset, bpm)
 
-    Args:
-        kern_content: Raw kern file content
-
-    Returns:
-        List of section names in playback order, or None if no expansion labels
-
-    Example:
-        "*>[A,A,B,B1,B,B2]" -> ["A", "A", "B", "B1", "B", "B2"]
-    """
-    match = re.search(r'\*>\[([^\]]+)\]', kern_content)
-    if not match:
-        return None
-    return match.group(1).split(',')
-
-
-def parse_section_ranges(kern_content: str) -> Dict[str, Tuple[int, int]]:
-    """Parse section markers and their line ranges.
-
-    Args:
-        kern_content: Raw kern file content
-
-    Returns:
-        Dictionary mapping section name to (start_line, end_line) tuple.
-        Lines are 0-indexed, start is inclusive, end is exclusive.
-
-    Example:
-        {"A": (15, 69), "B": (70, 104), "B1": (105, 118), ...}
-    """
-    lines = kern_content.split('\n')
-    section_ranges: Dict[str, Tuple[int, int]] = {}
-    current_section: Optional[str] = None
-    current_start: int = 0
-
-    for i, line in enumerate(lines):
-        # Section marker: *>A\t*>A or *>A\t*>A\t*>A (one per spine)
-        # But NOT expansion labels (*>[...]) or norep labels (*>norep[...])
-        if line.startswith('*>') and '\t' in line:
-            parts = line.split('\t')
-            # Check all parts are section markers (not expansion/norep labels)
-            is_section_marker = all(
-                p.startswith('*>') and
-                not p.startswith('*>[') and
-                not p.startswith('*>norep')
-                for p in parts
-            )
-            if is_section_marker:
-                section = parts[0][2:]  # Extract "A" from "*>A"
-                if section:
-                    # Close previous section
-                    if current_section is not None:
-                        section_ranges[current_section] = (current_start, i)
-                    # Start new section (content starts on next line)
-                    current_section = section
-                    current_start = i + 1
-
-    # Close last section
-    if current_section is not None:
-        section_ranges[current_section] = (current_start, len(lines))
-
-    return section_ranges
-
-
-def _clean_repeat_barline(line: str) -> str:
-    """Remove repeat markers from barline while preserving measure number.
-
-    Humdrum repeat barlines look like:
-        =5:|!|:  -> =5
-        =:|!|:   -> =
-        =10!|:   -> =10
-
-    Args:
-        line: A line that starts with '='
-
-    Returns:
-        Cleaned line with repeat markers removed
-    """
-    if not line.startswith('='):
-        return line
-
-    parts = line.split('\t')
-    cleaned_parts = []
-
-    for part in parts:
-        if part.startswith('='):
-            # Remove repeat markers: :, |, !
-            # But keep the = and measure number
-            cleaned = re.sub(r'[:\|!]+', '', part)
-            # Ensure it still starts with =
-            if not cleaned.startswith('='):
-                cleaned = '=' + cleaned.lstrip('=')
-            cleaned_parts.append(cleaned)
-        else:
-            cleaned_parts.append(part)
-
-    return '\t'.join(cleaned_parts)
-
-
-def _renumber_barlines(lines: List[str]) -> List[str]:
-    """Renumber barlines sequentially after expansion.
-
-    After expanding repeats, multiple sections may have the same measure numbers.
-    This function renumbers all barlines sequentially to avoid confusion in
-    music21/converter21.
-
-    Pickup measures (=N-) are handled specially:
-    - First pickup measure becomes =0
-    - Subsequent barlines are numbered 1, 2, 3, ...
-
-    Final barlines (==) are preserved as-is.
-
-    Args:
-        lines: List of kern file lines
-
-    Returns:
-        List with renumbered barlines
-    """
-    result = []
-    measure_counter = 0
-    first_barline_seen = False
-
-    for line in lines:
-        if not line.startswith('='):
-            result.append(line)
-            continue
-
-        # Skip final barline
-        if line.startswith('=='):
-            result.append(line)
-            continue
-
-        parts = line.split('\t')
-
-        # Determine the new measure number for this line (all spines get same number)
-        # Check if this is a pickup measure by looking at the first barline part
-        first_bar_part = next((p for p in parts if p.startswith('=')), None)
-        is_pickup = first_bar_part and '-' in first_bar_part and not first_bar_part.startswith('==')
-
-        if not first_barline_seen:
-            first_barline_seen = True
-            if is_pickup:
-                new_measure_num = 0
-            else:
-                measure_counter += 1
-                new_measure_num = measure_counter
-        else:
-            measure_counter += 1
-            new_measure_num = measure_counter
-
-        # Apply the same measure number to all barline spines on this line
-        new_parts = []
-        for part in parts:
-            if part.startswith('=') and not part.startswith('=='):
-                new_parts.append(f'={new_measure_num}')
-            else:
-                new_parts.append(part)
-
-        result.append('\t'.join(new_parts))
-
-    return result
-
-
-def _count_spine_change(line: str) -> int:
-    """Count spine change from a line containing *^ or *v.
-
-    Args:
-        line: A line that may contain spine split (*^) or merge (*v)
-
-    Returns:
-        Net change in spine count (positive for split, negative for merge)
-    """
-    if not line.startswith('*') or line.startswith('**'):
-        return 0
-
-    parts = line.split('\t')
-    change = 0
-    i = 0
-    while i < len(parts):
-        if parts[i] == '*^':
-            change += 1  # One spine becomes two
-        elif parts[i] == '*v':
-            # Count consecutive *v tokens (they merge into one)
-            merge_count = 0
-            while i < len(parts) and parts[i] == '*v':
-                merge_count += 1
-                i += 1
-            change -= (merge_count - 1)  # N spines become 1
-            continue
-        i += 1
-    return change
-
-
-def _get_spine_count(line: str) -> int:
-    """Get the number of spines (tab-separated fields) in a line."""
-    if not line or line.startswith('!'):
-        return 0
-    return len(line.split('\t'))
-
-
-def expand_kern_repeats(kern_content: str) -> str:
-    """Expand kern content according to Humdrum expansion labels.
-
-    This function:
-    1. Parses the expansion order (*>[A,A,B,...])
-    2. Identifies section boundaries (*>A, *>B, etc.)
-    3. Reassembles content in playback order
-    4. Handles spine count mismatches between sections by inserting merge lines
-    5. Removes repeat barlines to avoid music21 expandRepeats issues
-
-    Args:
-        kern_content: Raw kern file content with expansion labels
-
-    Returns:
-        Expanded kern content (through-composed, no repeats)
-
-    Note:
-        If no expansion labels are found, returns the original content
-        with repeat barlines removed.
-    """
-    # Parse expansion order
-    expansion_order = parse_expansion_order(kern_content)
-    if not expansion_order:
-        # No expansion labels - just remove repeat barlines
-        return remove_repeat_barlines(kern_content)
-
-    # Parse section ranges
-    section_ranges = parse_section_ranges(kern_content)
-    if not section_ranges:
-        # No section markers found - return original with barlines cleaned
-        return remove_repeat_barlines(kern_content)
-
-    lines = kern_content.split('\n')
-
-    # Find header end (everything before first section marker)
-    first_section_start = min(start for start, _ in section_ranges.values())
-    # Header ends one line before first section content (the marker line itself)
-    header_end = first_section_start - 1
-
-    # Collect header lines (exclude expansion and norep labels)
-    header_lines = []
-    base_spine_count = 2  # Default
-    for i, line in enumerate(lines[:header_end]):
-        # Skip expansion labels
-        if line.startswith('*>[') or line.startswith('*>norep['):
-            continue
-        # Skip if all parts are expansion/norep labels
-        if '\t' in line:
-            parts = line.split('\t')
-            if all(p.startswith('*>[') or p.startswith('*>norep[') for p in parts):
-                continue
-        # Get base spine count from **kern line
-        if line.startswith('**'):
-            base_spine_count = len(line.split('\t'))
-        header_lines.append(line)
-
-    # Assemble expanded content
-    expanded_lines = header_lines.copy()
-    current_spine_count = base_spine_count
-
-    for section in expansion_order:
-        if section not in section_ranges:
-            # Section not found, skip (shouldn't happen in well-formed files)
-            continue
-
-        start, end = section_ranges[section]
-
-        # Get the starting spine count expected by this section
-        # Look for the first data or interpretation line in the section
-        section_start_spines = base_spine_count
-        for line in lines[start:end]:
-            if line and '\t' in line and not line.startswith('!'):
-                section_start_spines = len(line.split('\t'))
+    def offset_to_seconds(offset: Fraction) -> float:
+        """Convert quarter note offset to seconds using tempo map."""
+        seconds = 0.0
+        prev_offset = Fraction(0)
+        prev_bpm = tempo_changes[0][1]
+        for t_offset, t_bpm in tempo_changes:
+            if t_offset >= offset:
                 break
+            seconds += float(t_offset - prev_offset) * (60.0 / prev_bpm)
+            prev_offset = t_offset
+            prev_bpm = t_bpm
+        seconds += float(offset - prev_offset) * (60.0 / prev_bpm)
+        return seconds
 
-        # If current spine count doesn't match section start, insert merge/split
-        if current_spine_count > section_start_spines:
-            # Need to merge extra spines
-            # Insert merge line: merge down to section_start_spines
-            merge_parts = []
-            remaining = current_spine_count
-            target = section_start_spines
-            while remaining > target:
-                # Merge the last two spines into one
-                merge_parts = ['*'] * (remaining - 2) + ['*v', '*v']
-                expanded_lines.append('\t'.join(merge_parts))
-                remaining -= 1
-            current_spine_count = section_start_spines
-        elif current_spine_count < section_start_spines:
-            # Need to split - this is rare, usually sections start with base spines
-            # Insert split line
-            split_parts = ['*'] * (current_spine_count - 1) + ['*^']
-            while current_spine_count < section_start_spines:
-                expanded_lines.append('\t'.join(split_parts))
-                current_spine_count += 1
-                split_parts = ['*'] * (current_spine_count - 1) + ['*^']
+    if kern_content is not None:
+        lines = kern_content.split('\n')
+        # Add newline back for consistency with readlines() format
+        lines = [line + '\n' for line in lines]
+    else:
+        from pathlib import Path as _Path
+        kern_path = _Path(kern_path)
+        with open(kern_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
 
-        # Add section content
-        for line in lines[start:end]:
-            # Skip spine terminators - we'll add one at the end
-            if line.strip() and all(p.strip() == '*-' for p in line.split('\t')):
-                continue
-            # Clean repeat barlines
-            if line.startswith('='):
-                line = _clean_repeat_barline(line)
-            expanded_lines.append(line)
+    # Pre-scan: find the line number of the LAST final barline (==) in
+    # the file.  Only that barline terminates measure tracking; earlier ==
+    # barlines (e.g. DaCapo section boundaries) are treated as regular
+    # barlines so the music after them is still counted.
+    last_final_barline: Optional[int] = None
+    for scan_i, scan_line in enumerate(lines, start=1):
+        if scan_line.strip().split('\t')[0].startswith('=='):
+            last_final_barline = scan_i
 
-            # Track spine count changes
-            if line.startswith('*') and not line.startswith('**'):
-                current_spine_count += _count_spine_change(line)
+    # Detect pickup measure: scan for data lines before the first barline.
+    # If found, create measure 0 for the anacrusis content.
+    pickup_data_start = None
+    for scan_num, scan_line in enumerate(lines, start=1):
+        scan_stripped = scan_line.strip()
+        if not scan_stripped or scan_stripped.startswith('!') or scan_stripped.startswith('*'):
+            continue
+        first_tok = scan_stripped.split('\t')[0]
+        if barline_pattern.match(first_tok):
+            break  # Reached first barline — no pickup (or pickup already handled)
+        # Found data before any barline → pickup measure exists
+        if pickup_data_start is None:
+            pickup_data_start = scan_num
 
-    # Merge back to base spine count before terminator if needed
-    while current_spine_count > base_spine_count:
-        merge_parts = ['*'] * (current_spine_count - 2) + ['*v', '*v']
-        expanded_lines.append('\t'.join(merge_parts))
-        current_spine_count -= 1
+    if pickup_data_start is not None:
+        # There's content before the first barline — start tracking measure 0
+        current_measure = 0
+        measure_start_line = pickup_data_start
+        measure_start_offset = Fraction(0)
 
-    # Add spine terminator at the end
-    expanded_lines.append('\t'.join(['*-'] * base_spine_count))
+    for line_num, line in enumerate(lines, start=1):
+        line = line.strip()
 
-    # Renumber barlines sequentially to avoid duplicates after expansion
-    # This is critical for music21/converter21 to parse the file correctly
-    expanded_lines = _renumber_barlines(expanded_lines)
-
-    return '\n'.join(expanded_lines)
-
-
-def remove_repeat_barlines(kern_content: str) -> str:
-    """Remove repeat barlines from kern content without expanding.
-
-    Use this for files without expansion labels but with repeat barlines
-    that cause music21 to fail.
-
-    Args:
-        kern_content: Raw kern file content
-
-    Returns:
-        Kern content with repeat barlines converted to regular barlines
-    """
-    lines = kern_content.split('\n')
-    cleaned_lines = []
-
-    for line in lines:
-        # Skip expansion and norep labels
-        if re.match(r'^\*>\[.*\]', line) or re.match(r'^\*>norep\[.*\]', line):
+        # Skip empty lines and comments
+        if not line or line.startswith('!'):
             continue
 
-        # Skip section markers (*>A, *>B, etc.)
-        if line.startswith('*>') and '\t' in line:
-            parts = line.split('\t')
-            if all(p.startswith('*>') and not p.startswith('*>[') for p in parts):
+        # Check for barline
+        first_token = line.split('\t')[0]
+        match = barline_pattern.match(first_token)
+
+        if match:
+            # Found a barline
+            measure_num_str = match.group(1)
+
+            # Close previous measure (including pickup measure 0)
+            if current_measure is not None and measure_start_line is not None:
+                line_end = line_num - 1  # End before this barline
+                # Skip measures with no actual music data (only comments,
+                # interpretations like key/meter changes, or empty lines).
+                # music21 does not create Measure objects for these, so
+                # including them would cause kern_measures/audio_measures mismatch.
+                has_music = False
+                if line_end >= measure_start_line:
+                    for check_i in range(measure_start_line - 1, line_end):
+                        raw = lines[check_i].strip()
+                        if raw and not raw.startswith('!') and not raw.startswith('*') and not raw.startswith('='):
+                            has_music = True
+                            break
+                if has_music:
+                    entry = {
+                        "measure": current_measure,
+                        "line_start": measure_start_line,
+                        "line_end": line_end,
+                    }
+                    if include_timing:
+                        entry["start_sec"] = round(offset_to_seconds(measure_start_offset), 4)
+                        entry["end_sec"] = round(offset_to_seconds(current_offset), 4)
+                    measures.append(entry)
+
+            # The LAST final barline (==) in the file signals end of
+            # piece.  Do NOT start a new measure — any content after it
+            # (e.g. tie resolution, reference comments) belongs to the
+            # preceding measure, not a new one.  music21 does not create
+            # a Measure for post-final-barline content.
+            # NOTE: == can also appear as a section double barline
+            # mid-piece (e.g. DaCapo point), so we only skip when this
+            # is truly the last == in the file.
+            if first_token.startswith('==') and line_num == last_final_barline:
+                current_measure = None
+                measure_start_line = None
                 continue
 
-        # Clean repeat barlines
-        if line.startswith('='):
-            line = _clean_repeat_barline(line)
+            # Start new measure
+            if measure_num_str:
+                current_measure = int(measure_num_str)
+            elif current_measure is not None:
+                current_measure += 1
+            else:
+                current_measure = 1
 
-        cleaned_lines.append(line)
+            measure_start_line = line_num + 1  # Start after barline
+            measure_start_offset = current_offset
 
-    return '\n'.join(cleaned_lines)
+        elif first_token.startswith('*'):
+            # Interpretation line (metadata) - not part of measure content
+            # But update measure_start_line if we haven't started the measure yet
+            if measure_start_line == line_num:
+                measure_start_line = line_num + 1
 
+            # Parse tempo and time signature for timing
+            if include_timing:
+                if '*MM' in line:
+                    tempo_match = re.search(r'\*MM=?(\d+\.?\d*)', line)
+                    if tempo_match:
+                        bpm = float(tempo_match.group(1))
+                        tempo_changes.append((current_offset, bpm))
+            continue
 
-def get_expansion_info(kern_content: str) -> Dict:
-    """Get information about the repeat structure for debugging.
+        else:
+            # Data line - advance offset by max duration across spines
+            if include_timing:
+                cols = line.split('\t')
+                max_dur = Fraction(0)
+                for col in cols:
+                    if col == '.' or not col:
+                        continue
+                    # Handle chords (space-separated subtokens)
+                    for subtoken in col.split():
+                        dur = parse_kern_duration(subtoken)
+                        if dur is not None and dur > max_dur:
+                            max_dur = dur
+                if max_dur > 0:
+                    current_offset += max_dur
 
-    Args:
-        kern_content: Raw kern file content
+    # Close the last measure — only if it contains actual music data.
+    # After the final barline (==), there are typically only reference
+    # comments (!!!) and spine terminators (*-), which should NOT form
+    # a phantom measure.
+    if current_measure is not None and measure_start_line is not None:
+        has_data = False
+        last_data_line = measure_start_line
+        for i in range(measure_start_line - 1, len(lines)):
+            raw = lines[i].strip()
+            # Skip empty, comments, spine terminators, interpretation lines
+            if not raw or raw.startswith('!') or raw.startswith('*'):
+                continue
+            # Skip barlines (shouldn't appear, but just in case)
+            if raw.startswith('='):
+                continue
+            # Found actual music data
+            has_data = True
+            last_data_line = i + 1  # 1-indexed
 
-    Returns:
-        Dictionary with expansion info:
-        - has_expansion: bool
-        - expansion_order: List[str] or None
-        - sections: Dict[str, (start, end)]
-        - estimated_expansion_ratio: float (expanded / original)
-    """
-    expansion_order = parse_expansion_order(kern_content)
-    section_ranges = parse_section_ranges(kern_content)
+        if has_data:
+            entry = {
+                "measure": current_measure,
+                "line_start": measure_start_line,
+                "line_end": last_data_line,
+            }
+            if include_timing:
+                entry["start_sec"] = round(offset_to_seconds(measure_start_offset), 4)
+                entry["end_sec"] = round(offset_to_seconds(current_offset), 4)
+            measures.append(entry)
 
-    info = {
-        'has_expansion': expansion_order is not None,
-        'expansion_order': expansion_order,
-        'sections': section_ranges,
-        'section_count': len(section_ranges),
-    }
-
-    if expansion_order and section_ranges:
-        # Estimate expansion ratio
-        original_lines = sum(end - start for start, end in section_ranges.values())
-        expanded_lines = sum(
-            section_ranges[s][1] - section_ranges[s][0]
-            for s in expansion_order
-            if s in section_ranges
-        )
-        info['estimated_expansion_ratio'] = expanded_lines / original_lines if original_lines > 0 else 1.0
-    else:
-        info['estimated_expansion_ratio'] = 1.0
-
-    return info
+    return measures
 
 
 # =============================================================================
@@ -733,6 +528,10 @@ def sanitize_kern_for_audio(kern_content: str) -> str:
     Returns:
         Sanitized kern content safe for converter21/music21 parsing
     """
+    # Lazy import to avoid circular dependency:
+    # expand_repeat imports extract_kern_measures from this module.
+    from src.score.expand_repeat import expand_kern_repeats
+
     # Step 1: Expand repeats
     result = expand_kern_repeats(kern_content)
 
@@ -746,11 +545,8 @@ def sanitize_kern_for_audio(kern_content: str) -> str:
 __all__ = [
     # Main entry point
     'sanitize_kern_for_audio',
-    # Repeat expansion
-    'expand_kern_repeats',
-    'remove_repeat_barlines',
-    'has_expansion_labels',
-    'get_expansion_info',
+    # Measure extraction
+    'extract_kern_measures',
     # Spine timing fix
     'fix_kern_spine_timing',
     'parse_kern_duration',

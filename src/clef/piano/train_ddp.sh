@@ -49,7 +49,7 @@ else:
 }
 
 # GPU configuration
-GPUS="${GPUS:-1,4}"                        # Default: GPU 1 and 4
+GPUS="${GPUS:-1,2}"                        # Default: GPU 1 and 2
 NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
 
 # Training parameters (read from config.yaml if not set via env vars)
@@ -59,8 +59,9 @@ GRADIENT_CLIP="${GRADIENT_CLIP:-$(read_config 'training.gradient_clip' '1.0')}"
 MAX_EPOCHS="${MAX_EPOCHS:-$(read_config 'training.max_epochs' '100')}"
 VALIDATE_EVERY="${VALIDATE_EVERY:-500}"    # Validate every N steps
 EARLY_STOPPING="${EARLY_STOPPING:-5}"      # Early stop after N epochs without improvement (0=disabled)
+MASTER_PORT="${MASTER_PORT:-29500}"        # Change if running multiple DDP jobs
 MANIFEST_DIR="${MANIFEST_DIR:-data/experiments/clef_piano_base}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpoints/clef_piano_base}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$(read_config 'paths.checkpoint_dir' 'checkpoints/clef_piano_base')}"
 RESUME="${RESUME:-}"
 
 # Wandb (read from config if not set)
@@ -83,6 +84,7 @@ echo "Effective batch size: $((BATCH_SIZE * NUM_GPUS * GRADIENT_ACCUM))"
 echo "Max epochs: $MAX_EPOCHS"
 echo "Validate every: $VALIDATE_EVERY steps"
 echo "Early stopping patience: $EARLY_STOPPING epochs"
+echo "Master port: $MASTER_PORT"
 echo "Config: $CONFIG"
 echo "Manifest dir: $MANIFEST_DIR"
 echo "Checkpoint dir: $CHECKPOINT_DIR"
@@ -97,7 +99,7 @@ echo ""
 # Build command
 # =============================================================================
 
-CMD="poetry run torchrun --nproc_per_node=$NUM_GPUS -m src.clef.piano.train"
+CMD="poetry run torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT -m src.clef.piano.train"
 CMD="$CMD --config $CONFIG"
 CMD="$CMD --manifest-dir $MANIFEST_DIR"
 CMD="$CMD --checkpoint-dir $CHECKPOINT_DIR"

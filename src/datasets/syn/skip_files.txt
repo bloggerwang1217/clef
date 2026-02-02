@@ -1,13 +1,10 @@
 # Files to skip during Phase 2 HumSyn audio generation
-# Updated: 2026-01-28
+# Updated: 2026-02-01
 #
 # Reason: kern quality issues that cannot be fixed automatically
-# - offsetInScore negative: spine timing errors in original kern file
-# - tuplet markers misaligned: *tuplet and *Xtuplet not tracking spines correctly
-#
 # Total: 8 Chopin files
 
-# Caused by negative delta time / offsetInScore errors
+# Negative delta time (spine timing errors in original kern)
 humdrum_chopin_first_editions_009-1-KI-003
 humdrum_chopin_first_editions_023-1-BH
 humdrum_chopin_first_editions_028_1-12-1a-C-005
@@ -15,6 +12,6 @@ humdrum_chopin_first_editions_028_13-24-1a-C-013
 humdrum_chopin_first_editions_055-1-BH-002
 humdrum_chopin_first_editions_060-1-BH
 
-# Caused by tuplet marker misalignment (dotted notes misinterpreted as triplets)
+# quarterLength conversion error (non-standard tuplet durations)
 humdrum_chopin_first_editions_021-1a-BH-001
 humdrum_chopin_first_editions_021-1a-BH-002

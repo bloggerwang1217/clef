@@ -51,7 +51,9 @@ from src.preprocessing.musesyn_processor import MuseSynProcessor
 from src.score.clean_kern import clean_kern_sequence
 from src.score.kern_zeng_compat import (
     expand_tuplets_to_zeng_vocab,
+    resolve_rscale_regions,
     quantize_oov_tuplets,
+    quantize_tuplet_ratios,
     apply_zeng_pitch_compat,
 )
 from src.score.sanitize_kern import fix_kern_spine_timing
@@ -140,57 +142,58 @@ def get_key_signature(score: m21.stream.Score) -> int:
 
 
 def extract_measure_times(score: m21.stream.Score) -> List[Dict[str, Any]]:
-    """Extract measure timing information from a music21 score.
+    """Extract measure timing from a music21 Score (single source of truth).
 
-    Uses the score's tempo markings to convert offsets to seconds.
-    Handles tempo changes within the piece.
+    Uses the Score's internal MetronomeMark objects and measure offsets.
+    This matches exactly what score.write('midi') produces, so timing is
+    guaranteed to align with the rendered audio.
 
     Args:
-        score: music21 Score object
+        score: music21 Score object (already parsed via converter21)
 
     Returns:
-        List of measure info:
+        List of measure info (in sequential order, may have duplicate numbers
+        from repeat expansion):
         [
-            {"measure": 1, "start_sec": 0.0, "end_sec": 2.5},
-            {"measure": 2, "start_sec": 2.5, "end_sec": 5.1},
+            {"measure": 1, "start_sec": 0.0, "end_sec": 1.25},
+            {"measure": 2, "start_sec": 1.25, "end_sec": 2.50},
             ...
         ]
     """
-    measures_info = []
-    seen_measures = set()
-
-    # Get the first part (assume all parts have same measure structure)
     if not score.parts:
-        return measures_info
+        return []
 
     part = score.parts[0]
 
-    # Get all tempo marks from the flattened score, sorted by offset
+    # Build tempo map from MetronomeMark objects: [(offset_ql, qpm)]
     flat_score = score.flatten()
     tempo_marks = list(flat_score.getElementsByClass(m21.tempo.MetronomeMark))
     tempo_marks.sort(key=lambda t: t.offset)
 
-    # Build tempo map: list of (offset, qpm) tuples
     tempo_map = []
     for tm in tempo_marks:
-        tempo_map.append((tm.offset, tm.number))
+        # numberSounding gives quarter-note BPM regardless of beat unit.
+        # However, converter21 often leaves numberSounding=None even when
+        # referent != quarter (e.g. !!!OMD "[half-dot] = 60" → number=60,
+        # referent=dotted-half, numberSounding=None).  In that case we must
+        # convert manually: qpm = number * referent.quarterLength.
+        if tm.numberSounding:
+            qpm = tm.numberSounding
+        elif tm.number is not None and tm.referent is not None:
+            qpm = tm.number * tm.referent.quarterLength
+        else:
+            qpm = tm.number
+        if qpm is None:
+            # converter21 creates MetronomeMark from !!!OMD records (e.g. "TRIO")
+            # that are section labels, not tempo changes. Skip them.
+            continue
+        tempo_map.append((float(tm.offset), float(qpm)))
 
-    # Default tempo if none specified
     if not tempo_map:
         tempo_map = [(0.0, 120.0)]
 
-    def get_tempo_at_offset(offset: float) -> float:
-        """Get tempo (qpm) at a given offset."""
-        qpm = tempo_map[0][1]  # Default to first tempo
-        for t_offset, t_qpm in tempo_map:
-            if t_offset <= offset:
-                qpm = t_qpm
-            else:
-                break
-        return qpm
-
     def offset_to_seconds(offset: float) -> float:
-        """Convert offset in quarter notes to seconds, handling tempo changes."""
+        """Convert quarter-note offset to seconds using tempo map."""
         seconds = 0.0
         prev_offset = 0.0
         prev_qpm = tempo_map[0][1]
@@ -198,43 +201,149 @@ def extract_measure_times(score: m21.stream.Score) -> List[Dict[str, Any]]:
         for t_offset, t_qpm in tempo_map:
             if t_offset >= offset:
                 break
-            # Add time from prev_offset to t_offset at prev_qpm
             seconds += (t_offset - prev_offset) * (60.0 / prev_qpm)
             prev_offset = t_offset
             prev_qpm = t_qpm
 
-        # Add remaining time from prev_offset to target offset
         seconds += (offset - prev_offset) * (60.0 / prev_qpm)
         return seconds
 
+    # Extract ALL measures in sequential order (no dedup by number,
+    # since repeat expansion can produce duplicate measure numbers)
+    measures_info = []
     for measure in part.getElementsByClass(m21.stream.Measure):
-        measure_num = measure.number
-        if measure_num in seen_measures:
-            continue
-        seen_measures.add(measure_num)
-
         try:
-            # Get offset in quarter notes
-            offset_start = measure.offset
-            offset_end = offset_start + measure.duration.quarterLength
-
-            # Convert to seconds
-            start_sec = offset_to_seconds(offset_start)
-            end_sec = offset_to_seconds(offset_end)
+            offset_start = float(measure.offset)
+            offset_end = offset_start + float(measure.duration.quarterLength)
 
             measures_info.append({
-                "measure": measure_num,
-                "start_sec": round(start_sec, 4),
-                "end_sec": round(end_sec, 4),
+                "measure": measure.number,
+                "start_sec": round(offset_to_seconds(offset_start), 4),
+                "end_sec": round(offset_to_seconds(offset_end), 4),
             })
         except Exception:
-            # Fallback: skip this measure
             continue
 
-    # Sort by measure number
-    measures_info.sort(key=lambda x: x["measure"])
-
     return measures_info
+
+
+def extract_measure_offsets(score: m21.stream.Score) -> List[Dict[str, Any]]:
+    """Extract measure boundaries as quarter-note offsets from a music21 Score.
+
+    These offsets are used to inject MIDI marker events at exact tick
+    positions, avoiding the tempo-map mismatch between music21's internal
+    offset_to_seconds and its MIDI writer.
+
+    Args:
+        score: music21 Score object
+
+    Returns:
+        List of {"measure": int, "start_qn": float, "end_qn": float}
+    """
+    if not score.parts:
+        return []
+
+    part = score.parts[0]
+    offsets = []
+    for measure in part.getElementsByClass(m21.stream.Measure):
+        try:
+            start = float(measure.offset)
+            end = start + float(measure.duration.quarterLength)
+            offsets.append({
+                "measure": measure.number,
+                "start_qn": start,
+                "end_qn": end,
+            })
+        except Exception:
+            continue
+    return offsets
+
+
+def inject_measure_markers(midi_path: str, measure_offsets: List[Dict[str, Any]]) -> None:
+    """Inject marker meta-events at measure boundaries into a MIDI file.
+
+    Markers are placed on a dedicated track so they don't interfere with
+    note data.  FluidSynth ignores all meta-events, so the audio output
+    is unaffected.  After tempo scaling (which also scales marker delta
+    times), the markers can be read back with ``read_measure_times_from_midi``
+    to obtain precise measure boundary times in seconds.
+
+    Args:
+        midi_path: Path to the MIDI file (modified in place).
+        measure_offsets: Output of ``extract_measure_offsets``.
+    """
+    from mido import MidiFile, MidiTrack, MetaMessage
+
+    mid = MidiFile(midi_path)
+    tpb = mid.ticks_per_beat
+
+    marker_track = MidiTrack()
+    prev_tick = 0
+    for m in measure_offsets:
+        tick = int(round(m["start_qn"] * tpb))
+        delta = max(0, tick - prev_tick)
+        marker_track.append(
+            MetaMessage("marker", text=f"bar_{m['measure']}", time=delta)
+        )
+        prev_tick = tick
+
+    # End-of-piece marker at the last measure's end
+    if measure_offsets:
+        end_tick = int(round(measure_offsets[-1]["end_qn"] * tpb))
+        delta = max(0, end_tick - prev_tick)
+        marker_track.append(MetaMessage("marker", text="end", time=delta))
+
+    mid.tracks.append(marker_track)
+    mid.save(midi_path)
+
+
+def read_measure_times_from_midi(midi_path: str) -> List[Dict[str, Any]]:
+    """Read measure boundary times (in seconds) from MIDI marker events.
+
+    mido's file iterator automatically applies the MIDI tempo map when
+    converting tick deltas to seconds, so the returned times are guaranteed
+    to match what FluidSynth renders.
+
+    Args:
+        midi_path: Path to a MIDI file containing ``bar_*`` / ``end`` markers.
+
+    Returns:
+        List of {"measure": int, "start_sec": float, "end_sec": float}.
+        Returns [] if no markers are found.
+    """
+    from mido import MidiFile
+
+    mid = MidiFile(midi_path)
+
+    # Collect absolute times for each marker
+    markers: List[tuple] = []  # (abs_sec, text)
+    abs_time = 0.0
+    for msg in mid:
+        abs_time += msg.time
+        if msg.type == "marker":
+            markers.append((abs_time, msg.text))
+
+    if not markers:
+        return []
+
+    # Build measure list from consecutive bar_* markers
+    measures = []
+    for i, (t, text) in enumerate(markers):
+        if not text.startswith("bar_"):
+            continue
+        measure_num = int(text[4:])
+        # end_sec is the next marker's time (bar_* or "end")
+        if i + 1 < len(markers):
+            end_sec = markers[i + 1][0]
+        else:
+            end_sec = t  # fallback: zero-length last measure
+        measures.append({
+            "measure": measure_num,
+            "start_sec": round(t, 4),
+            "end_sec": round(end_sec, 4),
+        })
+
+    return measures
 
 
 def extract_measure_times_from_kern(kern_content: str) -> List[Dict[str, Any]]:
@@ -409,10 +518,14 @@ def phase1_score_to_kern(
     # Process HumSyn
     logger.info("Processing HumSyn...")
     selected_chopin_path = metadata_dir / "selected_chopin.txt"
+    repeat_map_dir = output_dir / "repeat_map"
+    repeat_map_dir.mkdir(parents=True, exist_ok=True)
+
     humsyn_processor = HumSynProcessor(
         input_dir=humsyn_dir,
         output_dir=kern_output_dir,
         visual_dir=visual_output_dir,
+        repeat_map_dir=repeat_map_dir,
         selected_chopin_path=selected_chopin_path,
         preset=preset,
     )
@@ -425,6 +538,7 @@ def phase1_score_to_kern(
         input_dir=musesyn_dir,
         output_dir=kern_output_dir,
         visual_dir=visual_output_dir,
+        repeat_map_dir=repeat_map_dir,
         preset=preset,
     )
     musesyn_results = musesyn_processor.process_all()
@@ -446,10 +560,10 @@ def create_ground_truth_kern(
        - Strip natural accidentals (n)
        - Convert double accidentals (## → enharmonic, -- → enharmonic)
        - Remove slur/phrase markers ((), {})
-       - Mark extreme pitches as <unk>
+       - Clamp extreme pitches to piano range
     3. expand_tuplets_to_zeng_vocab() - expand 5/7/11-tuplets to standard durations
     4. quantize_oov_tuplets() - IP-based quantization for remaining OOV durations
-    5. X%Y → <unk> - mark complex tuplet ratios as unknown
+    5. X%Y → quantize to nearest standard duration
 
     Args:
         output_dir: Base output directory (reads from kern/, writes to kern_gt/)
@@ -476,46 +590,40 @@ def create_ground_truth_kern(
             with open(kern_path, "r", encoding="utf-8") as f:
                 raw_kern = f.read()
 
+            # kern/ files are already repeat-expanded (Phase 1).
+            # Repeat maps are saved in Phase 1 alongside kern/.
+
             # Step 0: Fix spine timing (insert rests to sync spines)
             # This ensures kern_gt timing matches audio timing
             spine_fixed = fix_kern_spine_timing(raw_kern)
 
             # Step 1: Clean kern sequence (standardize tokens, dotted triplets, remove beams)
-            cleaned = clean_kern_sequence(spine_fixed, warn_tuplet_ratio=False)
+            # strip_cue=True: kern/ retains cue notes (needed for Phase 2 MIDI generation);
+            # kern_gt/ must strip them so the model doesn't predict orchestral cue notes.
+            cleaned = clean_kern_sequence(spine_fixed, warn_tuplet_ratio=False, strip_cue=True)
 
             # Step 2: Apply Zeng pitch/accidental compatibility
-            # (split breves, strip n, convert ##/--, remove slur/phrase, mark extreme)
+            # (split breves, strip n, convert ##/--, remove slur/phrase, clamp extreme)
             pitch_compat = apply_zeng_pitch_compat(cleaned)
 
-            # Step 3: Expand standard tuplets to Zeng vocab
-            expanded = expand_tuplets_to_zeng_vocab(pitch_compat)
+            # Step 3: Resolve *rscale regions first (divide durations by factor,
+            # strip markers) so expand_tuplets sees actual recip values.
+            # e.g., *rscale:2 + dur 36 → dur 18, which NINE_TUPLET_MAP expands
+            # to uniform 20s. Must run BEFORE expand_tuplets to avoid IP solver
+            # producing mixed 16/20 or 32/40 that breaks converter21 tuplet inference.
+            rscale_resolved = resolve_rscale_regions(pitch_compat)
+
+            # Step 3.5: Expand standard tuplets to Zeng vocab
+            tuplet_expanded = expand_tuplets_to_zeng_vocab(rscale_resolved)
 
             # Step 4: Quantize remaining OOV tuplets with IP solver
-            quantized = quantize_oov_tuplets(expanded, seed=seed)
+            quantized = quantize_oov_tuplets(tuplet_expanded, seed=seed)
 
-            # Step 5: Mark X%Y tuplet ratios as <unk>
-            # Pattern: digits followed by % followed by digits (e.g., 56%3, 8%9)
-            def replace_tuplet_ratio(match):
-                # Keep pitch and other markers, replace duration with <unk>
-                token = match.group(0)
-                # Extract pitch part (letters after the duration)
-                pitch_match = re.search(r'[a-gA-Gr]', token)
-                if pitch_match:
-                    pitch_start = pitch_match.start()
-                    return '<unk>' + token[pitch_start:]
-                return '<unk>'
-
-            # Replace tokens with X%Y duration pattern
-            # Note: \.? handles dotted durations like 20%3.a
-            with_unk = re.sub(
-                r'\b\d+%\d+\.?[a-gA-Gr][^\s\t]*',
-                replace_tuplet_ratio,
-                quantized
-            )
+            # Step 5: Quantize X%Y tuplet ratios + strip *tuplet markers
+            quantized_final = quantize_tuplet_ratios(quantized)
 
             # Step 6: Final pass for double accidentals
-            # Step 5 may create tokens like <unk>FF## that need conversion
-            ground_truth = apply_zeng_pitch_compat(with_unk)
+            ground_truth = apply_zeng_pitch_compat(quantized_final)
 
             # Write ground truth file
             gt_path = kern_gt_dir / f"{stem}.krn"
@@ -569,6 +677,7 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
 
     from src.score.sanitize_kern import sanitize_kern_for_audio
     from src.score.sanitize_piano_score import sanitize_score
+    from src.score.expand_repeat import expand_musesyn_score
 
     midi_dir = output_dir / "midi"
     audio_dir = output_dir / "audio"
@@ -588,7 +697,7 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
     # Check if this is a MuseSyn file
     is_musesyn = stem.startswith("musesyn_")
 
-    expanded_kern = None  # For fallback measure extraction
+    expanded_kern = None
 
     try:
         if is_musesyn:
@@ -602,6 +711,11 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
 
             score = m21.converter.parse(str(xml_path))
             sanitize_score(score)
+
+            # Expand repeats at music21 level for accurate measure timing.
+            # score.write('midi') auto-expands repeats, so measure offsets
+            # must also come from the expanded score to match MIDI duration.
+            score, _ = expand_musesyn_score(score)
         else:
             # For HumSyn: use kern file with repeat expansion and sanitization
             # Original kern with repeat markers is preserved as ground truth
@@ -635,6 +749,19 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
     for part in score.parts:
         if not part.getElementsByClass(m21.instrument.Instrument):
             part.insert(0, m21.instrument.Piano())
+
+    # Extract measure boundary offsets (in quarter-notes) for MIDI marker
+    # injection.  These are converted to ticks and embedded into the MIDI
+    # file so that after tempo scaling we can read back precise measure
+    # times in seconds directly from the MIDI's own tempo map.
+    measure_offsets = extract_measure_offsets(score)
+
+    # Fallback: if Score-based extraction fails, try kern-based extraction
+    # (returns seconds, not quarter-note offsets — used only for the legacy
+    # score_measures path when marker injection is not possible).
+    score_measures_fallback: Optional[List[Dict[str, Any]]] = None
+    if not measure_offsets and expanded_kern:
+        score_measures_fallback = extract_measure_times_from_kern(expanded_kern)
 
     for version in range(num_versions):
         # Augmentation parameters
@@ -674,39 +801,20 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
             else:
                 transposed_score = score
 
-            # Extract measure times (for alignment - needed even for skipped files)
-            measure_times = extract_measure_times(transposed_score)
-
-            # Fallback: if score parsing failed, extract from kern directly
-            if not measure_times and expanded_kern:
-                measure_times = extract_measure_times_from_kern(expanded_kern)
-
-            # Calculate tempo scaling (deterministic based on seed)
-            # For existing files, we simulate what MIDIProcess would do
+            # Draw tempo scaling once from RNG (1 call per version, deterministic).
+            # This value is used both for metadata and passed to MIDIProcess.process()
+            # so that MIDIProcess does NOT draw its own RNG call.
+            import numpy as np
             tempo_scaling = 1.0  # Default: no scaling
             if tempo_enabled and split == "train":
-                # Simulate MIDIProcess.random_scaling logic
-                # NOTE: MIDIProcess.random_scaling removed Zeng's 4-12 second constraint
-                # (which was designed for 5-bar chunks). For full-song processing,
-                # we apply tempo_range directly without length-based bounds.
-                import numpy as np
                 tempo_scaling = np.random.uniform(tempo_range[0], tempo_range[1])
 
-            # Calculate audio_measures (apply tempo scaling to measure times)
-            audio_measures = []
-            for m in measure_times:
-                audio_measures.append({
-                    "measure": m["measure"],
-                    "start_sec": round(m["start_sec"] * tempo_scaling, 4),
-                    "end_sec": round(m["end_sec"] * tempo_scaling, 4),
-                })
-
-            # Calculate duration from last measure end time
-            duration_sec = audio_measures[-1]["end_sec"] if audio_measures else 0.0
-
-            # Skip audio generation if file already exists
-            # But still collect alignment info for metadata update
+            # Skip audio generation if file already exists.
+            # Read audio_measures from the MIDI's embedded markers (placed
+            # during a previous run).  This is the single source of truth.
             if audio_exists:
+                audio_measures = read_measure_times_from_midi(str(midi_path))
+                duration_sec = audio_measures[-1]["end_sec"] if audio_measures else 0.0
                 results[audio_name] = "skipped (exists)"
                 alignment_info[audio_key] = {
                     "tempo_scaling": round(tempo_scaling, 6),
@@ -732,7 +840,14 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
                 results[audio_name] = "error: midi write failed"
                 continue
 
+            # Inject measure-boundary markers into the MIDI file.
+            # These survive tempo scaling (apply_scaling also scales marker
+            # delta times) and can be read back afterwards for precise timing.
+            if measure_offsets:
+                inject_measure_markers(str(midi_path), measure_offsets)
+
             # Apply tempo scaling via MIDIProcess (Zeng-style)
+            # Pass pre-drawn tempo_scaling to avoid RNG double-consumption.
             tempo_scaling_success = True
             if has_zeng and tempo_enabled:
                 temp_midi_path = midi_dir / f"temp_{stem}_{version}.mid"
@@ -741,42 +856,33 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
                     str(midi_path),
                     str(temp_midi_path),
                     tempo_range=tempo_range,
+                    scaling=tempo_scaling,
                 )
-                # Handle both old (2-tuple) and new (3-tuple) return format
-                if len(result) == 3:
-                    scaling, original_length, tempo_scaling_success = result
-                else:
-                    scaling, original_length = result
-                    tempo_scaling_success = True
+                scaling, original_length, tempo_scaling_success = result
                 # Clean up temp file
                 if temp_midi_path.exists():
                     temp_midi_path.unlink()
 
-                # If tempo scaling failed, use original MIDI with tempo=1.0
-                # Still generate all 4 soundfont versions (v0-v3)
+                # If tempo scaling failed (negative delta time), fall back to tempo=1.0
                 if not tempo_scaling_success:
                     tempo_scaling = 1.0
-                    # Recalculate audio_measures with tempo=1.0
-                    audio_measures = []
-                    for m in measure_times:
-                        audio_measures.append({
-                            "measure": m["measure"],
-                            "start_sec": round(m["start_sec"], 4),
-                            "end_sec": round(m["end_sec"], 4),
-                        })
-                    duration_sec = audio_measures[-1]["end_sec"] if audio_measures else 0.0
-                elif scaling is not None:
-                    # Update with actual scaling (should match our simulation)
-                    tempo_scaling = scaling
-                    # Recalculate audio_measures with actual scaling
-                    audio_measures = []
-                    for m in measure_times:
-                        audio_measures.append({
-                            "measure": m["measure"],
-                            "start_sec": round(m["start_sec"] * tempo_scaling, 4),
-                            "end_sec": round(m["end_sec"] * tempo_scaling, 4),
-                        })
-                    duration_sec = audio_measures[-1]["end_sec"] if audio_measures else 0.0
+
+            # Read audio_measures from MIDI markers (single source of truth).
+            # The markers were injected above and scaled by MIDIProcess.
+            # mido's iterator applies the MIDI tempo map, so the times are
+            # guaranteed to match what FluidSynth renders.
+            audio_measures = read_measure_times_from_midi(str(midi_path))
+            if not audio_measures and score_measures_fallback:
+                # Fallback: kern-based timing (no markers available)
+                audio_measures = [
+                    {
+                        "measure": m["measure"],
+                        "start_sec": round(m["start_sec"] * tempo_scaling, 4),
+                        "end_sec": round(m["end_sec"] * tempo_scaling, 4),
+                    }
+                    for m in score_measures_fallback
+                ]
+            duration_sec = audio_measures[-1]["end_sec"] if audio_measures else 0.0
 
             # Render MIDI -> Audio with loudness normalization
             sf_path = soundfont_dir / soundfont
@@ -926,6 +1032,7 @@ def phase2_kern_to_audio(
         n_versions = num_versions_config[split]
         # Use train soundfonts for train, test soundfonts for valid/test
         soundfonts_for_split = available_train_soundfonts if split == "train" else available_test_soundfonts
+
         tasks.append((kern_path, output_dir, soundfont_dir, split, n_versions, soundfonts_for_split,
                       transpose_enabled, feasible_transposes, tempo_enabled, tempo_range, musesyn_dir))
 
@@ -951,11 +1058,23 @@ def phase2_kern_to_audio(
     updated_count = 0
     save_interval = 10  # Save metadata every N kern files
 
+    alignment_mismatches = []
+
     def update_metadata_incremental(alignment: dict) -> int:
         """Update metadata in memory with alignment info. Returns count of updates."""
         count = 0
         for audio_key, align_info in alignment.items():
             if audio_key in metadata:
+                # Validate: Score measure count must match kern_gt measure count.
+                # Score is the single source of truth for measure numbering/timing.
+                kern_measures = metadata[audio_key].get("kern_measures", [])
+                audio_measures = align_info["audio_measures"]
+                if kern_measures and audio_measures and len(kern_measures) != len(audio_measures):
+                    alignment_mismatches.append(
+                        f"{audio_key}: kern_measures={len(kern_measures)}, "
+                        f"audio_measures(Score)={len(audio_measures)}"
+                    )
+
                 metadata[audio_key]["tempo_scaling"] = align_info["tempo_scaling"]
                 metadata[audio_key]["duration_sec"] = align_info["duration_sec"]
                 metadata[audio_key]["audio_measures"] = align_info["audio_measures"]
@@ -994,12 +1113,26 @@ def phase2_kern_to_audio(
                     if (i + 1) % save_interval == 0:
                         save_metadata()
                 except Exception as e:
-                    logger.error(f"Error processing {kern_path}: {e}")
+                    import traceback
+                    logger.error(f"Error processing {kern_path}: {e}\n{traceback.format_exc()}")
                     all_results[kern_path.stem] = f"error: {e}"
 
     # Final save
     save_metadata()
     logger.info(f"Updated {updated_count} entries in {metadata_path}")
+
+    # Report alignment validation
+    if alignment_mismatches:
+        logger.warning(
+            f"ALIGNMENT MISMATCH: {len(alignment_mismatches)} entries have "
+            f"kern_measures vs audio_measures(Score) count disagreement:"
+        )
+        for msg in alignment_mismatches[:20]:
+            logger.warning(f"  {msg}")
+        if len(alignment_mismatches) > 20:
+            logger.warning(f"  ... and {len(alignment_mismatches) - 20} more")
+    else:
+        logger.info("Alignment validation PASSED: all kern_measures/audio_measures counts match")
 
     # Summary
     success = sum(1 for v in all_results.values() if v == "success")
@@ -1186,7 +1319,7 @@ def main():
     parser.add_argument(
         "--phase",
         type=str,
-        choices=["1", "2", "2.5", "3", "all"],
+        choices=["1", "1.5", "2", "2.5", "3", "all"],
         help="Phase to run: 1 (Score→Kern), 2 (Kern→Audio), 2.5 (Audio→Mel), "
              "3 (Create manifests), all (all phases). If not specified, runs 1 and 2.",
     )
@@ -1252,6 +1385,7 @@ def main():
     # Determine which phases to run
     phase = args.phase
     run_phase1 = phase is None or phase == "1" or phase == "all"
+    run_phase1b = phase == "1.5" or phase == "all"
     run_phase2 = phase is None or phase == "2" or phase == "all"
     run_phase2_5 = phase == "2.5" or phase == "all"
     run_phase3 = phase == "3" or phase == "all"
@@ -1273,11 +1407,17 @@ def main():
         success = sum(1 for v in phase1_results.values() if v == "success")
         logger.info(f"Phase 1 complete: {success}/{len(phase1_results)} successful")
 
+    if run_phase1 or run_phase1b:
         # Create ground truth kern files (Zeng vocab compatible)
         logger.info("=== Phase 1b: Creating Ground Truth Kern (Zeng Vocab) ===")
+        # Read seed from model config
+        import yaml
+        with open(args.model_config) as _f:
+            _cfg = yaml.safe_load(_f)
+        data_aug_seed = _cfg.get('seed', {}).get('data_augmentation', 0)
         gt_results = create_ground_truth_kern(
             output_dir=args.output_dir,
-            seed=42,
+            seed=data_aug_seed,
         )
         gt_success = sum(1 for v in gt_results.values() if v == "success")
         logger.info(f"Phase 1b complete: {gt_success}/{len(gt_results)} successful")

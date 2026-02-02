@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -213,28 +214,42 @@ class Trainer:
         self.optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
+            # Skip batches where all samples were filtered out
+            if batch is None:
+                continue
+
             # Move to device
             mel = batch['mel'].to(self.device)
             input_ids = batch['input_ids'].to(self.device)
             labels = batch['labels'].to(self.device)
             mel_valid_ratios = batch['mel_valid_ratios'].to(self.device)
 
-            # Forward pass with mixed precision
-            with torch.amp.autocast('cuda', dtype=self.autocast_dtype):
-                logits, loss = self.model(
-                    mel=mel,
-                    input_ids=input_ids,
-                    labels=labels,
-                    mel_valid_ratios=mel_valid_ratios,
-                )
-                # Scale loss for gradient accumulation
-                loss = loss / self.gradient_accumulation_steps
+            # Skip DDP all-reduce on non-update micro-batches to save
+            # communication overhead during gradient accumulation.
+            is_update_step = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+            maybe_no_sync = (
+                self.model.no_sync()
+                if isinstance(self.model, DDP) and not is_update_step
+                else nullcontext()
+            )
 
-            # Backward pass
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            with maybe_no_sync:
+                # Forward pass with mixed precision
+                with torch.amp.autocast('cuda', dtype=self.autocast_dtype):
+                    logits, loss = self.model(
+                        mel=mel,
+                        input_ids=input_ids,
+                        labels=labels,
+                        mel_valid_ratios=mel_valid_ratios,
+                    )
+                    # Scale loss for gradient accumulation
+                    loss = loss / self.gradient_accumulation_steps
+
+                # Backward pass
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
             accumulated_loss += loss.item() * self.gradient_accumulation_steps
 
@@ -262,7 +277,8 @@ class Trainer:
                     log_dict = {
                         'train/loss': accumulated_loss,
                         'train/grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
-                        'train/lr': self.scheduler.get_last_lr()[0],
+                        'train/lr_base': self.scheduler.get_last_lr()[1],
+                        'train/lr_offset': self.scheduler.get_last_lr()[0],
                         'train/epoch': self.epoch,
                         'system/gpu_memory_gb': torch.cuda.max_memory_allocated(self.device) / 1024**3,
                     }
@@ -271,7 +287,7 @@ class Trainer:
                 # Update progress bar
                 pbar.set_postfix({
                     'loss': f'{accumulated_loss:.4f}',
-                    'lr': f'{self.scheduler.get_last_lr()[0]:.2e}',
+                    'lr': f'{self.scheduler.get_last_lr()[1]:.2e}',
                     'grad': f'{grad_norm:.2f}' if hasattr(grad_norm, '__float__') else 'N/A',
                 })
 
@@ -565,16 +581,20 @@ def main():
             logger.info('Please run the data preparation script first.')
             return
 
+        aug_metadata_path = manifest_dir / 'augmentation_metadata.json'
+
         train_dataset = ManifestDataset(
             train_manifest,
             tokenizer=tokenizer,
             max_seq_len=config.max_seq_len,
+            augmentation_metadata_path=aug_metadata_path,
         )
 
         # Optionally chunk long pieces
         if hasattr(config, 'chunk_frames') and config.chunk_frames > 0:
             train_dataset = ChunkedDataset(
                 train_dataset,
+                tokenizer=tokenizer,
                 chunk_frames=config.chunk_frames,
                 overlap_frames=config.overlap_frames,
                 min_chunk_ratio=config.min_chunk_ratio,
@@ -586,7 +606,19 @@ def main():
                 valid_manifest,
                 tokenizer=tokenizer,
                 max_seq_len=config.max_seq_len,
+                augmentation_metadata_path=aug_metadata_path,
             )
+            # Chunk validation set too: ensures mel-kern alignment and
+            # prevents OOM on long pieces (some valid pieces > 10 min).
+            # No overlap needed for validation (just computing loss).
+            if hasattr(config, 'chunk_frames') and config.chunk_frames > 0:
+                valid_dataset = ChunkedDataset(
+                    valid_dataset,
+                    tokenizer=tokenizer,
+                    chunk_frames=config.chunk_frames,
+                    overlap_frames=0,
+                    min_chunk_ratio=config.min_chunk_ratio,
+                )
 
         # Create collator
         collator = ClefCollator(

@@ -42,7 +42,7 @@ model:
   # Content-Dependent Reference Points (key innovation)
   use_time_prior: true      # time_prior(tgt_pos) -> time location
   use_freq_prior: true      # freq_prior(tgt) -> freq region (stream tracking)
-  n_freq_groups: 4          # Per-head freq_prior (4 groups x 2 heads = 8 heads)
+  n_freq_groups: 1          # Single shared freq_prior (baseline)
   refine_range: 0.1         # +/-10% refinement
 
   # Bridge
@@ -102,14 +102,14 @@ data:
 # =============================================================================
 training:
   distributed:
-    enabled: false
+    enabled: true
     backend: "nccl"
-    num_gpus: 1
+    num_gpus: 2
 
   precision: "bf16"
-  batch_size: 2             # per GPU
+  batch_size: 1             # per GPU
   gradient_accumulation_steps: 2
-  effective_batch_size: 4   # 1 GPU x 2 batch x 2 accum
+  effective_batch_size: 4   # 2 GPUs x 1 batch x 2 accum
 
   learning_rate: 2.0e-5      # Base LR; offset params use 0.1x (2e-6)
   weight_decay: 0.01
@@ -125,7 +125,7 @@ training:
   wandb:
     enabled: true
     project: "clef-piano-base"
-    tags: ["piano", "a2s", "swin", "clef-attention", "multi-head", "a6000"]
+    tags: ["piano", "a2s", "swin", "clef-attention", "single-head", "ddp"]
 
 # =============================================================================
 # Paths
@@ -133,4 +133,4 @@ training:
 paths:
   data_dir: "data/datasets"
   output_dir: "data/experiments/clef_piano_base"
-  checkpoint_dir: "checkpoints/clef_piano_base_multi_head"
+  checkpoint_dir: "checkpoints/clef_piano_base_single_head"
