@@ -42,6 +42,10 @@ SPECIAL_TOKENS = {
     "<bar>": 5,      # Bar line
     "<b>": 6,        # Beat boundary
     "<continue>": 7, # Chunk boundary (piece continues in next chunk)
+    "<nl>": 8,       # Newline (line separator within measure)
+    "<split>": 9,    # Spine split (*^)
+    "<merge>": 10,   # Spine merge (*v)
+    "<*>": 11,       # Null interpretation (* in split/merge lines)
 }
 
 # Duration tokens (Zeng vocab compatible)
@@ -281,35 +285,45 @@ class KernTokenizer:
                 result.append(char)
             remaining = remaining[tie_start_match.end():]
 
-        # 2. Extract duration
-        dur_match = self._duration_pattern.match(remaining)
+        # 2. Strip beam markers early (L, J, K, k) - never included in output
+        remaining = self._beam_pattern.sub('', remaining)
+
+        # 3. Extract grace note marker (q, Q, P) from anywhere
+        grace_match = self._grace_pattern.search(remaining)
+        grace_token = None
+        if grace_match:
+            grace_token = grace_match.group()
+            remaining = remaining[:grace_match.start()] + remaining[grace_match.end():]
+
+        # 4. Extract pitch (from anywhere in remaining)
+        pitch_token = None
+        pitch_match = self._pitch_pattern.search(remaining)
+        if pitch_match:
+            pitch_token = pitch_match.group(1)
+            remaining = remaining[:pitch_match.start()] + remaining[pitch_match.end():]
+
+        # 5. Extract duration (from what's left — may be at start or after
+        #    removing pitch/grace from non-standard orderings like "a8q")
+        dur_match = re.search(r'(\d+\.?)', remaining)
         if dur_match:
             duration = dur_match.group(1)
             result.append(duration)
-            remaining = remaining[dur_match.end():]
+            remaining = remaining[:dur_match.start()] + remaining[dur_match.end():]
 
-        # 3. Check for grace note marker
-        grace_match = self._grace_pattern.search(remaining)
-        if grace_match:
-            result.append(grace_match.group())
-            remaining = remaining[:grace_match.start()] + remaining[grace_match.end():]
+        # 6. Emit grace note marker (after duration, before pitch)
+        if grace_token:
+            result.append(grace_token)
 
-        # 4. Extract pitch (including accidentals)
-        pitch_match = self._pitch_pattern.search(remaining)
-        if pitch_match:
-            pitch = pitch_match.group(1)
-            result.append(pitch)
-            remaining = remaining[:pitch_match.start()] + remaining[pitch_match.end():]
+        # 7. Emit pitch
+        if pitch_token:
+            result.append(pitch_token)
 
-        # 5. Extract trailing tie markers
+        # 8. Extract trailing tie markers from what's left
         tie_end_match = self._tie_end_pattern.search(remaining)
         if tie_end_match:
             for char in tie_end_match.group():
                 result.append(char)
             remaining = remaining[:tie_end_match.start()]
-
-        # 6. Strip beam markers (L, J, K, k) - don't include in output
-        remaining = self._beam_pattern.sub('', remaining)
 
         # If nothing was extracted, return as unknown
         if not result:
@@ -334,9 +348,30 @@ class KernTokenizer:
         if not line:
             return []
 
-        # Skip comments and interpretations
-        if line.startswith("!") or line.startswith("*"):
+        # Skip comments
+        if line.startswith("!"):
             return []
+
+        # Handle spine split/merge interpretation lines
+        if line.startswith("*"):
+            fields = line.split("\t")
+            has_split_merge = any(f in ("*^", "*v") for f in fields)
+            if not has_split_merge:
+                # Regular interpretation (clef, key sig, etc.) — skip
+                return []
+
+            # Tokenize spine split/merge: *^ -> <split>, *v -> <merge>, * -> <*>
+            result = []
+            for i, field in enumerate(fields):
+                if i > 0:
+                    result.append("<coc>")
+                if field == "*^":
+                    result.append("<split>")
+                elif field == "*v":
+                    result.append("<merge>")
+                else:
+                    result.append("<*>")
+            return result
 
         # Handle bar lines
         if line.startswith("="):
@@ -365,6 +400,10 @@ class KernTokenizer:
     def tokenize(self, kern_content: str) -> List[str]:
         """Tokenize entire kern content.
 
+        Inserts <nl> between consecutive data lines within a measure.
+        <bar> tokens already imply a line break, so <nl> is NOT inserted
+        before or after <bar>.
+
         Args:
             kern_content: Full kern file content or sequence
 
@@ -372,11 +411,21 @@ class KernTokenizer:
             List of all tokens (factorized)
         """
         result = ["<sos>"]
+        prev_was_data = False  # Was the previous emitted line a data line?
 
         for line in kern_content.split("\n"):
             line_tokens = self.tokenize_line(line)
-            if line_tokens:
-                result.extend(line_tokens)
+            if not line_tokens:
+                continue
+
+            is_bar = (line_tokens == ["<bar>"])
+
+            # Insert <nl> between consecutive data lines within a measure
+            if prev_was_data and not is_bar:
+                result.append("<nl>")
+
+            result.extend(line_tokens)
+            prev_was_data = not is_bar
 
         result.append("<eos>")
         return result
@@ -417,13 +466,19 @@ class KernTokenizer:
         """Reconstruct kern string from factorized tokens.
 
         This is the inverse of tokenization - combines duration and pitch
-        back into single kern tokens.
+        back into single kern tokens. Handles <nl> as line separator.
         """
         result = []
         current_note = []
 
         for token in tokens:
-            if token == "<coc>":
+            if token == "<nl>":
+                # Line separator: flush and insert newline
+                if current_note:
+                    result.append("".join(current_note))
+                    current_note = []
+                result.append("\n")
+            elif token == "<coc>":
                 # End current note, add tab
                 if current_note:
                     result.append("".join(current_note))
@@ -450,6 +505,17 @@ class KernTokenizer:
             elif token in ["[", "]", "(", ")", "{", "}", "q", "Q", "P", ";"]:
                 # Modifiers
                 current_note.append(token)
+            elif token in ("<split>", "<merge>", "<*>"):
+                # Spine structure tokens — emit as kern interpretation
+                if current_note:
+                    result.append("".join(current_note))
+                    current_note = []
+                if token == "<split>":
+                    result.append("*^")
+                elif token == "<merge>":
+                    result.append("*v")
+                else:
+                    result.append("*")
             elif token == "<unk>":
                 if current_note:
                     result.append("".join(current_note))
@@ -462,7 +528,14 @@ class KernTokenizer:
         if current_note:
             result.append("".join(current_note))
 
-        return " ".join(result)
+        # Smart join: space between note tokens, no space around structural chars
+        STRUCTURAL = ("\t", "\n", "\n=\n")
+        output = []
+        for i, item in enumerate(result):
+            if i > 0 and item not in STRUCTURAL and result[i - 1] not in STRUCTURAL:
+                output.append(" ")
+            output.append(item)
+        return "".join(output)
 
     def get_vocab_size(self) -> int:
         """Return vocabulary size."""

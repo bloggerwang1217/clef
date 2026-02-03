@@ -267,15 +267,16 @@ class Trainer:
                 self.scheduler.step()
                 self.optimizer.zero_grad()
 
-                # Update metrics
-                total_loss += accumulated_loss
+                # Update metrics (average over accumulation steps)
+                avg_accum_loss = accumulated_loss / self.gradient_accumulation_steps
+                total_loss += avg_accum_loss
                 num_batches += 1
                 self.global_step += 1
 
                 # Log to wandb (use commit=False to avoid step conflicts)
                 if self.use_wandb:
                     log_dict = {
-                        'train/loss': accumulated_loss,
+                        'train/loss': avg_accum_loss,
                         'train/grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
                         'train/lr_base': self.scheduler.get_last_lr()[1],
                         'train/lr_offset': self.scheduler.get_last_lr()[0],
@@ -286,7 +287,7 @@ class Trainer:
 
                 # Update progress bar
                 pbar.set_postfix({
-                    'loss': f'{accumulated_loss:.4f}',
+                    'loss': f'{avg_accum_loss:.4f}',
                     'lr': f'{self.scheduler.get_last_lr()[1]:.2e}',
                     'grad': f'{grad_norm:.2f}' if hasattr(grad_norm, '__float__') else 'N/A',
                 })

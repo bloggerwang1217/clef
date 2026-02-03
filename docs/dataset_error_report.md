@@ -264,3 +264,74 @@ while j < len(text) and text[j] in (...):  # 加入邊界檢查
 
 - [x] 在 `sanitize_piano_score.py` 實作 workaround
 - [ ] 向 converter21 作者 Greg Chapman 回報此問題
+
+---
+
+# Humdrum Chopin First Editions — 資料品質錯誤報告
+
+> 調查日期：2026-02-03
+> 資料來源：[Humdrum Chopin First Editions](https://github.com/pl-wnifc/humdrum-chopin-first-editions)
+> 跳過清單：`src/datasets/syn/skip_files.txt`
+
+## 摘要
+
+8 首 Chopin kern_gt 檔案因**原始 Humdrum 編碼的品質問題**無法通過 converter21 轉換為 MIDI。
+問題分為兩大類：
+
+| 類別 | 數量 | 本質 |
+|------|------|------|
+| Spine split 區段小節溢出（negative delta time） | 6 | `*^` split 後的 sub-spine 音符總時值超過拍號 |
+| 不可表示的 quarterLength | 2 | 原始 kern 使用非標準 duration，converter21 無法精確轉換 |
+
+這些是 Humdrum 手動編碼的錯誤，非 pipeline 問題。8/723 = **1.1% 損失率**。
+
+---
+
+## 類別一：Negative Delta Time（6 首）
+
+### 問題描述
+
+converter21 將 kern 轉為 music21 Score 再寫入 MIDI 時，計算出負的 `offsetInScore`。
+根本原因是原始 kern 檔案在 `*^` spine split 區段中，sub-spine 的音符總時值超過了小節拍號允許的長度，
+導致下一個事件的 offset 比前一個事件更早。
+
+### 受影響檔案
+
+| 檔案 | Chopin 作品 |
+|------|------------|
+| `009-1-KI-003` | Nocturne Op. 9 No. 1 |
+| `023-1-BH` | Ballade No. 1, Op. 23 |
+| `028_1-12-1a-C-005` | Prelude Op. 28 No. 5 |
+| `028_13-24-1a-C-013` | Prelude Op. 28 No. 13 |
+| `055-1-BH-002` | Nocturne Op. 55 No. 1 |
+| `060-1-BH` | Barcarolle, Op. 60 |
+
+### Pipeline 處理歷程
+
+- `fix_kern_spine_timing` 曾經修復 48 → 14 首的 spine timing 問題（救回 34 首）
+- 移除 Phase 1 的 `expand_tuplets_to_zeng_vocab` 再救回 9 首
+- 這 6 首的 timing 錯誤存在於原始編碼中，無法自動修正
+
+---
+
+## 類別二：不可表示的 quarterLength（2 首）
+
+### 問題描述
+
+原始 kern 使用的 duration 值（如 `0.6875` quarterLength）無法被 music21 精確轉換為標準音符時值類型。
+這通常是編碼者用 triplet duration（`12`, `6`）近似複雜節奏所致，留下不完整的 tuplet group。
+
+### 受影響檔案
+
+| 檔案 | Chopin 作品 | 錯誤訊息 |
+|------|------------|----------|
+| `021-1a-BH-001` | Nocturne Op. 21 (posth.) | `cannot convert quarterLength 0.6875 exactly to type` |
+| `021-1a-BH-002` | Nocturne Op. 21 (posth.) | 同上 |
+
+---
+
+## 結論
+
+- 8 首全部是 Humdrum 手動編碼的品質問題，非 clef pipeline 的 bug
+- 成功率 715/723 = **98.9%**
+- 這些檔案已列入 `src/datasets/syn/skip_files.txt`，Phase 2 自動跳過

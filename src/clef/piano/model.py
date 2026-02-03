@@ -105,6 +105,31 @@ class ClefPianoBase(nn.Module):
         # Causal mask cache
         self._causal_mask_cache: Dict[int, torch.Tensor] = {}
 
+        # Standard weight initialization for stable training
+        # Skip Swin (pretrained) — only init bridge, decoder, embeddings, output_head
+        self.bridge.apply(self._init_weights)
+        self.decoder.apply(self._init_weights)
+        self._init_weights(self.token_embed)
+        self._init_weights(self.output_head)
+
+        # Re-apply special initialization for reference point predictors
+        # (must come after _init_weights to override the generic init)
+        for layer in self.decoder.layers:
+            layer._init_reference_predictors()
+
+    @staticmethod
+    def _init_weights(module: nn.Module):
+        """Initialize weights following GPT-2 / BART convention.
+
+        Skips Swin V2 (frozen pretrained) and LayerNorm (default init is fine).
+        """
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.Embedding):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+
     def encode(
         self,
         mel: torch.Tensor,  # [B, 1, 128, T]
