@@ -91,6 +91,7 @@ def load_augmentation_config(config_path: Path = DEFAULT_AUG_CONFIG) -> Dict[str
         'tempo_enabled': tempo_enabled,
         'tempo_range': tempo_range,
         'train_soundfonts': config['soundfonts']['train'],
+        'valid_soundfonts': config['soundfonts']['valid'],
         'test_soundfonts': config['soundfonts']['test'],
         'num_versions': config['num_versions'],
     }
@@ -171,6 +172,7 @@ def generate_metadata(
     tempo_enabled = aug_config['tempo_enabled']
     tempo_range = aug_config['tempo_range']
     train_soundfonts = aug_config['train_soundfonts']
+    valid_soundfonts = aug_config['valid_soundfonts']
     test_soundfonts = aug_config['test_soundfonts']
     num_versions = aug_config['num_versions']
 
@@ -263,6 +265,14 @@ def generate_metadata(
 
         n_versions = num_versions[split]
 
+        # Determine soundfonts list for this split
+        if split == "train":
+            split_soundfonts = train_soundfonts
+        elif split == "valid":
+            split_soundfonts = valid_soundfonts
+        else:  # test
+            split_soundfonts = test_soundfonts
+
         for version in range(n_versions):
             # Reproduce random choices (same order as _process_single_kern)
             if split == "train":
@@ -272,17 +282,22 @@ def generate_metadata(
                 else:
                     transpose = 0
                 # Soundfont selection: deterministic mapping (version -> soundfont)
-                # Zeng original: random.choice() which causes duplicate soundfonts
-                # Our choice: version % len(soundfonts) ensures each soundfont appears once
-                soundfont = train_soundfonts[version % len(train_soundfonts)]
-            else:
+                soundfont = split_soundfonts[version % len(split_soundfonts)]
+            elif split == "valid":
                 transpose = 0
-                soundfont = test_soundfonts[0]
+                soundfont = split_soundfonts[0]
+            else:  # test: one version per soundfont, deterministic
+                transpose = 0
+                soundfont = split_soundfonts[version % len(split_soundfonts)]
 
             # Build audio name (same as _process_single_kern)
             # Note: key is without .wav extension for easier lookup
-            version_suffix = f"_v{version}" if n_versions > 1 else ""
-            audio_key = f"{stem}{version_suffix}~{soundfont[:-4]}"
+            # Train uses _v{N} suffix; valid/test use soundfont name as differentiator
+            if split == "train":
+                version_suffix = f"_v{version}"
+                audio_key = f"{stem}{version_suffix}~{soundfont[:-4]}"
+            else:
+                audio_key = f"{stem}~{soundfont[:-4]}"
 
             metadata[audio_key] = {
                 "kern_file": f"{stem}.krn",

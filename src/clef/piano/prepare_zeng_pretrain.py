@@ -84,6 +84,7 @@ def load_augmentation_config(config_path: Path = DEFAULT_AUG_CONFIG) -> Dict[str
         - tempo_enabled: bool
         - tempo_range: tuple (min_scale, max_scale)
         - train_soundfonts: list
+        - valid_soundfonts: list
         - test_soundfonts: list
         - num_versions: dict
     """
@@ -119,6 +120,7 @@ def load_augmentation_config(config_path: Path = DEFAULT_AUG_CONFIG) -> Dict[str
         'tempo_enabled': tempo_enabled,
         'tempo_range': tempo_range,
         'train_soundfonts': config['soundfonts']['train'],
+        'valid_soundfonts': config['soundfonts']['valid'],
         'test_soundfonts': config['soundfonts']['test'],
         'num_versions': config['num_versions'],
     }
@@ -772,24 +774,28 @@ def _process_single_kern(args: Tuple) -> Tuple[Dict[str, str], Dict[str, Dict]]:
             else:
                 transpose = 0  # No transpose - preserves piano voicing patterns
             # Soundfont selection: deterministic mapping (version -> soundfont)
-            # Zeng original: random.choice() which causes duplicate soundfonts across versions
-            # Our choice: version % len(soundfonts) ensures each soundfont appears exactly once
-            # Tempo is still random (via MIDIProcess.random_scaling), maintaining Zeng's spirit
             soundfont = available_soundfonts[version % len(available_soundfonts)]
-        else:
+        elif split == "valid":
             transpose = 0
             soundfont = available_soundfonts[0]
+        else:  # test: one version per soundfont, deterministic
+            transpose = 0
+            soundfont = available_soundfonts[version % len(available_soundfonts)]
 
         # Build output names
-        version_suffix = f"_v{version}" if num_versions > 1 else ""
-        midi_name = f"{stem}{version_suffix}.mid"
-        audio_name = f"{stem}{version_suffix}~{soundfont[:-4]}.wav"
+        # Train uses _v{N} suffix; valid/test use soundfont name as differentiator
+        if split == "train":
+            version_suffix = f"_v{version}"
+            midi_name = f"{stem}{version_suffix}.mid"
+            audio_name = f"{stem}{version_suffix}~{soundfont[:-4]}.wav"
+            audio_key = f"{stem}{version_suffix}~{soundfont[:-4]}"
+        else:
+            midi_name = f"{stem}~{soundfont[:-4]}.mid"
+            audio_name = f"{stem}~{soundfont[:-4]}.wav"
+            audio_key = f"{stem}~{soundfont[:-4]}"
 
         midi_path = midi_dir / midi_name
         audio_path = audio_dir / audio_name
-
-        # Audio key for metadata (without .wav extension)
-        audio_key = f"{stem}{version_suffix}~{soundfont[:-4]}"
 
         # Check if audio already exists
         audio_exists = audio_path.exists()
@@ -945,6 +951,7 @@ def phase2_kern_to_audio(
     tempo_enabled = aug_config['tempo_enabled']
     tempo_range = aug_config['tempo_range']
     train_soundfonts = aug_config['train_soundfonts']
+    valid_soundfonts = aug_config['valid_soundfonts']
     test_soundfonts = aug_config['test_soundfonts']
     num_versions_config = aug_config['num_versions']
 
@@ -988,13 +995,19 @@ def phase2_kern_to_audio(
         if skip_files:
             logger.info(f"Skipping {len(skip_files)} files from skip_files.txt")
 
-    # Check available soundfonts (train and test separately)
+    # Check available soundfonts (train, valid, test separately)
     available_train_soundfonts = [sf for sf in train_soundfonts if (soundfont_dir / sf).exists()]
+    available_valid_soundfonts = [sf for sf in valid_soundfonts if (soundfont_dir / sf).exists()]
     available_test_soundfonts = [sf for sf in test_soundfonts if (soundfont_dir / sf).exists()]
 
     if not available_train_soundfonts:
         logger.error(f"No train soundfonts found in {soundfont_dir}")
         logger.info(f"Expected soundfonts: {train_soundfonts}")
+        return {}
+
+    if not available_valid_soundfonts:
+        logger.error(f"No valid soundfonts found in {soundfont_dir}")
+        logger.info(f"Expected soundfonts: {valid_soundfonts}")
         return {}
 
     if not available_test_soundfonts:
@@ -1003,6 +1016,7 @@ def phase2_kern_to_audio(
         return {}
 
     logger.info(f"Available train soundfonts: {available_train_soundfonts}")
+    logger.info(f"Available valid soundfonts: {available_valid_soundfonts}")
     logger.info(f"Available test soundfonts: {available_test_soundfonts}")
 
     # Prepare task list
@@ -1030,8 +1044,13 @@ def phase2_kern_to_audio(
                     break
 
         n_versions = num_versions_config[split]
-        # Use train soundfonts for train, test soundfonts for valid/test
-        soundfonts_for_split = available_train_soundfonts if split == "train" else available_test_soundfonts
+        # Each split uses its own soundfont list
+        if split == "train":
+            soundfonts_for_split = available_train_soundfonts
+        elif split == "valid":
+            soundfonts_for_split = available_valid_soundfonts
+        else:  # test
+            soundfonts_for_split = available_test_soundfonts
 
         tasks.append((kern_path, output_dir, soundfont_dir, split, n_versions, soundfonts_for_split,
                       transpose_enabled, feasible_transposes, tempo_enabled, tempo_range, musesyn_dir))
