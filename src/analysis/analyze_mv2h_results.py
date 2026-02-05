@@ -674,7 +674,7 @@ def plot_success_rate_by_position(
     styles = {
         "MT3 + MuseScore": {"color": "#DC267F", "label": "MT3 + MuseScore (Pipeline)"},
         "Transkun + Beyer": {"color": "#FE6100", "label": "Transkun + Beyer & Dai (Pipeline)"},
-        "Zeng (E2E)": {"color": "#648FFF", "label": "Zeng et al. (E2E)"},
+        "Zeng (E2E)": {"color": "#648FFF", "label": "Zeng et al. (E2E*)"},
     }
 
     for name, csv_path in csv_paths.items():
