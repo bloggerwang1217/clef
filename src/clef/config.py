@@ -23,6 +23,12 @@ class ClefConfig:
     swin_dims: List[int] = field(default_factory=lambda: [96, 192, 384, 768])
     freeze_encoder: bool = True
 
+    # === HarmonicFlow (pitch space transform) ===
+    use_flow: bool = False
+    n_harmonics: int = 6
+    flow_init: str = 'harmonic'  # 'harmonic' (physics) or 'orthogonal' (random)
+    flow_pool_stride: int = 4    # Temporal pooling to match Swin S0 resolution
+
     # === Deformable Attention (CLEF) ===
     d_model: int = 512
     n_heads: int = 8
@@ -65,6 +71,10 @@ class ClefConfig:
         """Validate configuration."""
         assert self.n_heads > 0, "n_heads must be positive"
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
-        assert self.n_levels == len(self.swin_dims), "n_levels must match swin_dims"
+        expected_levels = len(self.swin_dims) + (1 if self.use_flow else 0)
+        assert self.n_levels == expected_levels, (
+            f"n_levels({self.n_levels}) must be swin_dims({len(self.swin_dims)}) "
+            f"+ flow({1 if self.use_flow else 0}) = {expected_levels}"
+        )
         assert self.n_points_freq > 0, "n_points_freq must be positive"
         assert self.n_points_time > 0, "n_points_time must be positive"

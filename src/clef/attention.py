@@ -29,16 +29,20 @@ Generality:
 Design:
 - Separate n_points_freq / n_points_time for flexibility (but typically equal)
 - Separate freq_offset_scale / time_offset_scale (but typically equal for square)
+- Decoupled level-point attention: level selection (softmax over L) and point
+  selection (softmax over K per level) use separate gradient paths, with
+  level bias initialization for scale-axis specialization (analogous to
+  freq_group for frequency-axis specialization)
 """
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ClefAttention(nn.Module):
+class FluxAttention(nn.Module):
     """CLEF Attention with content-aware spatial priors and square sampling.
 
     Key design choices:
@@ -57,10 +61,10 @@ class ClefAttention(nn.Module):
         d_model: int = 512,
         n_levels: int = 4,
         n_heads: int = 8,
-        n_points_freq: int = 2,         # Frequency direction: local detail
-        n_points_time: int = 2,         # Time direction: local detail
-        freq_offset_scale: float = 0.15,  # +/-15% (same as time for square)
-        time_offset_scale: float = 0.15,  # +/-15% (same as freq for square)
+        n_points_freq: int = 2,        # Frequency direction: local detail
+        n_points_time: int = 2,        # Time direction: local detail
+        freq_offset_scale: float = 1.0,  # ±1 pixel in feature map space
+        time_offset_scale: float = 1.0,  # ±1 pixel in feature map space
     ):
         super().__init__()
 
@@ -85,11 +89,13 @@ class ClefAttention(nn.Module):
             n_heads * n_levels * n_points_freq
         )
 
-        # Attention weights: for all sampling points
-        self.attention_weights = nn.Linear(
-            d_model,
-            n_heads * n_levels * self.n_points
-        )
+        # Decoupled level-point attention (inspired by auditory cortex):
+        # Level selection and point selection use separate softmax, so level
+        # specialization gets its own gradient path independent of point weights.
+        # Analogous to freq_group for frequency axis — this provides inductive
+        # bias for scale (resolution) axis.
+        self.level_weights = nn.Linear(d_model, n_heads * n_levels)
+        self.point_weights = nn.Linear(d_model, n_heads * n_levels * self.n_points)
 
         # Value projection
         self.value_proj = nn.Linear(d_model, d_model)
@@ -98,31 +104,25 @@ class ClefAttention(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        """Initialize with square distribution.
+        """Initialize with square grid and level-specialization bias.
 
-        Visualization (n_points_time=2, n_points_freq=2, offset_scale=0.15):
+        Offset initialization (offset_scale=1.0, Deformable DETR style):
+        - Bias = ±0.5 pixel in feature map space (within tanh linear region)
+        - After spatial normalization: Level 0 (H=32) -> ±0.5/32 = ±0.016
+          Level 3 (H=4) -> ±0.5/4 = ±0.125. Actual 2x2 grid, not degenerate.
 
-        freq ^
-             |             |
-             |   . ─ .     |  <- freq = +0.15
-             |   │ x │     |  <- reference (freq_prior decides)
-             |   . ─ .     |  <- freq = -0.15
-             |             |
-             +─────────────+
-                   │
-              time: -0.15, +0.15
-
-        Key: x position is decided by freq_prior(tgt)
-        Not fixed at 0.5, but dynamically adjusted based on content
+        Level bias initialization (inspired by freq_group success):
+        - Each pair of heads has a soft preference for one level
+        - Analogous to auditory cortex: different regions handle different
+          temporal integration windows (fine detail vs structure)
+        - Head 0,1 -> Level 0 (+1.0 bias), Head 2,3 -> Level 1, etc.
+        - softmax(+1.0, 0, 0, 0) ≈ (0.45, 0.18, 0.18, 0.18): soft, learnable
         """
         # === Time offset initialization ===
         nn.init.constant_(self.time_offset_proj.weight, 0.)
 
-        time_init = torch.linspace(
-            -self.time_offset_scale,
-            self.time_offset_scale,
-            self.n_points_time
-        )
+        # Bias: ±0.5 pixel spread (atanh(0.5/scale) puts it in tanh linear region)
+        time_init = torch.linspace(-0.5, 0.5, self.n_points_time)
 
         time_bias = time_init.view(1, 1, self.n_points_time)
         time_bias = time_bias.expand(self.n_heads, self.n_levels, -1)
@@ -133,11 +133,7 @@ class ClefAttention(nn.Module):
         # === Freq offset initialization ===
         nn.init.constant_(self.freq_offset_proj.weight, 0.)
 
-        freq_init = torch.linspace(
-            -self.freq_offset_scale,
-            self.freq_offset_scale,
-            self.n_points_freq
-        )
+        freq_init = torch.linspace(-0.5, 0.5, self.n_points_freq)
 
         freq_bias = freq_init.view(1, 1, self.n_points_freq)
         freq_bias = freq_bias.expand(self.n_heads, self.n_levels, -1)
@@ -145,15 +141,61 @@ class ClefAttention(nn.Module):
         with torch.no_grad():
             self.freq_offset_proj.bias.copy_(freq_bias.flatten())
 
-        # === Attention weights initialization: uniform ===
-        nn.init.constant_(self.attention_weights.weight, 0.)
-        nn.init.constant_(self.attention_weights.bias, 0.)
+        # === Level weights: soft level-specialization bias ===
+        # Each pair of heads prefers a different level (independent of freq_group).
+        # Frequency axis (bass/soprano) and scale axis (detail/structure) are
+        # orthogonal — a bass head may need fine detail (Level 0) or broad
+        # context (Level 3) depending on the musical content.
+        nn.init.constant_(self.level_weights.weight, 0.)
+
+        level_bias = torch.zeros(self.n_heads, self.n_levels)
+        heads_per_level = max(1, self.n_heads // self.n_levels)
+        for lvl in range(self.n_levels):
+            start_head = lvl * heads_per_level
+            end_head = min(start_head + heads_per_level, self.n_heads)
+            level_bias[start_head:end_head, lvl] = 1.0
+
+        with torch.no_grad():
+            self.level_weights.bias.copy_(level_bias.flatten())
+
+        # === Point weights: uniform initialization ===
+        nn.init.constant_(self.point_weights.weight, 0.)
+        nn.init.constant_(self.point_weights.bias, 0.)
 
         # === Projection layers: Xavier ===
         nn.init.xavier_uniform_(self.value_proj.weight)
         nn.init.constant_(self.value_proj.bias, 0.)
         nn.init.xavier_uniform_(self.output_proj.weight)
         nn.init.constant_(self.output_proj.bias, 0.)
+
+    def compute_value_cache(
+        self,
+        value: torch.Tensor,              # [B, N_v, D]
+        spatial_shapes: torch.Tensor,     # [L, 2]
+        level_start_index: torch.Tensor,  # [L]
+    ) -> List[torch.Tensor]:
+        """Pre-compute projected and reshaped values per level for caching.
+
+        Call once per chunk, reuse across all decoding steps.
+
+        Returns:
+            List of [B*H, D_head, H_l, W_l] tensors, one per level.
+        """
+        B, N_v, _ = value.shape
+        value = self.value_proj(value)  # [B, N_v, D]
+        value = value.view(B, N_v, self.n_heads, self.head_dim)  # [B, N_v, H, D_head]
+
+        level_values = []
+        for lid in range(self.n_levels):
+            H_l, W_l = spatial_shapes[lid].tolist()
+            start = level_start_index[lid].item()
+            end = start + H_l * W_l
+            value_l = value[:, start:end, :, :]  # [B, H_l*W_l, H, D_head]
+            value_l = value_l.permute(0, 2, 3, 1)  # [B, H, D_head, H_l*W_l]
+            value_l = value_l.reshape(B * self.n_heads, self.head_dim, H_l, W_l)
+            level_values.append(value_l)
+
+        return level_values
 
     def forward(
         self,
@@ -163,6 +205,7 @@ class ClefAttention(nn.Module):
         spatial_shapes: torch.Tensor,     # [L, 2] each level's (H, W)
         level_start_index: torch.Tensor,  # [L] start index in value for each level
         valid_ratios: Optional[torch.Tensor] = None,  # [B, L, 2] padding valid ratios
+        value_cache: Optional[List[torch.Tensor]] = None,  # from compute_value_cache
     ) -> torch.Tensor:
         """Forward pass with content-aware deformable attention.
 
@@ -176,12 +219,12 @@ class ClefAttention(nn.Module):
             spatial_shapes: Spatial shape (H, W) for each level [L, 2]
             level_start_index: Start index in value for each level [L]
             valid_ratios: Valid ratio for padding handling [B, L, 2]
+            value_cache: Pre-computed per-level value maps (skips value_proj)
 
         Returns:
             Output features [B, N_q, D]
         """
         B, N_q, _ = query.shape
-        _, N_v, _ = value.shape
         Kt = self.n_points_time
         Kf = self.n_points_freq
 
@@ -244,26 +287,38 @@ class ClefAttention(nn.Module):
         # Clamp to [0, 1]
         sampling_locations = sampling_locations.clamp(0, 1)
 
-        # === 4. Attention weights ===
+        # === 4. Decoupled level-point attention weights ===
+        # Level selection: softmax over L (which resolution?)
+        # Point selection: softmax over K per level (where within that level?)
+        # Final weight = level_weight[l] * point_weight[l,k]
+        # This gives level selection its own gradient path.
 
-        attention_weights = self.attention_weights(query)
-        attention_weights = attention_weights.view(
-            B, N_q, self.n_heads, self.n_levels * self.n_points
-        )
-        attention_weights = F.softmax(attention_weights, dim=-1)
-        attention_weights = attention_weights.view(
-            B, N_q, self.n_heads, self.n_levels, self.n_points
-        )
+        lw = self.level_weights(query)  # [B, N_q, H*L]
+        lw = lw.view(B, N_q, self.n_heads, self.n_levels)
+        lw = F.softmax(lw, dim=-1)  # [B, N_q, H, L]
+
+        pw = self.point_weights(query)  # [B, N_q, H*L*K]
+        pw = pw.view(B, N_q, self.n_heads, self.n_levels, self.n_points)
+        pw = F.softmax(pw, dim=-1)  # [B, N_q, H, L, K]
+
+        # Combine: [B, N_q, H, L, K]
+        attention_weights = lw.unsqueeze(-1) * pw
 
         # === 5. Deformable Attention computation ===
 
-        value = self.value_proj(value)
-        value = value.view(B, N_v, self.n_heads, self.head_dim)
-
-        output = self._deformable_attention_core(
-            value, spatial_shapes, level_start_index,
-            sampling_locations, attention_weights
-        )
+        if value_cache is not None:
+            # Use pre-computed per-level value maps (skip value_proj + reshape)
+            output = self._deformable_attention_core_cached(
+                value_cache, sampling_locations, attention_weights
+            )
+        else:
+            _, N_v, _ = value.shape
+            value = self.value_proj(value)
+            value = value.view(B, N_v, self.n_heads, self.head_dim)
+            output = self._deformable_attention_core(
+                value, spatial_shapes, level_start_index,
+                sampling_locations, attention_weights
+            )
 
         output = self.output_proj(output)
 
@@ -334,6 +389,48 @@ class ClefAttention(nn.Module):
 
         return output
 
+    def _deformable_attention_core_cached(
+        self,
+        level_values: List[torch.Tensor],  # pre-computed [B*H, D_head, H_l, W_l] per level
+        sampling_locations: torch.Tensor,   # [B, N_q, H, L, K, 2]
+        attention_weights: torch.Tensor,    # [B, N_q, H, L, K]
+    ) -> torch.Tensor:
+        """Deformable attention using pre-computed value cache.
+
+        Skips value_proj and per-level reshape (already done in compute_value_cache).
+        """
+        B, N_q, H, L, K, _ = sampling_locations.shape
+        D_head = level_values[0].shape[1]
+
+        # Convert to grid_sample format [-1, 1]
+        sampling_grids = 2 * sampling_locations - 1
+
+        sampling_value_list = []
+
+        for lid in range(L):
+            value_l = level_values[lid]  # [B*H, D_head, H_l, W_l]
+
+            grid_l = sampling_grids[:, :, :, lid, :, :]  # [B, N_q, H, K, 2]
+            grid_l = grid_l.permute(0, 2, 1, 3, 4)  # [B, H, N_q, K, 2]
+            grid_l = grid_l.reshape(B * H, N_q, K, 2)
+
+            sampled = F.grid_sample(
+                value_l, grid_l,
+                mode='bilinear', padding_mode='zeros', align_corners=False,
+            )  # [B*H, D_head, N_q, K]
+
+            sampled = sampled.view(B, H, D_head, N_q, K)
+            sampling_value_list.append(sampled)
+
+        sampling_values = torch.stack(sampling_value_list, dim=-1)
+        sampling_values = sampling_values.permute(0, 3, 1, 2, 5, 4)
+
+        attn_weights = attention_weights.unsqueeze(3)
+        output = (sampling_values * attn_weights).sum(dim=[-1, -2])
+        output = output.reshape(B, N_q, -1)
+
+        return output
+
 
 class DeformableEncoderLayer(nn.Module):
     """Encoder layer with deformable self-attention for multi-scale feature fusion."""
@@ -345,14 +442,14 @@ class DeformableEncoderLayer(nn.Module):
         n_levels: int = 4,
         n_points_freq: int = 2,
         n_points_time: int = 2,
-        freq_offset_scale: float = 0.15,
-        time_offset_scale: float = 0.15,
+        freq_offset_scale: float = 1.0,
+        time_offset_scale: float = 1.0,
         ff_dim: int = 2048,
         dropout: float = 0.1,
     ):
         super().__init__()
 
-        self.self_attn = ClefAttention(
+        self.self_attn = FluxAttention(
             d_model=d_model,
             n_levels=n_levels,
             n_heads=n_heads,

@@ -2,7 +2,7 @@
 Deformable Decoder
 ==================
 
-Transformer decoder with ClefAttention cross-attention.
+Transformer decoder with FluxAttention cross-attention.
 
 Key innovation: Content-Dependent Reference Points
 - time_prior: Predict "which time point to look at" from positional embedding
@@ -14,13 +14,13 @@ Piano application:
 - When predicting left-hand harmony -> freq_prior outputs low value
 """
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .attention import ClefAttention
+from .attention import FluxAttention
 
 
 class DeformableDecoderLayer(nn.Module):
@@ -28,7 +28,7 @@ class DeformableDecoderLayer(nn.Module):
 
     Structure:
     1. Causal Self-Attention (standard)
-    2. ClefAttention with content-dependent reference points
+    2. FluxAttention with content-dependent reference points
     3. FFN
 
     The content-dependent reference points are the key innovation:
@@ -43,8 +43,8 @@ class DeformableDecoderLayer(nn.Module):
         n_levels: int = 4,
         n_points_freq: int = 2,
         n_points_time: int = 2,
-        freq_offset_scale: float = 0.15,
-        time_offset_scale: float = 0.15,
+        freq_offset_scale: float = 1.0,
+        time_offset_scale: float = 1.0,
         ff_dim: int = 2048,
         dropout: float = 0.1,
         use_time_prior: bool = True,
@@ -69,8 +69,18 @@ class DeformableDecoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
-        # 2. ClefAttention (Cross-attention)
-        self.cross_attn = ClefAttention(
+        # 2. FluxAttention (Cross-attention) with gain control
+        # Problem: CA output norm (~3) << residual norm (~22), so CA gets drowned
+        # after residual addition + LayerNorm. Training actively erases any good
+        # initialization (level bias, offset grid) because gradient is too weak.
+        #
+        # Solution (CaiT LayerScale):
+        # ca_gamma: per-channel learnable scale, init=1.0 (following CaiT).
+        # No LayerNorm before gamma — raw CA output norm (~11 with proper init)
+        # naturally reflects feature quality: bad CA → small norm → little impact,
+        # good CA → large norm → decoder can use it. LayerNorm would force all
+        # outputs to ~22.6 regardless of quality, amplifying noise at init.
+        self.cross_attn = FluxAttention(
             d_model=d_model,
             n_levels=n_levels,
             n_heads=n_heads,
@@ -79,6 +89,7 @@ class DeformableDecoderLayer(nn.Module):
             freq_offset_scale=freq_offset_scale,
             time_offset_scale=time_offset_scale,
         )
+        self.ca_gamma = nn.Parameter(torch.ones(d_model) * 0.5)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -121,25 +132,44 @@ class DeformableDecoderLayer(nn.Module):
     def _init_reference_predictors(self):
         """Initialize reference point predictors.
 
-        IMPORTANT: Cannot use zero weights!
-        - Zero weights -> constant output -> zero gradients -> no learning
-        - Use small Xavier init for weights (enables gradient flow)
-        - Use zero bias (centers output at sigmoid(0)=0.5 or tanh(0)=0)
+        Key insight: gain=0.001 causes reference points to be stuck at
+        sigmoid(0)=0.5 (feature map center). The gradient signal from the
+        language model prior is too weak to push them out. Instead:
+
+        - freq_prior: Spread bias across frequency axis so each head group
+          starts at a different register (bass/tenor/alto/soprano).
+          Weight gain=0.1 gives W@x std ≈ 0.14, enough for content-dependent
+          modulation within each band while keeping sigmoid gradient healthy.
+        - reference_refine: std=0.01 (was 0.001) for visible initial offsets.
+        - time_prior: Prefer fixed linspace (use_time_prior=False) because
+          position embeddings (std=0.02) are too small to produce a 0→1 ramp
+          through a linear layer.
         """
         if self.time_prior is not None:
-            # Small Xavier init - prevents gradient explosion through grid_sample
-            nn.init.xavier_uniform_(self.time_prior.weight, gain=0.001)
-            nn.init.constant_(self.time_prior.bias, 0.)  # sigmoid(0) = 0.5
+            nn.init.xavier_uniform_(self.time_prior.weight, gain=0.1)
+            nn.init.constant_(self.time_prior.bias, 0.)
 
         if self.freq_prior is not None:
-            # Small Xavier init - prevents gradient explosion through grid_sample
-            nn.init.xavier_uniform_(self.freq_prior.weight, gain=0.001)
-            nn.init.constant_(self.freq_prior.bias, 0.)  # sigmoid(0) = 0.5
+            # Weight: gain=0.1 for content-dependent modulation (W@x std ≈ 0.14)
+            nn.init.xavier_uniform_(self.freq_prior.weight, gain=0.1)
 
-        # Refinement: very small init to prevent gradient explosion through grid_sample
-        # grid_sample gradients w.r.t. sampling locations can be very large
-        nn.init.normal_(self.reference_refine.weight, std=0.001)
-        nn.init.constant_(self.reference_refine.bias, 0.)  # tanh(0) = 0
+            # Bias: spread across frequency axis
+            # sigmoid(bias) -> target freq position
+            #   -1.386 -> 0.2 (bass)
+            #   -0.405 -> 0.4 (tenor)
+            #   +0.405 -> 0.6 (alto)
+            #   +1.386 -> 0.8 (soprano)
+            import math
+            n_groups = self.freq_prior.bias.shape[0]
+            with torch.no_grad():
+                for g in range(n_groups):
+                    # Evenly spaced targets in (0, 1), e.g. [0.2, 0.4, 0.6, 0.8]
+                    target = (g + 1) / (n_groups + 1)
+                    self.freq_prior.bias[g] = math.log(target / (1 - target))
+
+        # Refinement: std=0.01 for meaningful initial offsets
+        nn.init.normal_(self.reference_refine.weight, std=0.01)
+        nn.init.constant_(self.reference_refine.bias, 0.)
 
     def forward(
         self,
@@ -149,10 +179,11 @@ class DeformableDecoderLayer(nn.Module):
         level_start_index: torch.Tensor,
         valid_ratios: torch.Tensor,  # [B, L, 2]
         tgt_pos: Optional[torch.Tensor] = None,  # [B, S, D] or [1, S, D]
-    ) -> torch.Tensor:
+        past_kv: Optional[tuple] = None,  # (k_cache, v_cache) each [B, H, S_prev, D_head]
+        use_cache: bool = False,
+        value_cache: Optional[List[torch.Tensor]] = None,  # pre-computed cross-attn values
+    ):
         """Forward pass with content-dependent reference points.
-
-        Uses is_causal=True for Flash Attention (PyTorch 2.0+).
 
         Args:
             tgt: Decoder input embeddings [B, S, D]
@@ -161,30 +192,42 @@ class DeformableDecoderLayer(nn.Module):
             level_start_index: Start index per level [L]
             valid_ratios: Valid ratios for padding [B, L, 2]
             tgt_pos: Position embeddings [B, S, D] or [1, S, D]
+            past_kv: Cached K, V from previous steps (inference only)
+            use_cache: Whether to return updated KV cache
+            value_cache: Pre-computed cross-attention value maps per level
 
         Returns:
-            Updated decoder features [B, S, D]
+            tgt: Updated decoder features [B, S, D]
+            new_kv: (only if use_cache=True) updated (k, v) cache
         """
         B, S, D = tgt.shape
 
         # Add position embedding for self-attention
         if tgt_pos is not None:
-            q = k = tgt + tgt_pos
+            q_input = tgt + tgt_pos
         else:
-            q = k = tgt
+            q_input = tgt
 
-        # 1. Causal Self-Attention with Flash Attention (PyTorch 2.0+)
-        # Compute Q, K, V
-        qkv = self.self_attn_qkv(q)  # [B, S, 3*D]
+        # 1. Self-Attention (with optional KV-cache for incremental decoding)
+        qkv = self.self_attn_qkv(q_input)  # [B, S, 3*D]
         qkv = qkv.reshape(B, S, 3, self.n_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, D_head]
         q_sa, k_sa, v_sa = qkv[0], qkv[1], qkv[2]
 
-        # Flash Attention with is_causal=True (O(S) memory instead of O(S²))
+        if past_kv is not None:
+            # Incremental: append new K, V to cache
+            k_sa = torch.cat([past_kv[0], k_sa], dim=2)  # [B, H, S_prev+S, D_head]
+            v_sa = torch.cat([past_kv[1], v_sa], dim=2)
+
+        new_kv = (k_sa, v_sa) if use_cache else None
+
+        # is_causal only valid for full-sequence mode (no cache, S > 1)
+        use_causal = past_kv is None and S > 1
+
         attn_out = F.scaled_dot_product_attention(
             q_sa, k_sa, v_sa,
             dropout_p=self.self_attn_dropout if self.training else 0.0,
-            is_causal=True,
+            is_causal=use_causal,
         )  # [B, H, S, D_head]
 
         # Reshape back
@@ -196,11 +239,13 @@ class DeformableDecoderLayer(nn.Module):
         # 2. Content-Dependent Reference Points (key innovation!)
         reference_points = self._compute_reference_points(tgt, tgt_pos, B, S)
 
-        # 3. ClefAttention (Cross-attention)
+        # 3. FluxAttention (Cross-attention) with gain control
         tgt2 = self.cross_attn(
             tgt, reference_points, memory,
-            spatial_shapes, level_start_index, valid_ratios
+            spatial_shapes, level_start_index, valid_ratios,
+            value_cache=value_cache,
         )
+        tgt2 = self.ca_gamma * tgt2
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
 
@@ -208,6 +253,8 @@ class DeformableDecoderLayer(nn.Module):
         tgt = tgt + self.ffn(tgt)
         tgt = self.norm3(tgt)
 
+        if use_cache:
+            return tgt, new_kv
         return tgt
 
     def _compute_reference_points(
@@ -219,7 +266,7 @@ class DeformableDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Compute content-dependent reference points (per-head).
 
-        This is the key innovation of ClefAttention:
+        This is the key innovation of FluxAttention:
         - time_base: Predicted from position embedding (sequential progression)
         - freq_base: Predicted from hidden state (content-dependent!)
 
@@ -284,7 +331,7 @@ class DeformableDecoderLayer(nn.Module):
 
 
 class ClefDecoder(nn.Module):
-    """Full decoder stack with ClefAttention layers."""
+    """Full decoder stack with FluxAttention layers."""
 
     def __init__(
         self,
@@ -294,8 +341,8 @@ class ClefDecoder(nn.Module):
         n_levels: int = 4,
         n_points_freq: int = 2,
         n_points_time: int = 2,
-        freq_offset_scale: float = 0.15,
-        time_offset_scale: float = 0.15,
+        freq_offset_scale: float = 1.0,
+        time_offset_scale: float = 1.0,
         ff_dim: int = 2048,
         dropout: float = 0.1,
         use_time_prior: bool = True,
@@ -334,20 +381,47 @@ class ClefDecoder(nn.Module):
         level_start_index: torch.Tensor,
         valid_ratios: torch.Tensor,
         tgt_pos: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_kv_list: Optional[list] = None,
+        use_cache: bool = False,
+        value_cache_list: Optional[list] = None,
+    ):
         """Forward through all decoder layers.
 
-        Uses is_causal=True for Flash Attention (PyTorch 2.0+).
-        No explicit causal mask needed.
+        Args:
+            past_kv_list: List of (k_cache, v_cache) per layer (inference only)
+            use_cache: Whether to return updated KV caches
+            value_cache_list: List of cross-attn value caches per layer
+
+        Returns:
+            output: Decoder output [B, S, D]
+            new_kv_list: (only if use_cache=True) list of (k, v) per layer
         """
         output = tgt
+        new_kv_list = [] if use_cache else None
 
-        for layer in self.layers:
-            output = layer(
-                output, memory,
-                spatial_shapes, level_start_index, valid_ratios,
-                tgt_pos=tgt_pos,
-            )
+        for i, layer in enumerate(self.layers):
+            layer_past_kv = past_kv_list[i] if past_kv_list else None
+            layer_value_cache = value_cache_list[i] if value_cache_list else None
+
+            if use_cache:
+                output, new_kv = layer(
+                    output, memory,
+                    spatial_shapes, level_start_index, valid_ratios,
+                    tgt_pos=tgt_pos,
+                    past_kv=layer_past_kv,
+                    use_cache=True,
+                    value_cache=layer_value_cache,
+                )
+                new_kv_list.append(new_kv)
+            else:
+                output = layer(
+                    output, memory,
+                    spatial_shapes, level_start_index, valid_ratios,
+                    tgt_pos=tgt_pos,
+                )
 
         output = self.norm(output)
+
+        if use_cache:
+            return output, new_kv_list
         return output

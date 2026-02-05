@@ -138,24 +138,32 @@ class Trainer:
         self.train_loader = train_loader
         self.valid_loader = valid_loader
 
-        # Optimizer with separate LR for offset-related parameters
-        # Following Deformable DETR: offset params use 0.1x LR
+        # Two-optimizer setup:
+        # 1. Main optimizer (OneCycleLR): offset params (0.1x) + everything else (1x)
+        # 2. Gamma optimizer (constant LR=1e-3): ca_gamma only
+        #
+        # ca_gamma must grow fast from init=0.1 to open the CA pathway.
+        # OneCycleLR warmup starves it during the critical early phase.
+        # Constant LR + AdamW's adaptive moments provide implicit decay.
         base_lr = config.learning_rate if hasattr(config, 'learning_rate') else 1e-4
         offset_lr = base_lr * 0.1  # 0.1x for offset-related params
+        gamma_lr = 2e-4  # constant, no schedule
         weight_decay = config.weight_decay if hasattr(config, 'weight_decay') else 0.01
 
-        # Separate offset-related parameters (sensitive to LR)
         offset_param_names = [
-            'time_prior', 'freq_prior', 'reference_refine',  # Decoder reference points
-            'time_offset_proj', 'freq_offset_proj',          # Attention offsets
+            'time_prior', 'reference_refine',                  # Decoder reference points
+            'time_offset_proj', 'freq_offset_proj',           # Attention offsets
         ]
         offset_params = []
+        gain_params = []  # ca_gamma: separate optimizer
         other_params = []
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if any(offset_name in name for offset_name in offset_param_names):
+            if 'ca_gamma' in name:
+                gain_params.append(param)
+            elif any(offset_name in name for offset_name in offset_param_names):
                 offset_params.append(param)
                 if self.rank == 0:
                     logger.debug(f'Offset param (lr={offset_lr:.2e}): {name}')
@@ -164,6 +172,7 @@ class Trainer:
 
         if self.rank == 0:
             logger.info(f'Optimizer: {len(offset_params)} offset params (lr={offset_lr:.2e}), '
+                       f'{len(gain_params)} gamma params (lr={gamma_lr:.2e}, constant), '
                        f'{len(other_params)} other params (lr={base_lr:.2e})')
 
         self.optimizer = torch.optim.AdamW([
@@ -171,14 +180,18 @@ class Trainer:
             {'params': other_params, 'lr': base_lr},
         ], weight_decay=weight_decay)
 
-        # Learning rate scheduler
+        self.optimizer_gamma = torch.optim.AdamW(
+            gain_params, lr=gamma_lr, weight_decay=0.0,
+        )
+
+        # Learning rate scheduler (main optimizer only)
         total_steps = len(train_loader) * (config.max_epochs if hasattr(config, 'max_epochs') else 50)
         total_steps = total_steps // gradient_accumulation_steps
         warmup_steps = config.warmup_steps if hasattr(config, 'warmup_steps') else 1000
 
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=[offset_lr, base_lr],  # Different max_lr for each param group
+            max_lr=[offset_lr, base_lr],  # 2 groups: offset, other
             total_steps=total_steps,
             pct_start=warmup_steps / total_steps,
             anneal_strategy='cos',
@@ -197,6 +210,105 @@ class Trainer:
         # Wandb
         self.use_wandb = use_wandb and rank == 0
 
+        # Build pitch token mask for loss breakdown (pitch vs structure vs duration)
+        self._build_token_type_masks()
+
+    def _build_token_type_masks(self):
+        """Build boolean masks over vocab to classify token types.
+
+        Creates three 1-D boolean tensors of shape [vocab_size]:
+        - pitch_mask: pitch tokens (e.g. C, D#, ee, GG)
+        - duration_mask: duration tokens (e.g. 4, 8., 16, q)
+        - struct_mask: structural tokens (<coc>, <bar>, <nl>, ...)
+
+        Used for per-type loss breakdown logged to wandb (monitoring only,
+        does not affect training).
+        """
+        tokenizer = KernTokenizer()
+        V = self.config.vocab_size
+
+        struct_names = {
+            '<pad>', '<sos>', '<eos>', '<unk>', '<coc>', '<bar>',
+            '<b>', '<continue>', '<nl>', '<split>', '<merge>', '<*>',
+            '(', ')',    # slur start/end
+            '{', '}',    # phrase start/end
+            'L', 'J',    # beam start/end
+            ';',         # fermata
+        }
+        duration_names = {
+            '0', '00',  # breve, longa
+            '1', '2', '4', '8', '16', '32', '64', '128',
+            '0.', '00.', '1.', '2.', '4.', '8.', '16.', '32.', '64.',
+            '3', '6', '12', '24', '48', '96',
+            '20', '40', '112', '176',  # tuplet durations
+            '.', 'q', 'Q', 'P',
+            '[', ']', '_',  # tie start/end/continue (onset vs sustain)
+            '\t', '\n',  # whitespace (should not appear in labels)
+        }
+        # r (rest) stays in pitch: it's the "no pitch" decision, needs audio
+
+        struct_ids = set()
+        duration_ids = set()
+        pitch_ids = set()
+
+        for tok_str, tok_id in tokenizer.vocab.items():
+            if tok_str in struct_names:
+                struct_ids.add(tok_id)
+            elif tok_str in duration_names:
+                duration_ids.add(tok_id)
+
+        # Everything else is a pitch token (including r, accidentals, etc.)
+        classified = struct_ids | duration_ids
+        for tok_id in range(V):
+            if tok_id not in classified:
+                pitch_ids.add(tok_id)
+
+        self._struct_mask = torch.zeros(V, dtype=torch.bool)
+        self._duration_mask = torch.zeros(V, dtype=torch.bool)
+        self._pitch_mask = torch.zeros(V, dtype=torch.bool)
+        for i in struct_ids:
+            self._struct_mask[i] = True
+        for i in duration_ids:
+            self._duration_mask[i] = True
+        for i in pitch_ids:
+            self._pitch_mask[i] = True
+
+        if self.rank == 0:
+            logger.info(
+                f'Token type masks: {self._pitch_mask.sum()} pitch, '
+                f'{self._duration_mask.sum()} duration, '
+                f'{self._struct_mask.sum()} struct'
+            )
+
+    @torch.no_grad()
+    def _compute_loss_breakdown(
+        self,
+        logits: torch.Tensor,  # [B, S, V]
+        labels: torch.Tensor,  # [B, S]
+    ) -> Dict[str, float]:
+        """Compute per-token-type loss (monitoring only, detached)."""
+        ce = nn.CrossEntropyLoss(reduction='none')
+        per_token = ce(logits.view(-1, logits.size(-1)), labels.view(-1))  # [B*S]
+        flat_labels = labels.view(-1)
+
+        # Map each label to its type using pre-built masks
+        pitch_mask = self._pitch_mask.to(flat_labels.device)
+        duration_mask = self._duration_mask.to(flat_labels.device)
+        struct_mask = self._struct_mask.to(flat_labels.device)
+
+        is_pitch = pitch_mask[flat_labels] & (flat_labels != 0)
+        is_duration = duration_mask[flat_labels] & (flat_labels != 0)
+        is_struct = struct_mask[flat_labels] & (flat_labels != 0)
+
+        result = {}
+        if is_pitch.any():
+            result['loss_pitch'] = per_token[is_pitch].mean().item()
+        if is_duration.any():
+            result['loss_duration'] = per_token[is_duration].mean().item()
+        if is_struct.any():
+            result['loss_struct'] = per_token[is_struct].mean().item()
+        return result
+
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
@@ -212,6 +324,7 @@ class Trainer:
         )
 
         self.optimizer.zero_grad()
+        self.optimizer_gamma.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
             # Skip batches where all samples were filtered out
@@ -257,15 +370,25 @@ class Trainer:
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+                    self.scaler.unscale_(self.optimizer_gamma)
+
+                # Per-optimizer clipping: gamma gradients don't pollute main grad norm
+                main_params = [p for g in self.optimizer.param_groups for p in g['params']]
+                gamma_params = [p for g in self.optimizer_gamma.param_groups for p in g['params']]
+                grad_norm = torch.nn.utils.clip_grad_norm_(main_params, self.gradient_clip)
+                gamma_grad_norm = torch.nn.utils.clip_grad_norm_(gamma_params, self.gradient_clip)
+
+                if self.scaler is not None:
                     self.scaler.step(self.optimizer)
+                    self.scaler.step(self.optimizer_gamma)
                     self.scaler.update()
                 else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
                     self.optimizer.step()
+                    self.optimizer_gamma.step()
 
-                self.scheduler.step()
+                self.scheduler.step()  # OneCycleLR: main optimizer only
                 self.optimizer.zero_grad()
+                self.optimizer_gamma.zero_grad()
 
                 # Update metrics (average over accumulation steps)
                 avg_accum_loss = accumulated_loss / self.gradient_accumulation_steps
@@ -273,16 +396,29 @@ class Trainer:
                 num_batches += 1
                 self.global_step += 1
 
-                # Log to wandb (use commit=False to avoid step conflicts)
+                # Log to wandb
                 if self.use_wandb:
+                    model_unwrapped = self.model.module if isinstance(self.model, DDP) else self.model
+                    gamma_mean = sum(
+                        l.ca_gamma.data.mean().item() for l in model_unwrapped.decoder.layers
+                    ) / len(model_unwrapped.decoder.layers)
+
                     log_dict = {
                         'train/loss': avg_accum_loss,
                         'train/grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
+                        'train/gamma_grad_norm': gamma_grad_norm.item() if hasattr(gamma_grad_norm, 'item') else gamma_grad_norm,
+                        'train/ca_gamma_mean': gamma_mean,
                         'train/lr_base': self.scheduler.get_last_lr()[1],
                         'train/lr_offset': self.scheduler.get_last_lr()[0],
                         'train/epoch': self.epoch,
                         'system/gpu_memory_gb': torch.cuda.max_memory_allocated(self.device) / 1024**3,
                     }
+
+                    # Per-token-type loss breakdown (last micro-batch only)
+                    breakdown = self._compute_loss_breakdown(logits.detach(), labels)
+                    for k, v in breakdown.items():
+                        log_dict[f'train/{k}'] = v
+
                     wandb.log(log_dict, step=self.global_step)
 
                 # Update progress bar
@@ -300,7 +436,11 @@ class Trainer:
                     if valid_metrics and self.rank == 0:
                         logger.info(f'Step {self.global_step}: valid_loss={valid_metrics["valid_loss"]:.4f}')
                         if self.use_wandb:
-                            wandb.log({'valid/loss': valid_metrics['valid_loss']}, step=self.global_step)
+                            valid_log = {'valid/loss': valid_metrics['valid_loss']}
+                            for k in ('loss_pitch', 'loss_duration', 'loss_struct'):
+                                if k in valid_metrics:
+                                    valid_log[f'valid/{k}'] = valid_metrics[k]
+                            wandb.log(valid_log, step=self.global_step)
                     self.model.train()
 
         avg_loss = total_loss / max(num_batches, 1)
@@ -317,6 +457,9 @@ class Trainer:
 
         total_loss = 0.0
         num_batches = 0
+        # Accumulators for per-type loss breakdown
+        type_loss_sums = {'loss_pitch': 0.0, 'loss_duration': 0.0, 'loss_struct': 0.0}
+        type_loss_counts = {'loss_pitch': 0, 'loss_duration': 0, 'loss_struct': 0}
 
         for batch in self.valid_loader:
             mel = batch['mel'].to(self.device)
@@ -335,9 +478,20 @@ class Trainer:
             total_loss += loss.item()
             num_batches += 1
 
+            # Accumulate per-type losses
+            breakdown = self._compute_loss_breakdown(logits, labels)
+            for k, v in breakdown.items():
+                type_loss_sums[k] += v
+                type_loss_counts[k] += 1
+
         avg_loss = total_loss / max(num_batches, 1)
 
-        return {'valid_loss': avg_loss}
+        result = {'valid_loss': avg_loss}
+        for k in type_loss_sums:
+            if type_loss_counts[k] > 0:
+                result[k] = type_loss_sums[k] / type_loss_counts[k]
+
+        return result
 
     def save_checkpoint(self, path: Path, is_best: bool = False):
         """Save checkpoint."""
@@ -357,6 +511,7 @@ class Trainer:
             'global_step': self.global_step,
             'model_state_dict': model_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'optimizer_gamma_state_dict': self.optimizer_gamma.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_valid_loss': self.best_valid_loss,
             'epochs_without_improvement': self.epochs_without_improvement,
@@ -386,6 +541,8 @@ class Trainer:
         model.load_state_dict(checkpoint['model_state_dict'])
 
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'optimizer_gamma_state_dict' in checkpoint:
+            self.optimizer_gamma.load_state_dict(checkpoint['optimizer_gamma_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
         self.epoch = checkpoint['epoch']
@@ -435,6 +592,9 @@ class Trainer:
                     }
                     if 'valid_loss' in valid_metrics:
                         epoch_log['epoch/valid_loss'] = valid_metrics['valid_loss']
+                    for k in ('loss_pitch', 'loss_duration', 'loss_struct'):
+                        if k in valid_metrics:
+                            epoch_log[f'epoch/valid_{k}'] = valid_metrics[k]
                     wandb.log(epoch_log, step=self.global_step)
 
             # Save checkpoint and check early stopping

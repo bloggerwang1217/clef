@@ -26,21 +26,26 @@ model:
   swin_dims: [96, 192, 384, 768]
   freeze_encoder: true
 
+  # HarmonicFlow (pitch space transform)
+  use_flow: true
+  n_harmonics: 6
+  flow_pool_stride: 4   # Temporal pooling: T -> T/4 (matches Swin S0, prevents grad explosion)
+
   # Deformable Attention (CLEF: Content-aware Learned-prior Event Focusing)
   d_model: 512
   n_heads: 8
-  n_levels: 4
+  n_levels: 5  # 1 (Flow) + 4 (Swin stages)
   ff_dim: 2048
   dropout: 0.1
 
   # Square sampling + Content-Dependent Prior (key design)
   n_points_freq: 2          # Frequency direction: local detail
   n_points_time: 2          # Time direction: local detail
-  freq_offset_scale: 0.15   # +/-15% (unified for square sampling)
-  time_offset_scale: 0.15   # +/-15% (unified for square sampling)
+  freq_offset_scale: 1.0    # ±1 pixel in feature map space (was 0.15, caused 2x2 degeneration)
+  time_offset_scale: 1.0    # ±1 pixel in feature map space (was 0.15, caused 2x2 degeneration)
 
   # Content-Dependent Reference Points (key innovation)
-  use_time_prior: true      # time_prior(tgt_pos) -> time location
+  use_time_prior: false     # Fixed linspace(0,1,S); learned prior doesn't work because pos_embed std=0.02 is too small
   use_freq_prior: true      # freq_prior(tgt) -> freq region (stream tracking)
   n_freq_groups: 4          # Per-head freq_prior (4 groups x 2 heads = 8 heads)
   refine_range: 0.1         # +/-10% refinement
@@ -102,16 +107,16 @@ data:
 # =============================================================================
 training:
   distributed:
-    enabled: false
+    enabled: true
     backend: "nccl"
-    num_gpus: 1
+    num_gpus: 2
 
   precision: "bf16"
-  batch_size: 2             # per GPU
+  batch_size: 1             # per GPU
   gradient_accumulation_steps: 2
-  effective_batch_size: 4   # 1 GPU x 2 batch x 2 accum
+  effective_batch_size: 4   # 2 GPU x 1 batch x 2 accum
 
-  learning_rate: 2.0e-5      # Base LR; offset params use 0.1x (2e-6)
+  learning_rate: 2.0e-5      # Base LR; offset params use 0.1x (2e-6); gamma uses constant 2e-4
   weight_decay: 0.01
   max_epochs: 50
   warmup_steps: 5000        # ~5.3 epochs warmup (944 steps/epoch)
@@ -125,7 +130,7 @@ training:
   wandb:
     enabled: true
     project: "clef-piano-base"
-    tags: ["piano", "a2s", "swin", "clef-attention", "multi-head", "a6000"]
+    tags: ["piano", "a2s", "swin", "clef-attention", "multi-head", "a6000", "harmonic-flow"]
 
 # =============================================================================
 # Paths
@@ -133,4 +138,4 @@ training:
 paths:
   data_dir: "data/datasets"
   output_dir: "data/experiments/clef_piano_base"
-  checkpoint_dir: "checkpoints/clef_piano_base_multi_head"
+  checkpoint_dir: "checkpoints/clef_piano_base_flow"

@@ -17,7 +17,7 @@ class ClefPianoConfig(ClefConfig):
     """Configuration for clef-piano-base model.
 
     ISMIR 2026 target: Single-instrument (piano) transcription
-    using Swin V2 encoder + ClefAttention decoder.
+    using Swin V2 encoder + FluxAttention decoder.
     """
 
     # Piano-specific defaults
@@ -63,6 +63,12 @@ class ClefPianoConfig(ClefConfig):
             swin_model=model_cfg.get("swin_model", defaults.swin_model),
             swin_dims=model_cfg.get("swin_dims", defaults.swin_dims),
             freeze_encoder=model_cfg.get("freeze_encoder", defaults.freeze_encoder),
+
+            # HarmonicFlow
+            use_flow=model_cfg.get("use_flow", defaults.use_flow),
+            n_harmonics=model_cfg.get("n_harmonics", defaults.n_harmonics),
+            flow_init=model_cfg.get("flow_init", defaults.flow_init),
+            flow_pool_stride=model_cfg.get("flow_pool_stride", defaults.flow_pool_stride),
 
             # Attention
             d_model=model_cfg.get("d_model", defaults.d_model),

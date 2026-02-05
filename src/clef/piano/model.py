@@ -2,15 +2,15 @@
 Clef Piano Base Model
 =====================
 
-ISMIR 2026 version: Swin V2 + ClefAttention
+ISMIR 2026 version: Swin V2 + FluxAttention
 
 Architecture highlights:
 - Swin V2 (frozen) extracts F1/F2/F3/F4 four-scale features
 - Deformable Bridge: Sparse self-attention fuses multi-scale features
-- ClefAttention Decoder: Content-aware Learned-prior Event Focusing
+- FluxAttention Decoder: Content-aware Learned-prior Event Focusing
 - Solves grace note problem: Can directly access F1 (10ms resolution, 100 fps)
 
-ClefAttention features:
+FluxAttention features:
 - freq_prior: Predict "high or low frequency" from content (stream tracking)
 - time_prior: Predict "which time point" from position
 - Square sampling 2x2: prior locates, offset refines locally
@@ -27,10 +27,11 @@ from transformers import Swinv2Model
 from .config import ClefPianoConfig
 from ..bridge import DeformableBridge
 from ..decoder import ClefDecoder
+from ..flow import HarmonicFlow
 
 
 class ClefPianoBase(nn.Module):
-    """Clef Piano Base: Swin V2 + ClefAttention for piano transcription.
+    """Clef Piano Base: Swin V2 + FluxAttention for piano transcription.
 
     Model flow:
     1. Mel spectrogram -> Swin V2 (frozen) -> F1, F2, F3, F4
@@ -60,7 +61,26 @@ class ClefPianoBase(nn.Module):
             for p in self.swin.parameters():
                 p.requires_grad = False
 
+        # === HarmonicFlow (optional, pitch space transform) ===
+        self.use_flow = getattr(config, 'use_flow', False)
+        if self.use_flow:
+            self.flow = HarmonicFlow(
+                n_mels=config.n_mels,
+                n_pitches=88,
+                n_harmonics=getattr(config, 'n_harmonics', 6),
+                f_min=config.f_min,
+                f_max=config.f_max,
+                sample_rate=config.sample_rate,
+                n_fft=config.n_fft,
+                init=getattr(config, 'flow_init', 'harmonic'),
+            )
+
         # === Deformable Bridge ===
+        # When Flow is enabled, prepend n_mels as Level 0 input dim
+        bridge_input_dims = None
+        if self.use_flow:
+            bridge_input_dims = [config.n_mels] + config.swin_dims
+
         self.bridge = DeformableBridge(
             swin_dims=config.swin_dims,
             d_model=config.d_model,
@@ -73,6 +93,8 @@ class ClefPianoBase(nn.Module):
             n_layers=config.bridge_layers,
             ff_dim=config.ff_dim,
             dropout=config.dropout,
+            mel_height=config.n_mels,
+            input_dims=bridge_input_dims,
         )
 
         # === Decoder ===
@@ -106,16 +128,22 @@ class ClefPianoBase(nn.Module):
         self._causal_mask_cache: Dict[int, torch.Tensor] = {}
 
         # Standard weight initialization for stable training
-        # Skip Swin (pretrained) — only init bridge, decoder, embeddings, output_head
+        # Skip Swin (pretrained) and Flow (physics-initialized) —
+        # only init bridge, decoder, embeddings, output_head
         self.bridge.apply(self._init_weights)
         self.decoder.apply(self._init_weights)
         self._init_weights(self.token_embed)
         self._init_weights(self.output_head)
+        # NOTE: Flow.transform is NOT re-initialized here — it uses physics init
 
-        # Re-apply special initialization for reference point predictors
-        # (must come after _init_weights to override the generic init)
+        # Re-apply special initialization that _init_weights overwrites.
+        # _init_weights sets all Linear biases to 0, which destroys:
+        # - FluxAttention offset bias (±0.5 grid pattern)
+        # - FluxAttention level_weights bias (+1.0 level specialization)
+        # - DecoderLayer freq_prior/time_prior/reference_refine bias
         for layer in self.decoder.layers:
             layer._init_reference_predictors()
+            layer.cross_attn._reset_parameters()
 
     @staticmethod
     def _init_weights(module: nn.Module):
@@ -166,21 +194,47 @@ class ClefPianoBase(nn.Module):
         with ctx:
             swin_out = self.swin(x, output_hidden_states=True)
 
-        # Extract features from all 4 stages
+        # Build feature list and spatial shapes
+        features = []
+        spatial_shapes_list = []
+        valid_ratios_list = []
+
+        # Level 0: HarmonicFlow (if enabled)
+        if self.use_flow:
+            flow_feat = self.flow(mel)  # [B, T, 128] (original T, not padded)
+            # Temporal pooling to match Swin S0 resolution (T/4)
+            # Without pooling, W=24000 causes gradient explosion through
+            # reference_refine: grid_sample gradient scales with W, and
+            # reference_refine is shared across all levels (no W normalization).
+            pool_stride = getattr(self.config, 'flow_pool_stride', 4)
+            if pool_stride > 1:
+                flow_feat = flow_feat.permute(0, 2, 1)  # [B, 128, T]
+                flow_feat = F.avg_pool1d(flow_feat, kernel_size=pool_stride,
+                                         stride=pool_stride)
+                flow_feat = flow_feat.permute(0, 2, 1)  # [B, T//stride, 128]
+            T_flow = flow_feat.shape[1]
+            features.append(flow_feat)
+            spatial_shapes_list.append((1, T_flow))  # H=1, W=T//stride
+            valid_ratios_list.append([1.0, 1.0])  # No padding on Flow
+
+        # Levels 1-4 (or 0-3): Swin stages
         # hidden_states: [stage0(96), stage1(192), stage2(384), stage3(768), stage4(768)]
         # We use stages 0-3 (indices 0-3) to match swin_dims=[96, 192, 384, 768]
-        features = []
         for i in range(4):
             feat = swin_out.hidden_states[i]  # [B, N_patches, C]
             features.append(feat)
 
-        # Compute spatial shapes from PADDED dimensions (guaranteed divisible by 32)
-        spatial_shapes_list = self._compute_spatial_shapes(H_pad, T_pad)
+        # Swin spatial shapes from PADDED dimensions (guaranteed divisible by 32)
+        swin_shapes = self._compute_spatial_shapes(H_pad, T_pad)
+        spatial_shapes_list.extend(swin_shapes)
+
+        # Swin valid ratios (same for all Swin levels)
+        for _ in range(4):
+            valid_ratios_list.append([valid_ratio_w, valid_ratio_h])
 
         # Compute per-level valid ratios [B, L, 2]
-        # Each level has same valid ratio (time, freq)
         level_valid_ratios = torch.tensor(
-            [[valid_ratio_w, valid_ratio_h] for _ in range(self.config.n_levels)],
+            valid_ratios_list,
             device=mel.device, dtype=mel.dtype
         ).unsqueeze(0).expand(B, -1, -1)  # [B, L, 2]
 
@@ -239,6 +293,25 @@ class ClefPianoBase(nn.Module):
             shapes.append((h, w))
         return shapes
 
+    def prepare_value_cache(
+        self,
+        memory: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+    ) -> list:
+        """Pre-compute cross-attention value projections for all decoder layers.
+
+        Call once per chunk, pass result to decode() for all steps.
+        Avoids recomputing value_proj(memory) at every decoding step.
+        """
+        value_cache_list = []
+        for layer in self.decoder.layers:
+            cache = layer.cross_attn.compute_value_cache(
+                memory, spatial_shapes, level_start_index,
+            )
+            value_cache_list.append(cache)
+        return value_cache_list
+
     def decode(
         self,
         input_ids: torch.Tensor,  # [B, S]
@@ -246,8 +319,11 @@ class ClefPianoBase(nn.Module):
         spatial_shapes: torch.Tensor,
         level_start_index: torch.Tensor,
         valid_ratios: torch.Tensor,
-    ) -> torch.Tensor:
-        """Decode with ClefAttention.
+        past_kv: Optional[list] = None,
+        use_cache: bool = False,
+        value_cache: Optional[list] = None,
+    ):
+        """Decode with FluxAttention.
 
         Args:
             input_ids: Input token IDs [B, S]
@@ -255,29 +331,47 @@ class ClefPianoBase(nn.Module):
             spatial_shapes: [L, 2]
             level_start_index: [L]
             valid_ratios: [B, L, 2]
+            past_kv: List of (k_cache, v_cache) per decoder layer (inference only)
+            use_cache: Whether to return updated KV caches
+            value_cache: Pre-computed cross-attn value maps (from prepare_value_cache)
 
         Returns:
             logits: Output logits [B, S, vocab_size]
+            new_kv: (only if use_cache=True) list of (k, v) per layer
         """
         B, S = input_ids.shape
 
         # Token embedding
         tgt = self.token_embed(input_ids)  # [B, S, D]
 
-        # Position embedding
-        tgt_pos = self.decoder_pos_embed[:, :S, :]
+        # Position embedding: use correct position offset when using KV-cache
+        if past_kv is not None:
+            # Incremental decoding: position = cached_length .. cached_length + S
+            cached_len = past_kv[0][0].shape[2]  # [B, H, S_cached, D_head]
+            tgt_pos = self.decoder_pos_embed[:, cached_len:cached_len + S, :]
+        else:
+            tgt_pos = self.decoder_pos_embed[:, :S, :]
 
-        # Run decoder (uses is_causal=True for Flash Attention, no explicit mask needed)
-        tgt = self.decoder(
-            tgt, memory,
-            spatial_shapes, level_start_index, valid_ratios,
-            tgt_pos=tgt_pos,
-        )
-
-        # Output projection
-        logits = self.output_head(tgt)
-
-        return logits
+        # Run decoder
+        if use_cache:
+            tgt, new_kv = self.decoder(
+                tgt, memory,
+                spatial_shapes, level_start_index, valid_ratios,
+                tgt_pos=tgt_pos,
+                past_kv_list=past_kv,
+                use_cache=True,
+                value_cache_list=value_cache,
+            )
+            logits = self.output_head(tgt)
+            return logits, new_kv
+        else:
+            tgt = self.decoder(
+                tgt, memory,
+                spatial_shapes, level_start_index, valid_ratios,
+                tgt_pos=tgt_pos,
+            )
+            logits = self.output_head(tgt)
+            return logits
 
     def forward(
         self,
