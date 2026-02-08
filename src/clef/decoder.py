@@ -69,17 +69,7 @@ class DeformableDecoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
-        # 2. FluxAttention (Cross-attention) with gain control
-        # Problem: CA output norm (~3) << residual norm (~22), so CA gets drowned
-        # after residual addition + LayerNorm. Training actively erases any good
-        # initialization (level bias, offset grid) because gradient is too weak.
-        #
-        # Solution (CaiT LayerScale):
-        # ca_gamma: per-channel learnable scale, init=1.0 (following CaiT).
-        # No LayerNorm before gamma — raw CA output norm (~11 with proper init)
-        # naturally reflects feature quality: bad CA → small norm → little impact,
-        # good CA → large norm → decoder can use it. LayerNorm would force all
-        # outputs to ~22.6 regardless of quality, amplifying noise at init.
+        # 2. FluxAttention (Cross-attention) with predictive coding gate
         self.cross_attn = FluxAttention(
             d_model=d_model,
             n_levels=n_levels,
@@ -89,7 +79,20 @@ class DeformableDecoderLayer(nn.Module):
             freq_offset_scale=freq_offset_scale,
             time_offset_scale=time_offset_scale,
         )
-        self.ca_gamma = nn.Parameter(torch.ones(d_model) * 0.5)
+        # Predictive coding gate (Rao & Ballard 1999):
+        # Only prediction error (surprise) passes through, gain can amplify.
+        # Predictor: LM state -> predicted CA output (cortex -> thalamus)
+        # Surprise: CA(tgt) - prediction (what LM didn't know)
+        # Gain: per-token scalar, softplus -> can be > 1 (amplification)
+        self.ca_predictor = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.ca_gain = nn.Linear(d_model, 1)
+        # Auxiliary loss storage (training only, cleared after collection)
+        self._last_prediction = None
+        self._last_ca_output = None
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -239,14 +242,25 @@ class DeformableDecoderLayer(nn.Module):
         # 2. Content-Dependent Reference Points (key innovation!)
         reference_points = self._compute_reference_points(tgt, tgt_pos, B, S)
 
-        # 3. FluxAttention (Cross-attention) with gain control
+        # 3. FluxAttention (Cross-attention) with gating
         tgt2 = self.cross_attn(
             tgt, reference_points, memory,
             spatial_shapes, level_start_index, valid_ratios,
             value_cache=value_cache,
         )
-        tgt2 = self.ca_gamma * tgt2
-        tgt = tgt + self.dropout2(tgt2)
+        # Predictive coding: only surprise (prediction error) passes through
+        # - predictor(tgt.detach()): LM predicts what CA should output
+        # - surprise = CA - prediction: what LM didn't know (pitch info)
+        # - gain * surprise: amplify novel information (gain can be > 1)
+        # - predictor.detach() in surprise: isolate MSE gradient from CE gradient
+        prediction = self.ca_predictor(tgt.detach())       # [B, S, D]
+        surprise = tgt2 - prediction.detach()               # [B, S, D]
+        gain = F.softplus(self.ca_gain(tgt.detach()))       # [B, S, 1]
+        tgt = tgt + gain * self.dropout2(surprise)
+        # Store for auxiliary MSE loss (training only)
+        if self.training:
+            self._last_prediction = prediction
+            self._last_ca_output = tgt2.detach()
         tgt = self.norm2(tgt)
 
         # 4. FFN
@@ -316,7 +330,9 @@ class DeformableDecoderLayer(nn.Module):
         base_ref = torch.cat([time_base, freq_base], dim=-1)  # [B, S, H, 2]
 
         # Content-based refinement (+/-10%), shared across heads
-        refine = self.reference_refine(tgt).tanh() * self.refine_range  # [B, S, 2]
+        # detach: refine observes tgt to decide WHERE to look, but doesn't backprop
+        # (eliminates L0 reference_refine dominating 85% of total grad norm)
+        refine = self.reference_refine(tgt.detach()).tanh() * self.refine_range  # [B, S, 2]
         refine = refine.unsqueeze(2)  # [B, S, 1, 2] -> broadcast to H
 
         # Final reference point
@@ -372,6 +388,24 @@ class ClefDecoder(nn.Module):
         ])
 
         self.norm = nn.LayerNorm(d_model)
+
+    def collect_pred_loss(self) -> Optional[torch.Tensor]:
+        """Collect predictor MSE loss from all layers (predictive_coding mode).
+
+        Returns average MSE across layers, or None if not in PC mode.
+        Clears stored predictions to prevent stale data.
+        """
+        losses = []
+        for layer in self.layers:
+            if getattr(layer, '_last_prediction', None) is not None:
+                losses.append(
+                    F.mse_loss(layer._last_prediction, layer._last_ca_output)
+                )
+                layer._last_prediction = None
+                layer._last_ca_output = None
+        if losses:
+            return torch.stack(losses).mean()
+        return None
 
     def forward(
         self,

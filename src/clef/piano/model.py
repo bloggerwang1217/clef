@@ -27,7 +27,7 @@ from transformers import Swinv2Model
 from .config import ClefPianoConfig
 from ..bridge import DeformableBridge
 from ..decoder import ClefDecoder
-from ..flow import HarmonicFlow
+from ..flow import HarmonizingFlow
 
 
 class ClefPianoBase(nn.Module):
@@ -61,10 +61,11 @@ class ClefPianoBase(nn.Module):
             for p in self.swin.parameters():
                 p.requires_grad = False
 
-        # === HarmonicFlow (optional, pitch space transform) ===
+        # === HarmonizingFlow (optional, pitch space transform) ===
         self.use_flow = getattr(config, 'use_flow', False)
+        self.use_temporal_cnn = getattr(config, 'use_temporal_cnn', False)
         if self.use_flow:
-            self.flow = HarmonicFlow(
+            self.flow = HarmonizingFlow(
                 n_mels=config.n_mels,
                 n_pitches=88,
                 n_harmonics=getattr(config, 'n_harmonics', 6),
@@ -73,13 +74,24 @@ class ClefPianoBase(nn.Module):
                 sample_rate=config.sample_rate,
                 n_fft=config.n_fft,
                 init=getattr(config, 'flow_init', 'harmonic'),
+                use_temporal_cnn=self.use_temporal_cnn,
+                temporal_pool_stride=getattr(config, 'temporal_pool_stride', 8),
             )
 
         # === Deformable Bridge ===
-        # When Flow is enabled, prepend n_mels as Level 0 input dim
+        # Build bridge input dims based on active levels:
+        # Flow levels (n_mels each) + selected Swin stages
+        self.swin_start_stage = getattr(config, 'swin_start_stage', 0)
+        swin_dims_used = config.swin_dims[self.swin_start_stage:]
+
         bridge_input_dims = None
         if self.use_flow:
-            bridge_input_dims = [config.n_mels] + config.swin_dims
+            flow_dims = [config.n_mels]
+            if self.use_temporal_cnn:
+                flow_dims = [config.n_mels, config.n_mels]
+            bridge_input_dims = flow_dims + swin_dims_used
+        elif self.swin_start_stage > 0:
+            bridge_input_dims = swin_dims_used
 
         self.bridge = DeformableBridge(
             swin_dims=config.swin_dims,
@@ -141,9 +153,12 @@ class ClefPianoBase(nn.Module):
         # - FluxAttention offset bias (±0.5 grid pattern)
         # - FluxAttention level_weights bias (+1.0 level specialization)
         # - DecoderLayer freq_prior/time_prior/reference_refine bias
+        # - PC gain bias (softplus(0.7) ≈ 1.0, "start open")
         for layer in self.decoder.layers:
             layer._init_reference_predictors()
             layer.cross_attn._reset_parameters()
+            if hasattr(layer, 'ca_gain'):
+                nn.init.constant_(layer.ca_gain.bias, 0.7)
 
     @staticmethod
     def _init_weights(module: nn.Module):
@@ -199,37 +214,62 @@ class ClefPianoBase(nn.Module):
         spatial_shapes_list = []
         valid_ratios_list = []
 
-        # Level 0: HarmonicFlow (if enabled)
+        # Level 0 (+Level 1 if TemporalCNN): HarmonizingFlow
         if self.use_flow:
-            flow_feat = self.flow(mel)  # [B, T, 128] (original T, not padded)
-            # Temporal pooling to match Swin S0 resolution (T/4)
-            # Without pooling, W=24000 causes gradient explosion through
-            # reference_refine: grid_sample gradient scales with W, and
-            # reference_refine is shared across all levels (no W normalization).
+            flow_out = self.flow(mel)  # tuple or tensor
+
+            if self.use_temporal_cnn:
+                # flow_out = (pitch [B,T,128], temporal [B,T//tcnn_stride,128])
+                flow_feat, temporal_feat = flow_out
+            else:
+                flow_feat = flow_out
+
+            # Temporal pooling for pitch features to match Swin S0 resolution
             pool_stride = getattr(self.config, 'flow_pool_stride', 4)
             if pool_stride > 1:
                 flow_feat = flow_feat.permute(0, 2, 1)  # [B, 128, T]
                 flow_feat = F.avg_pool1d(flow_feat, kernel_size=pool_stride,
                                          stride=pool_stride)
                 flow_feat = flow_feat.permute(0, 2, 1)  # [B, T//stride, 128]
+
+            # Level 0: pitch content
             T_flow = flow_feat.shape[1]
             features.append(flow_feat)
-            spatial_shapes_list.append((1, T_flow))  # H=1, W=T//stride
-            valid_ratios_list.append([1.0, 1.0])  # No padding on Flow
+            spatial_shapes_list.append((1, T_flow))
+            valid_ratios_list.append([1.0, 1.0])
 
-        # Levels 1-4 (or 0-3): Swin stages
+            # Level 1: temporal dynamics (onset/sustain/release)
+            if self.use_temporal_cnn:
+                T_temporal = temporal_feat.shape[1]
+                features.append(temporal_feat)
+                spatial_shapes_list.append((1, T_temporal))
+                valid_ratios_list.append([1.0, 1.0])
+
+        # Swin stages (skip stages before swin_start_stage)
         # hidden_states: [stage0(96), stage1(192), stage2(384), stage3(768), stage4(768)]
-        # We use stages 0-3 (indices 0-3) to match swin_dims=[96, 192, 384, 768]
-        for i in range(4):
+        # We use stages swin_start_stage..3 to match swin_dims[swin_start_stage:]
+        n_swin_stages = len(self.config.swin_dims)
+        all_swin_shapes = self._compute_spatial_shapes(H_pad, T_pad)
+        swin_pools = getattr(self.config, 'swin_pool_strides', [1] * n_swin_stages)
+
+        for i in range(self.swin_start_stage, n_swin_stages):
             feat = swin_out.hidden_states[i]  # [B, N_patches, C]
+            H_s, W_s = all_swin_shapes[i]
+            pool_s = swin_pools[i] if i < len(swin_pools) else 1
+
+            # Pool in time to remove redundant overlapping windows
+            # Swin window_size=8 → each stage has ~8x temporal oversampling
+            if pool_s > 1:
+                feat = feat.view(B, H_s, W_s, -1)        # [B, H, W, C]
+                feat = feat.permute(0, 3, 1, 2)           # [B, C, H, W]
+                feat = F.avg_pool2d(feat, kernel_size=(1, pool_s),
+                                    stride=(1, pool_s))
+                feat = feat.permute(0, 2, 3, 1)           # [B, H, W_new, C]
+                W_s = feat.shape[2]
+                feat = feat.reshape(B, H_s * W_s, -1)     # [B, H*W_new, C]
+
             features.append(feat)
-
-        # Swin spatial shapes from PADDED dimensions (guaranteed divisible by 32)
-        swin_shapes = self._compute_spatial_shapes(H_pad, T_pad)
-        spatial_shapes_list.extend(swin_shapes)
-
-        # Swin valid ratios (same for all Swin levels)
-        for _ in range(4):
+            spatial_shapes_list.append((H_s, W_s))
             valid_ratios_list.append([valid_ratio_w, valid_ratio_h])
 
         # Compute per-level valid ratios [B, L, 2]
@@ -409,10 +449,19 @@ class ClefPianoBase(nn.Module):
                 ignore_index=0,  # <pad> token
                 label_smoothing=self.config.label_smoothing,
             )
-            loss = loss_fn(
+            ce_loss = loss_fn(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1)
             )
+
+            # Predictive coding auxiliary loss (predictor MSE)
+            pred_loss = self.decoder.collect_pred_loss()
+            if pred_loss is not None:
+                loss = ce_loss + self.config.pred_loss_weight * pred_loss
+                self._last_pred_loss = pred_loss.detach()
+            else:
+                loss = ce_loss
+                self._last_pred_loss = None
 
         return logits, loss
 

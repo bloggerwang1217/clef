@@ -7,7 +7,7 @@ from .config import ClefConfig
 from .attention import FluxAttention, DeformableEncoderLayer
 from .bridge import DeformableBridge
 from .decoder import DeformableDecoderLayer, ClefDecoder
-from .flow import HarmonicFlow
+from .flow import HarmonizingFlow
 from .data import ChunkedDataset, ManifestDataset
 from .collate import BucketSampler, DistributedBucketSampler, ClefCollator, create_dataloader
 
@@ -18,7 +18,7 @@ __all__ = [
     "DeformableBridge",
     "DeformableDecoderLayer",
     "ClefDecoder",
-    "HarmonicFlow",
+    "HarmonizingFlow",
     "ChunkedDataset",
     "ManifestDataset",
     "BucketSampler",

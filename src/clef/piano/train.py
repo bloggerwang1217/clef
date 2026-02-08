@@ -38,6 +38,7 @@ print(f"[DEBUG] CUDA_VISIBLE_DEVICES = {_cuda_visible}", flush=True)
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -138,16 +139,10 @@ class Trainer:
         self.train_loader = train_loader
         self.valid_loader = valid_loader
 
-        # Two-optimizer setup:
-        # 1. Main optimizer (OneCycleLR): offset params (0.1x) + everything else (1x)
-        # 2. Gamma optimizer (constant LR=1e-3): ca_gamma only
-        #
-        # ca_gamma must grow fast from init=0.1 to open the CA pathway.
-        # OneCycleLR warmup starves it during the critical early phase.
-        # Constant LR + AdamW's adaptive moments provide implicit decay.
+        # Optimizer setup:
+        # - Main optimizer (OneCycleLR): offset params (0.1x) + everything else (1x)
         base_lr = config.learning_rate if hasattr(config, 'learning_rate') else 1e-4
         offset_lr = base_lr * 0.1  # 0.1x for offset-related params
-        gamma_lr = 2e-4  # constant, no schedule
         weight_decay = config.weight_decay if hasattr(config, 'weight_decay') else 0.01
 
         offset_param_names = [
@@ -155,15 +150,12 @@ class Trainer:
             'time_offset_proj', 'freq_offset_proj',           # Attention offsets
         ]
         offset_params = []
-        gain_params = []  # ca_gamma: separate optimizer
         other_params = []
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'ca_gamma' in name:
-                gain_params.append(param)
-            elif any(offset_name in name for offset_name in offset_param_names):
+            if any(offset_name in name for offset_name in offset_param_names):
                 offset_params.append(param)
                 if self.rank == 0:
                     logger.debug(f'Offset param (lr={offset_lr:.2e}): {name}')
@@ -172,17 +164,12 @@ class Trainer:
 
         if self.rank == 0:
             logger.info(f'Optimizer: {len(offset_params)} offset params (lr={offset_lr:.2e}), '
-                       f'{len(gain_params)} gamma params (lr={gamma_lr:.2e}, constant), '
                        f'{len(other_params)} other params (lr={base_lr:.2e})')
 
         self.optimizer = torch.optim.AdamW([
             {'params': offset_params, 'lr': offset_lr},
             {'params': other_params, 'lr': base_lr},
         ], weight_decay=weight_decay)
-
-        self.optimizer_gamma = torch.optim.AdamW(
-            gain_params, lr=gamma_lr, weight_decay=0.0,
-        )
 
         # Learning rate scheduler (main optimizer only)
         total_steps = len(train_loader) * (config.max_epochs if hasattr(config, 'max_epochs') else 50)
@@ -324,7 +311,6 @@ class Trainer:
         )
 
         self.optimizer.zero_grad()
-        self.optimizer_gamma.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
             # Skip batches where all samples were filtered out
@@ -370,25 +356,22 @@ class Trainer:
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
-                    self.scaler.unscale_(self.optimizer_gamma)
 
-                # Per-optimizer clipping: gamma gradients don't pollute main grad norm
-                main_params = [p for g in self.optimizer.param_groups for p in g['params']]
-                gamma_params = [p for g in self.optimizer_gamma.param_groups for p in g['params']]
-                grad_norm = torch.nn.utils.clip_grad_norm_(main_params, self.gradient_clip)
-                gamma_grad_norm = torch.nn.utils.clip_grad_norm_(gamma_params, self.gradient_clip)
+                # Per-group clipping: offset/base clipped independently
+                # so reference_refine's huge gradient doesn't starve base params
+                offset_params = [p for p in self.optimizer.param_groups[0]['params']]
+                base_params = [p for p in self.optimizer.param_groups[1]['params']]
+                offset_grad_norm = torch.nn.utils.clip_grad_norm_(offset_params, self.gradient_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(base_params, self.gradient_clip)
 
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer)
-                    self.scaler.step(self.optimizer_gamma)
                     self.scaler.update()
                 else:
                     self.optimizer.step()
-                    self.optimizer_gamma.step()
 
-                self.scheduler.step()  # OneCycleLR: main optimizer only
+                self.scheduler.step()
                 self.optimizer.zero_grad()
-                self.optimizer_gamma.zero_grad()
 
                 # Update metrics (average over accumulation steps)
                 avg_accum_loss = accumulated_loss / self.gradient_accumulation_steps
@@ -399,20 +382,25 @@ class Trainer:
                 # Log to wandb
                 if self.use_wandb:
                     model_unwrapped = self.model.module if isinstance(self.model, DDP) else self.model
-                    gamma_mean = sum(
-                        l.ca_gamma.data.mean().item() for l in model_unwrapped.decoder.layers
-                    ) / len(model_unwrapped.decoder.layers)
+                    layers = model_unwrapped.decoder.layers
 
                     log_dict = {
                         'train/loss': avg_accum_loss,
                         'train/grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
-                        'train/gamma_grad_norm': gamma_grad_norm.item() if hasattr(gamma_grad_norm, 'item') else gamma_grad_norm,
-                        'train/ca_gamma_mean': gamma_mean,
+                        'train/offset_grad_norm': offset_grad_norm.item() if hasattr(offset_grad_norm, 'item') else offset_grad_norm,
                         'train/lr_base': self.scheduler.get_last_lr()[1],
                         'train/lr_offset': self.scheduler.get_last_lr()[0],
                         'train/epoch': self.epoch,
                         'system/gpu_memory_gb': torch.cuda.max_memory_allocated(self.device) / 1024**3,
                     }
+
+                    # Predictive coding gate: log gain and pred_loss
+                    gain_mean = sum(
+                        F.softplus(l.ca_gain.bias.data).item() for l in layers
+                    ) / len(layers)
+                    log_dict['train/pc_gain_mean'] = gain_mean
+                    if model_unwrapped._last_pred_loss is not None:
+                        log_dict['train/pred_loss'] = model_unwrapped._last_pred_loss.item()
 
                     # Per-token-type loss breakdown (last micro-batch only)
                     breakdown = self._compute_loss_breakdown(logits.detach(), labels)
@@ -511,7 +499,6 @@ class Trainer:
             'global_step': self.global_step,
             'model_state_dict': model_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'optimizer_gamma_state_dict': self.optimizer_gamma.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_valid_loss': self.best_valid_loss,
             'epochs_without_improvement': self.epochs_without_improvement,
@@ -541,8 +528,6 @@ class Trainer:
         model.load_state_dict(checkpoint['model_state_dict'])
 
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'optimizer_gamma_state_dict' in checkpoint:
-            self.optimizer_gamma.load_state_dict(checkpoint['optimizer_gamma_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
         self.epoch = checkpoint['epoch']

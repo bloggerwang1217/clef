@@ -52,7 +52,7 @@ class DeformableBridge(nn.Module):
     Input: List of features from different sources (Flow, Swin stages)
     Output: Unified multi-scale features for decoder cross-attention
 
-    When use_flow=True, Level 0 is HarmonicFlow output (H=1, W=T),
+    When use_flow=True, Level 0 is HarmonizingFlow output (H=1, W=T),
     followed by Swin stages as Levels 1-4.
     """
 

@@ -64,11 +64,15 @@ class ClefPianoConfig(ClefConfig):
             swin_dims=model_cfg.get("swin_dims", defaults.swin_dims),
             freeze_encoder=model_cfg.get("freeze_encoder", defaults.freeze_encoder),
 
-            # HarmonicFlow
+            # HarmonizingFlow
             use_flow=model_cfg.get("use_flow", defaults.use_flow),
             n_harmonics=model_cfg.get("n_harmonics", defaults.n_harmonics),
             flow_init=model_cfg.get("flow_init", defaults.flow_init),
             flow_pool_stride=model_cfg.get("flow_pool_stride", defaults.flow_pool_stride),
+            use_temporal_cnn=model_cfg.get("use_temporal_cnn", defaults.use_temporal_cnn),
+            temporal_pool_stride=model_cfg.get("temporal_pool_stride", defaults.temporal_pool_stride),
+            swin_start_stage=model_cfg.get("swin_start_stage", defaults.swin_start_stage),
+            swin_pool_strides=model_cfg.get("swin_pool_strides", defaults.swin_pool_strides),
 
             # Attention
             d_model=model_cfg.get("d_model", defaults.d_model),
@@ -83,6 +87,9 @@ class ClefPianoConfig(ClefConfig):
             freq_offset_scale=model_cfg.get("freq_offset_scale", defaults.freq_offset_scale),
             time_offset_scale=model_cfg.get("time_offset_scale", defaults.time_offset_scale),
 
+            # Gating
+            ca_gate_type=model_cfg.get("ca_gate_type", defaults.ca_gate_type),
+            pred_loss_weight=model_cfg.get("pred_loss_weight", defaults.pred_loss_weight),
             # Priors
             use_time_prior=model_cfg.get("use_time_prior", defaults.use_time_prior),
             use_freq_prior=model_cfg.get("use_freq_prior", defaults.use_freq_prior),

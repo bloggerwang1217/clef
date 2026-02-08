@@ -1,5 +1,5 @@
 """
-HarmonicFlow: Physics-based Coordinate Transform
+HarmonizingFlow: Physics-based Coordinate Transform
 =================================================
 
 Per-frame invertible transform from mel frequency space to pitch space.
@@ -7,7 +7,7 @@ Per-frame invertible transform from mel frequency space to pitch space.
 Neuroscience analogy:
 - Mel spectrogram = acoustic signal (microphone output)
 - Swin = cochlea (local frequency decomposition, 2D attention)
-- HarmonicFlow = brainstem (coordinate transform: frequency -> pitch space)
+- HarmonizingFlow = brainstem (coordinate transform: frequency -> pitch space)
 
 The transform is a 128x128 square matrix (invertible, lossless):
 - Rows 0-87: harmonic templates for 88 piano keys (A0 to C8)
@@ -27,6 +27,7 @@ import librosa
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _build_harmonic_template(
@@ -141,7 +142,90 @@ def _build_orthogonal_complement(
     return complement
 
 
-class HarmonicFlow(nn.Module):
+class _CausalConvBlock(nn.Module):
+    """Single causal conv1d block with residual connection.
+
+    Causal: left-pad only, no future information leakage.
+    """
+
+    def __init__(self, channels: int, kernel_size: int, dilation: int):
+        super().__init__()
+        self.causal_pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(channels, channels, kernel_size, dilation=dilation)
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Args: x [B, C, T]. Returns: [B, C, T]."""
+        residual = x
+        h = F.pad(x, (self.causal_pad, 0))  # left-pad only
+        h = self.conv(h)  # [B, C, T]
+        h = h.transpose(1, 2)  # [B, T, C] for LayerNorm
+        h = self.norm(h)
+        h = F.gelu(h)
+        return h.transpose(1, 2) + residual  # [B, C, T]
+
+
+def _init_difference_operator(conv: nn.Conv1d) -> None:
+    """Initialize Conv1d as causal temporal difference operator.
+
+    Physics prior: onset = energy change in pitch space.
+    Each output channel computes the temporal derivative of the
+    corresponding input channel: out[c,t] = in[c,t] - in[c,t-2].
+
+    For causal conv with kernel_size=3 and left-padding=2:
+        kernel positions [0, 1, 2] correspond to [t-2, t-1, t].
+        Setting weights to [-1, 0, +1] computes central difference.
+
+    This gives onset spikes from epoch 0, analogous to HarmonizingFlow's
+    harmonic template initialization giving pitch activations from epoch 0.
+    """
+    with torch.no_grad():
+        nn.init.zeros_(conv.weight)   # [C_out, C_in, K]
+        nn.init.zeros_(conv.bias)
+        C = conv.weight.shape[0]
+        for c in range(C):
+            conv.weight[c, c, 0] = -1.0  # t-2 (oldest, due to causal pad)
+            conv.weight[c, c, 2] = +1.0  # t   (current)
+
+
+class TemporalCNN(nn.Module):
+    """Causal 1D CNN for temporal dynamics in pitch space.
+
+    Neuroscience analogy: inferior colliculus temporal modulation filtering.
+    Detects onset/sustain/release patterns in pitch activation timelines.
+
+    Architecture: 2-layer causal dilated conv with residual connections.
+    - Layer 1: difference operator init → onset/release from epoch 0
+    - Layer 2: random init → learns higher-order temporal patterns
+
+    Physics initialization (layer 1):
+        kernel = [-1, 0, +1] per channel (causal central difference)
+        → positive spike at onset (energy appeared)
+        → negative spike at release (energy disappeared)
+        → near zero during sustain (energy stable)
+        Equivalent to spectral flux onset detection in pitch space.
+
+    Input:  [B, C, T] pitch-space features (detached from HarmonizingFlow)
+    Output: [B, C, T] with temporal context baked in
+    """
+
+    def __init__(self, channels: int = 128, kernel_size: int = 3):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            _CausalConvBlock(channels, kernel_size, dilation=1),  # RF: 3 frames
+            _CausalConvBlock(channels, kernel_size, dilation=2),  # RF: 7 frames
+        ])
+        # Layer 1: difference operator (onset detection from epoch 0)
+        _init_difference_operator(self.blocks[0].conv)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Args: x [B, C, T]. Returns: [B, C, T]."""
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+class HarmonizingFlow(nn.Module):
     """Per-frame invertible transform: mel frequency space -> pitch space.
 
     Applies a 128x128 square matrix to each time frame of the mel spectrogram.
@@ -168,10 +252,14 @@ class HarmonicFlow(nn.Module):
         sample_rate: int = 16000,
         n_fft: int = 2048,
         init: str = 'harmonic',
+        use_temporal_cnn: bool = False,
+        temporal_pool_stride: int = 8,
     ):
         super().__init__()
         self.n_mels = n_mels
         self.n_pitches = n_pitches
+        self.use_temporal_cnn = use_temporal_cnn
+        self.temporal_pool_stride = temporal_pool_stride
 
         if init == 'harmonic':
             # Physics-based: harmonic templates + orthogonal complement
@@ -198,22 +286,44 @@ class HarmonicFlow(nn.Module):
         # Learnable parameter
         self.transform = nn.Parameter(full_matrix)
 
-    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+        # Temporal CNN: onset/sustain/release detection in pitch space
+        # Reads Flow output but gradient does NOT flow back to self.transform
+        if use_temporal_cnn:
+            self.temporal_cnn = TemporalCNN(n_mels, kernel_size=3)
+
+    def forward(self, mel: torch.Tensor):
         """Apply coordinate transform to mel spectrogram.
 
         Args:
             mel: [B, 1, n_mels, T] log-mel spectrogram
 
         Returns:
-            pitch_features: [B, T, n_mels] in pitch space
-                - [:, :, :88] = piano key activations
-                - [:, :, 88:] = residual spectral info
+            If use_temporal_cnn=False:
+                pitch_features: [B, T, n_mels] in pitch space
+            If use_temporal_cnn=True:
+                (pitch_features, temporal_features):
+                    pitch_features:    [B, T, n_mels] pitch space (full resolution)
+                    temporal_features: [B, T//pool_stride, n_mels] with temporal context
         """
         # mel: [B, 1, 128, T] -> [B, T, 128]
         x = mel.squeeze(1).permute(0, 2, 1)  # [B, T, 128]
 
         # Apply transform: [B, T, 128] @ [128, 128]^T -> [B, T, 128]
-        return x @ self.transform.T
+        pitch = x @ self.transform.T
+
+        if not self.use_temporal_cnn:
+            return pitch
+
+        # Temporal CNN: detached from transform (observer, not operator)
+        # CNN reads pitch-space activations but gradient does NOT flow back
+        # to self.transform — same principle as reference_refine detach.
+        t = pitch.detach().transpose(1, 2)  # [B, 128, T]
+        t = self.temporal_cnn(t)  # [B, 128, T]
+        t = F.avg_pool1d(t, kernel_size=self.temporal_pool_stride,
+                         stride=self.temporal_pool_stride)
+        temporal = t.transpose(1, 2)  # [B, T//stride, 128]
+
+        return pitch, temporal
 
     def check_invertibility(self) -> dict:
         """Check invertibility diagnostics.

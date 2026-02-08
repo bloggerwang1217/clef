@@ -306,7 +306,7 @@ def generate_kern(
     model: ClefPianoBase,
     mel_path: str,
     tokenizer: KernTokenizer,
-    max_length: int = 4096,
+    max_length: int = 16384,
     chunk_frames: int = 24000,
     overlap_frames: int = 6000,
     device: str = 'cuda',
