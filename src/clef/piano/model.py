@@ -26,7 +26,7 @@ from transformers import Swinv2Model
 
 from .config import ClefPianoConfig
 from ..bridge import DeformableBridge
-from ..decoder import ClefDecoder
+from ..decoder import ClefDecoder, SADecoderLayer, MambaDecoderLayer
 from ..flow import HarmonizingFlow
 
 
@@ -131,6 +131,10 @@ class ClefPianoBase(nn.Module):
             use_freq_prior=config.use_freq_prior,
             n_freq_groups=config.n_freq_groups,
             refine_range=config.refine_range,
+            decoder_layer_types=config.decoder_layer_types,
+            d_state=config.mamba_d_state,
+            d_conv=config.mamba_d_conv,
+            expand=config.mamba_expand,
         )
 
         # === Output ===
@@ -352,6 +356,21 @@ class ClefPianoBase(nn.Module):
             value_cache_list.append(cache)
         return value_cache_list
 
+    def _get_cached_len(self, past_states: list) -> int:
+        """Get the number of previously cached tokens from past_states.
+
+        Checks SA layers for KV-cache shape, or Mamba InferenceParams for seqlen_offset.
+        """
+        for i, layer in enumerate(self.decoder.layers):
+            state = past_states[i]
+            if state is None:
+                continue
+            if isinstance(layer, SADecoderLayer) and isinstance(state, tuple):
+                return state[0].shape[2]  # K cache: [B, H, S_cached, D_head]
+            if hasattr(state, 'seqlen_offset'):
+                return state.seqlen_offset  # Mamba InferenceParams
+        return 0
+
     def decode(
         self,
         input_ids: torch.Tensor,  # [B, S]
@@ -359,11 +378,11 @@ class ClefPianoBase(nn.Module):
         spatial_shapes: torch.Tensor,
         level_start_index: torch.Tensor,
         valid_ratios: torch.Tensor,
-        past_kv: Optional[list] = None,
+        past_states: Optional[list] = None,
         use_cache: bool = False,
         value_cache: Optional[list] = None,
     ):
-        """Decode with FluxAttention.
+        """Decode with Jamba hybrid decoder.
 
         Args:
             input_ids: Input token IDs [B, S]
@@ -371,39 +390,38 @@ class ClefPianoBase(nn.Module):
             spatial_shapes: [L, 2]
             level_start_index: [L]
             valid_ratios: [B, L, 2]
-            past_kv: List of (k_cache, v_cache) per decoder layer (inference only)
-            use_cache: Whether to return updated KV caches
+            past_states: List of per-layer state (KV tuple for SA, InferenceParams for Mamba)
+            use_cache: Whether to return updated states
             value_cache: Pre-computed cross-attn value maps (from prepare_value_cache)
 
         Returns:
             logits: Output logits [B, S, vocab_size]
-            new_kv: (only if use_cache=True) list of (k, v) per layer
+            new_states: (only if use_cache=True) list of states per layer
         """
         B, S = input_ids.shape
 
         # Token embedding
         tgt = self.token_embed(input_ids)  # [B, S, D]
 
-        # Position embedding: use correct position offset when using KV-cache
-        if past_kv is not None:
-            # Incremental decoding: position = cached_length .. cached_length + S
-            cached_len = past_kv[0][0].shape[2]  # [B, H, S_cached, D_head]
+        # Position embedding: use correct position offset when using cache
+        if past_states is not None:
+            cached_len = self._get_cached_len(past_states)
             tgt_pos = self.decoder_pos_embed[:, cached_len:cached_len + S, :]
         else:
             tgt_pos = self.decoder_pos_embed[:, :S, :]
 
         # Run decoder
         if use_cache:
-            tgt, new_kv = self.decoder(
+            tgt, new_states = self.decoder(
                 tgt, memory,
                 spatial_shapes, level_start_index, valid_ratios,
                 tgt_pos=tgt_pos,
-                past_kv_list=past_kv,
+                past_states=past_states,
                 use_cache=True,
                 value_cache_list=value_cache,
             )
             logits = self.output_head(tgt)
-            return logits, new_kv
+            return logits, new_states
         else:
             tgt = self.decoder(
                 tgt, memory,
@@ -480,6 +498,23 @@ class ClefPianoBase(nn.Module):
 
         return self._causal_mask_cache[seq_len].to(device)
 
+    def _init_inference_states(self, batch_size: int, max_length: int, device: torch.device) -> list:
+        """Initialize per-layer inference states.
+
+        SA layers: None (KV-cache built incrementally)
+        Mamba layers: shared InferenceParams object (mamba-ssm manages per-layer state)
+        """
+        from mamba_ssm.utils.generation import InferenceParams
+        mamba_params = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
+
+        past_states = []
+        for layer in self.decoder.layers:
+            if isinstance(layer, MambaDecoderLayer):
+                past_states.append(mamba_params)  # shared object
+            else:
+                past_states.append(None)  # SA, no cache yet
+        return past_states
+
     @torch.no_grad()
     def generate(
         self,
@@ -511,13 +546,18 @@ class ClefPianoBase(nn.Module):
         # Encode once
         memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
 
+        # Initialize inference states (Mamba InferenceParams + SA KV-cache)
+        past_states = self._init_inference_states(B, max_length, device)
+
         # Start with <sos>
         generated = torch.full((B, 1), sos_token_id, dtype=torch.long, device=device)
+        input_ids = generated
 
         for _ in range(max_length - 1):
-            # Decode current sequence
-            logits = self.decode(
-                generated, memory, spatial_shapes, level_start_index, valid_ratios
+            # Decode with cache
+            logits, past_states = self.decode(
+                input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
+                past_states=past_states, use_cache=True,
             )
 
             # Get last token logits
@@ -547,6 +587,7 @@ class ClefPianoBase(nn.Module):
 
             # Append
             generated = torch.cat([generated, next_token], dim=1)
+            input_ids = next_token  # next step: single token
 
             # Check for EOS
             if (next_token == eos_token_id).all():

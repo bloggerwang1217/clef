@@ -11,8 +11,16 @@ Example:
     "16r"  -> ["16", "r"]     (sixteenth rest)
     "[4E"  -> ["[", "4", "E"] (tie start + quarter E)
 
+Schema-first design (Mamba decoder):
+    After each <bar>, schema tokens are injected:
+    <bar> <4> 4 <key:3b> 8E- <coc> 8B- ...
+           ^  ^    ^
+    numerator | key signature
+         denominator (reuses existing duration token)
+
 Vocabulary Design:
-    - Special tokens: <pad>, <sos>, <eos>, <unk>, <coc>, etc.
+    - Special tokens: <pad>, <sos>, <eos>, <coc>, <bar>, etc.
+    - Schema tokens: <2>~<17> (numerator), <key:0>~<key:7#>/<key:1b>~<key:7b>
     - Duration tokens: 1, 2, 4, 8, 16, 32, 64, 128, dotted, triplets
     - Pitch tokens: CC, C, c, cc, ccc (octave notation) with accidentals
     - Modifiers: ties ([, ], _), grace notes (q, Q, P)
@@ -20,7 +28,7 @@ Vocabulary Design:
 Benefits of Factorized Encoding:
     - Small vocab (~512) vs single-token (~9000+)
     - Compositional generalization
-    - Rare combinations don't become <unk>
+    - Rare combinations don't need fallback tokens
 """
 
 import re
@@ -37,18 +45,88 @@ SPECIAL_TOKENS = {
     "<pad>": 0,
     "<sos>": 1,
     "<eos>": 2,
-    "<unk>": 3,
-    "<coc>": 4,      # Change of Column (multi-track separator)
-    "<bar>": 5,      # Bar line
-    "<b>": 6,        # Beat boundary
-    "<continue>": 7, # Chunk boundary (piece continues in next chunk)
-    "<nl>": 8,       # Newline (line separator within measure)
-    "<split>": 9,    # Spine split (*^)
-    "<merge>": 10,   # Spine merge (*v)
-    "<*>": 11,       # Null interpretation (* in split/merge lines)
+    "<coc>": 3,      # Change of Column (multi-track separator)
+    "<bar>": 4,      # Bar line
+    "<b>": 5,        # Beat boundary
+    "<continue>": 6, # Chunk boundary (piece continues in next chunk)
+    "<nl>": 7,       # Newline (line separator within measure)
+    "<split>": 8,    # Spine split (*^)
+    "<merge>": 9,    # Spine merge (*v)
+    "<*>": 10,       # Null interpretation (* in split/merge lines)
 }
 
-# Duration tokens (Zeng vocab compatible)
+# Schema tokens: time signature numerators (beats per measure)
+# Denominator reuses existing duration tokens (2, 4, 8, 16, 32)
+METER_NUMERATOR_TOKENS = [
+    "<2>", "<3>", "<4>", "<5>", "<6>", "<7>",
+    "<8>", "<9>", "<10>", "<12>", "<17>",
+]
+
+# Schema tokens: key signatures (circle of fifths)
+KEY_TOKENS = [
+    "<key:0>",                                          # C major / A minor
+    "<key:1#>", "<key:2#>", "<key:3#>", "<key:4#>",    # sharps
+    "<key:5#>", "<key:6#>", "<key:7#>",
+    "<key:1b>", "<key:2b>", "<key:3b>", "<key:4b>",    # flats
+    "<key:5b>", "<key:6b>", "<key:7b>",
+]
+
+# Mapping from kern key signature to token
+_KEY_SIG_TO_TOKEN = {
+    '*k[]': '<key:0>',
+    '*k[f#]': '<key:1#>', '*k[f#c#]': '<key:2#>', '*k[f#c#g#]': '<key:3#>',
+    '*k[f#c#g#d#]': '<key:4#>', '*k[f#c#g#d#a#]': '<key:5#>',
+    '*k[f#c#g#d#a#e#]': '<key:6#>', '*k[f#c#g#d#a#e#b#]': '<key:7#>',
+    '*k[b-]': '<key:1b>', '*k[b-e-]': '<key:2b>', '*k[b-e-a-]': '<key:3b>',
+    '*k[b-e-a-d-]': '<key:4b>', '*k[b-e-a-d-g-]': '<key:5b>',
+    '*k[b-e-a-d-g-c-]': '<key:6b>', '*k[b-e-a-d-g-c-f-]': '<key:7b>',
+}
+
+# Reverse mapping: token to kern key signature
+_TOKEN_TO_KEY_SIG = {v: k for k, v in _KEY_SIG_TO_TOKEN.items()}
+
+
+def normalize_key_sig(key_sig: str) -> str:
+    """Normalize non-standard key signatures (e.g. Chopin with explicit naturals).
+
+    Strips natural signs and maps to standard circle-of-fifths form.
+    Examples:
+        '*k[bnenf#c#]' -> '*k[f#c#]'  (D major with explicit naturals)
+        '*k[cancel]'   -> '*k[]'       (cancellation marker)
+    """
+    if key_sig in _KEY_SIG_TO_TOKEN:
+        return key_sig
+    if key_sig == '*k[cancel]':
+        return '*k[]'
+    # Strip natural signs (n, n-) and reconstruct
+    inside = key_sig[3:-1]  # extract content between *k[ and ]
+    # Keep only sharps and flats
+    accidentals = []
+    i = 0
+    while i < len(inside):
+        ch = inside[i]
+        if ch in 'abcdefg':
+            # Check next char
+            if i + 1 < len(inside) and inside[i + 1] == '#':
+                accidentals.append(f'{ch}#')
+                i += 2
+            elif i + 1 < len(inside) and inside[i + 1] == '-':
+                accidentals.append(f'{ch}-')
+                i += 2
+            else:
+                # Natural (no accidental) — skip
+                # Also handle 'n' or 'n-' after letter
+                if i + 1 < len(inside) and inside[i + 1] == 'n':
+                    i += 2
+                    if i < len(inside) and inside[i] == '-':
+                        i += 1  # skip 'n-'
+                else:
+                    i += 1
+        else:
+            i += 1
+    return f'*k[{"".join(accidentals)}]'
+
+# Duration tokens (Zeng vocab only — OOV durations handled by rhythm_quantizer.py)
 DURATION_TOKENS = [
     # Binary
     "0", "00",                          # breve, longa
@@ -58,7 +136,7 @@ DURATION_TOKENS = [
     "1.", "2.", "4.", "8.", "16.", "32.", "64.",
     # Triplets
     "3", "6", "12", "24", "48", "96",
-    # Extended (quintuplets, septuplets, etc.)
+    # Extended (Zeng vocab: quintuplet, septuplet, 11-tuplet)
     "20", "40", "112", "176",
 ]
 
@@ -171,6 +249,14 @@ def build_vocab() -> Tuple[Dict[str, int], Dict[int, str]]:
         token_to_id[token] = special_idx
         idx = max(idx, special_idx + 1)
 
+    # Schema tokens (meter numerators + key signatures)
+    for token in METER_NUMERATOR_TOKENS:
+        token_to_id[token] = idx
+        idx += 1
+    for token in KEY_TOKENS:
+        token_to_id[token] = idx
+        idx += 1
+
     # Structural tokens
     for token in STRUCTURAL_TOKENS:
         if token not in token_to_id:
@@ -239,8 +325,10 @@ class KernTokenizer:
         self._duration_pattern = re.compile(
             r'^(\d+\.?)'  # Duration: digits optionally followed by dot
         )
-        self._pitch_pattern = re.compile(
-            r'([A-Ga-g]+[#\-n]*|r)'  # Pitch: letters with optional accidentals (#, -, n), or rest
+        # Valid kern pitch: same letter repeated + optional accidentals.
+        # Uses backreference to ensure all octave letters are identical.
+        self._single_pitch_re = re.compile(
+            r'(([A-G])\2*|([a-g])\3*)[#\-n]*|r'
         )
         self._tie_start_pattern = re.compile(r'^[\[({]+')
         self._tie_end_pattern = re.compile(r'[\])}]+$')
@@ -251,8 +339,48 @@ class KernTokenizer:
         self._valid_durations = set(DURATION_TOKENS)
         self._valid_pitches = set(PITCH_TOKENS)
 
+    @staticmethod
+    def _clean_pitch(pitch: str) -> str:
+        """Clean a pitch token: strip naturals, resolve conflicting accidentals.
+
+        Zeng-compatible vocabulary does not include natural accidentals (n).
+        Conflicting sharps+flats (data errors) are resolved by keeping the first.
+        """
+        if pitch == 'r':
+            return pitch
+        pitch = pitch.replace('n', '')
+        if not pitch:
+            return ''
+        # Resolve conflicting accidentals (e.g. ccc#- -> ccc#)
+        if '#' in pitch and '-' in pitch:
+            sharp_pos = pitch.index('#')
+            flat_pos = pitch.index('-')
+            if sharp_pos < flat_pos:
+                pitch = pitch.replace('-', '')
+            else:
+                pitch = pitch.replace('#', '')
+        return pitch
+
+    def _split_kern_token(self, token: str) -> List[str]:
+        """Split concatenated kern notes that each have their own duration.
+
+        Handles data quality issues where notes lack space separation:
+            '4r4G-'  -> ['4r', '4G-']     (rest + note concatenated)
+            '16c#0'  -> ['16c#']           (stray '0' discarded)
+            '24ffd#' -> ['24ffd#']         (pitch splitting handled in tokenize_kern_token)
+        """
+        clean = self._beam_pattern.sub('', token)
+        # Split at boundaries: after pitch/accidental/rest, before digit (new duration)
+        parts = re.split(r'(?<=[A-Ga-gr#\-n])(?=\d)', clean)
+        # Keep only parts that contain a pitch character (discard stray numbers)
+        result = [p for p in parts if re.search(r'[A-Ga-gr]', p)]
+        return result if result else [clean]
+
     def tokenize_kern_token(self, token: str) -> List[str]:
         """Tokenize a single kern token into factorized components.
+
+        Handles malformed kern data: concatenated chord notes (e.g. '24ffd#'),
+        natural accidentals (e.g. 'bbn'), and conflicting accidentals (e.g. 'ccc#-').
 
         Args:
             token: A single kern token like "4c#", "[8.G", "16r"
@@ -262,18 +390,6 @@ class KernTokenizer:
         """
         if not token or token == ".":
             return ["."]
-
-        # Handle <unk> tokens
-        if token.startswith("<unk>"):
-            # Extract pitch part after <unk>
-            pitch_part = token[5:]  # Remove "<unk>"
-            if pitch_part:
-                # Try to extract pitch
-                pitch_match = self._pitch_pattern.search(pitch_part)
-                if pitch_match:
-                    pitch = pitch_match.group(1)
-                    return ["<unk>", pitch]
-            return ["<unk>"]
 
         result = []
         remaining = token
@@ -295,39 +411,51 @@ class KernTokenizer:
             grace_token = grace_match.group()
             remaining = remaining[:grace_match.start()] + remaining[grace_match.end():]
 
-        # 4. Extract pitch (from anywhere in remaining)
-        pitch_token = None
-        pitch_match = self._pitch_pattern.search(remaining)
-        if pitch_match:
-            pitch_token = pitch_match.group(1)
-            remaining = remaining[:pitch_match.start()] + remaining[pitch_match.end():]
+        # 4. Extract ALL valid pitches using backreference regex.
+        #    This handles concatenated chord notes like 'ffd#' -> ['ff', 'd#']
+        #    where the greedy [A-Ga-g]+ would incorrectly match 'ffd#' as one pitch.
+        pitches = []
+        for pm in self._single_pitch_re.finditer(remaining):
+            pitch = self._clean_pitch(pm.group(0))
+            if pitch:
+                pitches.append(pitch)
+        # Remove all pitch material from remaining to isolate duration
+        remaining = self._single_pitch_re.sub('', remaining)
 
         # 5. Extract duration (from what's left — may be at start or after
         #    removing pitch/grace from non-standard orderings like "a8q")
         dur_match = re.search(r'(\d+\.?)', remaining)
+        duration = None
         if dur_match:
             duration = dur_match.group(1)
-            result.append(duration)
             remaining = remaining[:dur_match.start()] + remaining[dur_match.end():]
 
-        # 6. Emit grace note marker (after duration, before pitch)
-        if grace_token:
-            result.append(grace_token)
+        # 6. Emit tokens: [duration] [grace] pitch for each pitch found.
+        #    For concatenated chords (multiple pitches), duration is repeated.
+        for i, pitch in enumerate(pitches):
+            if i == 0:
+                if duration:
+                    result.append(duration)
+                if grace_token:
+                    result.append(grace_token)
+            else:
+                # Chord note from concatenated data: repeat duration
+                if duration:
+                    result.append(duration)
+            result.append(pitch)
 
-        # 7. Emit pitch
-        if pitch_token:
-            result.append(pitch_token)
+        # 7. If no pitches found but we have a duration, emit just the duration
+        if not pitches and duration:
+            result.append(duration)
 
         # 8. Extract trailing tie markers from what's left
         tie_end_match = self._tie_end_pattern.search(remaining)
         if tie_end_match:
             for char in tie_end_match.group():
                 result.append(char)
-            remaining = remaining[:tie_end_match.start()]
 
-        # If nothing was extracted, return as unknown
         if not result:
-            return ["<unk>"]
+            raise ValueError(f"Cannot tokenize kern token: {token!r}")
 
         return result
 
@@ -335,6 +463,9 @@ class KernTokenizer:
         """Tokenize a line of kern data.
 
         Handles tab-separated spines and special lines (comments, interpretations).
+        Time signature and key signature interpretation lines update internal state
+        (self._current_time_sig, self._current_key_sig) but don't emit tokens
+        directly — schema tokens are injected after <bar> by tokenize().
 
         Args:
             line: A line from kern file
@@ -352,12 +483,25 @@ class KernTokenizer:
         if line.startswith("!"):
             return []
 
-        # Handle spine split/merge interpretation lines
+        # Handle interpretation lines
         if line.startswith("*"):
             fields = line.split("\t")
+
+            # Check for time signature (*M4/4, *M3/8, etc.)
+            for field in fields:
+                if field.startswith("*M") and '/' in field:
+                    self._current_time_sig = field  # e.g. '*M4/4'
+                    break
+
+            # Check for key signature (*k[f#c#], *k[], etc.)
+            for field in fields:
+                if field.startswith("*k["):
+                    self._current_key_sig = normalize_key_sig(field)
+                    break
+
+            # Handle spine split/merge
             has_split_merge = any(f in ("*^", "*v") for f in fields)
             if not has_split_merge:
-                # Regular interpretation (clef, key sig, etc.) — skip
                 return []
 
             # Tokenize spine split/merge: *^ -> <split>, *v -> <merge>, * -> <*>
@@ -388,21 +532,51 @@ class KernTokenizer:
                 result.append("<coc>")
 
             # Handle chord (space-separated notes in same spine)
-            notes = spine.split()
+            notes_raw = spine.split()
 
-            for j, note in enumerate(notes):
-                # Tokenize each note
-                tokens = self.tokenize_kern_token(note)
-                result.extend(tokens)
+            for note in notes_raw:
+                # Split concatenated notes (data quality fix: e.g. '4r4G-' -> ['4r', '4G-'])
+                split_notes = self._split_kern_token(note)
+                for sn in split_notes:
+                    tokens = self.tokenize_kern_token(sn)
+                    result.extend(tokens)
 
         return result
+
+    def _make_schema_tokens(self) -> List[str]:
+        """Build schema token sequence from current time_sig and key_sig state.
+
+        Returns tokens like: ['<4>', '4', '<key:0>']
+        for *M4/4 and *k[].
+        """
+        tokens = []
+
+        # Time signature: extract numerator and denominator
+        if self._current_time_sig:
+            # Parse *M4/4 -> numerator=4, denominator=4
+            m = re.match(r'\*M(\d+)/(\d+)', self._current_time_sig)
+            if m:
+                numerator = m.group(1)
+                denominator = m.group(2)
+                num_token = f'<{numerator}>'
+                if num_token in VOCAB:
+                    tokens.append(num_token)
+                    tokens.append(denominator)  # reuse duration token
+
+        # Key signature
+        if self._current_key_sig:
+            key_token = _KEY_SIG_TO_TOKEN.get(self._current_key_sig)
+            if key_token:
+                tokens.append(key_token)
+
+        return tokens
 
     def tokenize(self, kern_content: str) -> List[str]:
         """Tokenize entire kern content.
 
-        Inserts <nl> between consecutive data lines within a measure.
-        <bar> tokens already imply a line break, so <nl> is NOT inserted
-        before or after <bar>.
+        Schema-first: after each <bar>, injects schema tokens (time sig + key sig).
+        Initial schema is emitted right after <sos>.
+        <nl> separates consecutive data lines within a measure.
 
         Args:
             kern_content: Full kern file content or sequence
@@ -410,10 +584,32 @@ class KernTokenizer:
         Returns:
             List of all tokens (factorized)
         """
+        # Reset schema state for this tokenization
+        self._current_time_sig = None
+        self._current_key_sig = None
+
+        # First pass: scan for initial time_sig and key_sig before first barline
+        # (interpretation lines appear before first measure)
+        lines = kern_content.split("\n")
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("="):
+                break  # stop at first barline
+            if stripped.startswith("*"):
+                fields = stripped.split("\t")
+                for field in fields:
+                    if field.startswith("*M") and '/' in field and not self._current_time_sig:
+                        self._current_time_sig = field
+                    if field.startswith("*k[") and not self._current_key_sig:
+                        self._current_key_sig = normalize_key_sig(field)
+
         result = ["<sos>"]
+        # Emit initial schema right after <sos>
+        result.extend(self._make_schema_tokens())
+
         prev_was_data = False  # Was the previous emitted line a data line?
 
-        for line in kern_content.split("\n"):
+        for line in lines:
             line_tokens = self.tokenize_line(line)
             if not line_tokens:
                 continue
@@ -425,22 +621,37 @@ class KernTokenizer:
                 result.append("<nl>")
 
             result.extend(line_tokens)
+
+            # After <bar>, inject schema tokens
+            if is_bar:
+                result.extend(self._make_schema_tokens())
+
             prev_was_data = not is_bar
 
         result.append("<eos>")
         return result
 
-    def encode(self, kern_content: str) -> List[int]:
+    def encode(self, kern_content: str, strict: bool = True) -> List[int]:
         """Encode kern content to token IDs.
 
         Args:
             kern_content: Kern file content or sequence
+            strict: If True (default), raise ValueError on OOV tokens.
+                    If False, raise ValueError but caller can catch it.
 
         Returns:
             List of token IDs
+
+        Raises:
+            ValueError: If any token is not in vocabulary
         """
         tokens = self.tokenize(kern_content)
-        return [self.vocab.get(t, self.vocab["<unk>"]) for t in tokens]
+        ids = []
+        for t in tokens:
+            if t not in self.vocab:
+                raise ValueError(f"Token {t!r} not in vocabulary")
+            ids.append(self.vocab[t])
+        return ids
 
     def decode(self, token_ids: List[int], skip_special: bool = True) -> str:
         """Decode token IDs back to kern format.
@@ -454,7 +665,7 @@ class KernTokenizer:
         """
         tokens = []
         for tid in token_ids:
-            token = self.id_to_token.get(tid, "<unk>")
+            token = self.id_to_token.get(tid, f"<UNK:{tid}>")
             if skip_special and token in ["<pad>", "<sos>", "<eos>", "<continue>"]:
                 continue
             tokens.append(token)
@@ -466,20 +677,47 @@ class KernTokenizer:
         """Reconstruct kern string from factorized tokens.
 
         This is the inverse of tokenization - combines duration and pitch
-        back into single kern tokens. Handles <nl> as line separator.
+        back into single kern tokens. Schema tokens after <bar> are consumed
+        to track state but not emitted as note content.
         """
+        # Schema token sets for detection
+        _numerator_set = set(METER_NUMERATOR_TOKENS)
+        _key_set = set(KEY_TOKENS)
+
         result = []
         current_note = []
+        # State machine: after <bar>, consume schema tokens before note data
+        consuming_schema = False
+        schema_expect_denom = False  # after numerator, expect denominator
 
         for token in tokens:
+            # Schema consumption: after <bar> (or at start), eat schema tokens
+            if consuming_schema:
+                if token in _numerator_set:
+                    schema_expect_denom = True
+                    continue
+                if schema_expect_denom and token in self._valid_durations:
+                    schema_expect_denom = False
+                    continue
+                if token in _key_set:
+                    continue
+                # Not a schema token — stop consuming, process normally
+                consuming_schema = False
+                schema_expect_denom = False
+
+            if token in _numerator_set or token in _key_set:
+                # Schema token outside of post-bar context (e.g. after <sos>)
+                consuming_schema = True
+                if token in _numerator_set:
+                    schema_expect_denom = True
+                continue
+
             if token == "<nl>":
-                # Line separator: flush and insert newline
                 if current_note:
                     result.append("".join(current_note))
                     current_note = []
                 result.append("\n")
             elif token == "<coc>":
-                # End current note, add tab
                 if current_note:
                     result.append("".join(current_note))
                     current_note = []
@@ -489,24 +727,22 @@ class KernTokenizer:
                     result.append("".join(current_note))
                     current_note = []
                 result.append("\n=\n")
+                consuming_schema = True
+                schema_expect_denom = False
             elif token == ".":
                 if current_note:
                     result.append("".join(current_note))
                     current_note = []
                 result.append(".")
             elif token in self._valid_durations:
-                # Start new note with duration
                 if current_note:
                     result.append("".join(current_note))
                 current_note = [token]
             elif token in self._valid_pitches:
-                # Add pitch to current note
                 current_note.append(token)
             elif token in ["[", "]", "(", ")", "{", "}", "q", "Q", "P", ";"]:
-                # Modifiers
                 current_note.append(token)
             elif token in ("<split>", "<merge>", "<*>"):
-                # Spine structure tokens — emit as kern interpretation
                 if current_note:
                     result.append("".join(current_note))
                     current_note = []
@@ -516,15 +752,9 @@ class KernTokenizer:
                     result.append("*v")
                 else:
                     result.append("*")
-            elif token == "<unk>":
-                if current_note:
-                    result.append("".join(current_note))
-                current_note = ["<unk>"]
             else:
-                # Unknown token
                 current_note.append(token)
 
-        # Don't forget last note
         if current_note:
             result.append("".join(current_note))
 
@@ -569,10 +799,6 @@ def analyze_kern_file(filepath: Path, tokenizer: Optional[KernTokenizer] = None)
     tokens = tokenizer.tokenize(content)
     token_ids = tokenizer.encode(content)
 
-    # Count unknowns
-    unk_id = tokenizer.vocab["<unk>"]
-    unk_count = token_ids.count(unk_id)
-
     # Token frequency
     from collections import Counter
     token_freq = Counter(tokens)
@@ -581,8 +807,6 @@ def analyze_kern_file(filepath: Path, tokenizer: Optional[KernTokenizer] = None)
         "filepath": str(filepath),
         "total_tokens": len(tokens),
         "unique_tokens": len(token_freq),
-        "unknown_count": unk_count,
-        "unknown_rate": unk_count / len(tokens) if tokens else 0,
         "top_tokens": token_freq.most_common(20),
     }
 
@@ -608,7 +832,6 @@ if __name__ == "__main__":
         "4d]",
         "8qf#",
         "24ggLL",
-        "<unk>een",
         "2.BB-",
     ]
 

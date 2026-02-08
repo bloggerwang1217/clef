@@ -59,6 +59,9 @@ class ChunkedDataset(Dataset):
         # Pre-compute all chunks
         self.chunks = self._create_chunks()
 
+        # OOV skip counter (reset per epoch for logging)
+        self.oov_skipped_chunks = 0
+
         logger.info(
             f"ChunkedDataset: {len(self.base_dataset)} pieces -> {len(self.chunks)} chunks "
             f"(chunk={chunk_frames} frames, overlap={overlap_frames} frames)"
@@ -134,10 +137,18 @@ class ChunkedDataset(Dataset):
         is_last_chunk = True  # default: single chunk or no alignment info
 
         if not audio_measures or not kern_measures or self.tokenizer is None:
-            if start_frame == 0:
+            if start_frame == 0 and not meta.get('has_oov', False):
                 # First (and only) chunk without alignment: tokens from
                 # ManifestDataset are acceptable since both start from 0.
                 pass
+            elif start_frame == 0 and meta.get('has_oov', False):
+                # File has OOV but no alignment info — cannot recover
+                name = meta.get('name', f'base_idx={base_idx}')
+                logger.warning(
+                    f"Chunk {idx} ({name}): OOV tokens and no alignment "
+                    f"info, skipping entire piece"
+                )
+                return None
             else:
                 name = meta.get('name', f'base_idx={base_idx}')
                 logger.error(
@@ -171,7 +182,18 @@ class ChunkedDataset(Dataset):
                     with open(kern_path, 'r', encoding='utf-8') as f:
                         all_lines = f.readlines()
                     chunk_kern = ''.join(all_lines[line_start - 1:line_end])
-                    tokens = self.tokenizer.encode(chunk_kern)
+
+                    try:
+                        tokens = self.tokenizer.encode(chunk_kern)
+                    except ValueError as e:
+                        self.oov_skipped_chunks += 1
+                        name = meta.get('name', f'base_idx={base_idx}')
+                        logger.warning(
+                            f"Chunk {idx} ({name}): OOV in measures "
+                            f"{first_m}-{last_m}, skipping chunk "
+                            f"[{start_frame}:{end_frame}]: {e}"
+                        )
+                        return None
 
                     # tokenizer.encode() always appends <eos>.
                     # For non-final chunks, replace <eos> with <continue>
@@ -267,6 +289,9 @@ class ManifestDataset(Dataset):
             else:
                 logger.warning(f"ManifestDataset: augmentation metadata not found at {aug_path}")
 
+        # Track which kern files have OOV (log once per file, not per access)
+        self._oov_warned_kerns: set = set()
+
         logger.info(f"ManifestDataset: loaded {len(self.manifest)} items from {manifest_path}")
 
     def __len__(self) -> int:
@@ -288,10 +313,23 @@ class ManifestDataset(Dataset):
         # Load and tokenize kern
         with open(kern_path, 'r', encoding='utf-8') as f:
             kern_content = f.read()
-        tokens = self.tokenizer.encode(kern_content)
+
+        has_oov = False
+        try:
+            tokens = self.tokenizer.encode(kern_content)
+        except ValueError as e:
+            # OOV tokens in kern — mark for chunk-level handling.
+            # ChunkedDataset will re-tokenize per chunk; only chunks
+            # containing OOV measures will be skipped.
+            tokens = []
+            has_oov = True
+            if kern_path.name not in self._oov_warned_kerns:
+                self._oov_warned_kerns.add(kern_path.name)
+                logger.warning(f"ManifestDataset: {kern_path.name}: {e} "
+                               f"(will attempt chunk-level recovery)")
 
         # Truncate if needed
-        if len(tokens) > self.max_seq_len:
+        if tokens and len(tokens) > self.max_seq_len:
             tokens = tokens[:self.max_seq_len]
 
         metadata = {
@@ -299,6 +337,7 @@ class ManifestDataset(Dataset):
             'mel_path': str(mel_path),
             'kern_path': str(kern_path),
             'duration_frames': item.get('duration_frames', mel.shape[-1]),
+            'has_oov': has_oov,
         }
 
         # Add alignment info from augmentation metadata

@@ -21,13 +21,21 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Valid duration tokens (must match tokenizer vocabulary)
+# Valid duration tokens (Zeng vocab only — must match tokenizer)
 VALID_DURATIONS = {
     "0", "00", "1", "2", "4", "8", "16", "32", "64", "128",
     "0.", "00.", "1.", "2.", "4.", "8.", "16.", "32.", "64.",
     "3", "6", "12", "24", "48", "96",
     "20", "40", "112", "176",
 }
+
+# Schema token detection
+from src.clef.piano.tokenizer import (
+    METER_NUMERATOR_TOKENS, KEY_TOKENS,
+    _TOKEN_TO_KEY_SIG,
+)
+_NUMERATOR_SET = set(METER_NUMERATOR_TOKENS)
+_KEY_SET = set(KEY_TOKENS)
 
 
 def _assemble_spine_content(tokens: List[str]) -> str:
@@ -187,8 +195,113 @@ def reconstruct_kern_from_tokens(
     SPINE_TOKENS = {'<split>', '<merge>', '<*>'}
     SPINE_MAP = {'<split>': '*^', '<merge>': '*v', '<*>': '*'}
 
-    # Filter out padding/sos/eos
-    filtered = [t for t in tokens if t not in ['<pad>', '<sos>', '<eos>']]
+    # Filter out padding/sos/eos, extract schema tokens, and track changes.
+    # Schema changes between bars become interpretation lines in the output.
+    filtered = []
+    initial_time_sig = None   # first time sig seen (for header)
+    initial_key_sig = None    # first key sig seen (for header)
+    current_time_sig = None   # current state
+    current_key_sig = None
+    # Map from bar index (count of <bar> tokens) to schema changes
+    bar_schema_changes = {}   # bar_idx -> {'time_sig': ..., 'key_sig': ...}
+    bar_count = 0
+    consuming_schema = False
+    schema_expect_denom = False
+    pending_time_sig = None
+    pending_key_sig = None
+    schema_time_sig_num = None
+
+    def _flush_schema():
+        """Record schema changes at current bar.
+
+        Initial schema (bar_count=0) goes into the header via initial_time_sig/
+        initial_key_sig. Schema changes at bar_count>0 become interpretation
+        lines before the barline. This ensures files without pre-barline
+        time/key sigs (e.g. Joplin pickup bars) reconstruct correctly.
+        """
+        nonlocal pending_time_sig, pending_key_sig, current_time_sig, current_key_sig
+        nonlocal initial_time_sig, initial_key_sig
+        changes = {}
+        if pending_time_sig:
+            if pending_time_sig != current_time_sig:
+                # Only set initial from schema that appears before the first bar
+                if bar_count == 0 and initial_time_sig is None:
+                    initial_time_sig = pending_time_sig
+                else:
+                    changes['time_sig'] = pending_time_sig
+                current_time_sig = pending_time_sig
+            elif bar_count == 0 and initial_time_sig is None:
+                initial_time_sig = pending_time_sig
+                current_time_sig = pending_time_sig
+        if pending_key_sig:
+            if pending_key_sig != current_key_sig:
+                if bar_count == 0 and initial_key_sig is None:
+                    initial_key_sig = pending_key_sig
+                else:
+                    changes['key_sig'] = pending_key_sig
+                current_key_sig = pending_key_sig
+            elif bar_count == 0 and initial_key_sig is None:
+                initial_key_sig = pending_key_sig
+                current_key_sig = pending_key_sig
+        if changes:
+            bar_schema_changes[bar_count] = changes
+        pending_time_sig = None
+        pending_key_sig = None
+
+    for t in tokens:
+        if t in ['<pad>', '<sos>', '<eos>']:
+            continue
+
+        # Schema consumption: after <bar> or at start
+        if consuming_schema:
+            if t in _NUMERATOR_SET:
+                schema_expect_denom = True
+                schema_time_sig_num = t[1:-1]
+                continue
+            if schema_expect_denom and t in VALID_DURATIONS:
+                schema_expect_denom = False
+                pending_time_sig = f'*M{schema_time_sig_num}/{t}'
+                continue
+            if t in _KEY_SET:
+                pending_key_sig = _TOKEN_TO_KEY_SIG.get(t, '*k[]')
+                continue
+            # Not a schema token — flush pending schema and stop consuming
+            _flush_schema()
+            consuming_schema = False
+            schema_expect_denom = False
+
+        if t in _NUMERATOR_SET:
+            consuming_schema = True
+            schema_expect_denom = True
+            schema_time_sig_num = t[1:-1]
+            continue
+        if t in _KEY_SET:
+            consuming_schema = True
+            pending_key_sig = _TOKEN_TO_KEY_SIG.get(t, '*k[]')
+            continue
+
+        if t == '<bar>':
+            if consuming_schema:
+                _flush_schema()
+            consuming_schema = True
+            schema_expect_denom = False
+            bar_count += 1
+
+        filtered.append(t)
+
+    # Flush any remaining schema at end
+    if consuming_schema:
+        _flush_schema()
+
+    # Inject extracted schema into metadata
+    if metadata is None:
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    if initial_time_sig and 'time_sig' not in metadata:
+        metadata['time_sig'] = initial_time_sig
+    if initial_key_sig and 'key_sig' not in metadata:
+        metadata['key_sig'] = initial_key_sig
 
     # Build kern lines. Track current spine count dynamically
     # since <split>/<merge> change it.
@@ -304,13 +417,28 @@ def reconstruct_kern_from_tokens(
 
     # Second pass: replace barline placeholders with correct spine count.
     # Track spine count through split/merge operations.
+    # Inject interpretation lines when schema changes between bars.
     # Use first_measure_num from metadata if available (e.g. =0 for pickup bars).
     measure_num = int(metadata.get('first_measure_num', '0')) if metadata else 0
-    
+
     current_n = n_spines
+    bar_idx = 0  # counts bars to look up schema changes
     output_lines = []
     for line in kern_lines:
         if line == '<BAR_PLACEHOLDER>':
+            bar_idx += 1
+            # Inject schema change interpretation lines BEFORE the barline.
+            # In kern format, interpretation lines like *k[b-] / *M3/4 appear
+            # before the barline they apply to, so the tokenizer reads them
+            # before processing the barline (updating state before schema emission).
+            if bar_idx in bar_schema_changes:
+                changes = bar_schema_changes[bar_idx]
+                if 'time_sig' in changes:
+                    ts = changes['time_sig']
+                    output_lines.append("\t".join([ts] * current_n))
+                if 'key_sig' in changes:
+                    ks = changes['key_sig']
+                    output_lines.append("\t".join([ks] * current_n))
             bar = f"={measure_num}"
             output_lines.append("\t".join([bar] * current_n))
             measure_num += 1
@@ -366,7 +494,7 @@ def reconstruct_kern_from_token_ids(
     """
     tokens = []
     for tid in token_ids:
-        token = tokenizer.id_to_token.get(tid, "<unk>")
+        token = tokenizer.id_to_token.get(tid, f"<UNK:{tid}>")
         if token in ["<pad>", "<sos>", "<eos>"]:
             continue
         tokens.append(token)

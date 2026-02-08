@@ -2,16 +2,21 @@
 Deformable Decoder
 ==================
 
-Transformer decoder with FluxAttention cross-attention.
+Jamba-style hybrid decoder: Mamba2 + Sparse Self-Attention.
+
+Layer pattern (default): [Mamba, Mamba, SA, Mamba, Mamba, SA]
+- Mamba layers: sequential writing, beat counting via linear recurrence
+- SA layers: constraint verification, retrieval, copy detection
+
+Shared across all layers:
+- FluxAttention cross-attention with content-dependent reference points
+- Predictive coding gate (surprise-driven information flow)
+- FFN
 
 Key innovation: Content-Dependent Reference Points
 - time_prior: Predict "which time point to look at" from positional embedding
 - freq_prior: Predict "high or low frequency region" from hidden state
 - This corresponds to stream tracking in human auditory perception (Bregman, 1990)
-
-Piano application:
-- When predicting right-hand melody -> freq_prior outputs high value
-- When predicting left-hand harmony -> freq_prior outputs low value
 """
 
 from typing import List, Optional
@@ -23,17 +28,15 @@ import torch.nn.functional as F
 from .attention import FluxAttention
 
 
-class DeformableDecoderLayer(nn.Module):
-    """Decoder Layer with Content-Aware Deformable Cross-Attention.
+class DecoderLayerBase(nn.Module):
+    """Base decoder layer: FluxCA + PC gate + FFN + reference points.
+
+    Subclasses implement _sequence_forward() for SA or Mamba.
 
     Structure:
-    1. Causal Self-Attention (standard)
-    2. FluxAttention with content-dependent reference points
+    1. Sequence model (SA or Mamba) — subclass-defined
+    2. FluxAttention with content-dependent reference points + PC gate
     3. FFN
-
-    The content-dependent reference points are the key innovation:
-    - time_prior(pos_embed) -> "where in time to look"
-    - freq_prior(hidden_state) -> "which frequency region to focus on"
     """
 
     def __init__(
@@ -54,22 +57,18 @@ class DeformableDecoderLayer(nn.Module):
     ):
         super().__init__()
 
+        self.d_model = d_model
         self.n_levels = n_levels
+        self.n_heads = n_heads
         self.use_time_prior = use_time_prior
         self.use_freq_prior = use_freq_prior
         self.n_freq_groups = n_freq_groups
         self.refine_range = refine_range
 
-        # 1. Causal Self-Attention (use F.scaled_dot_product_attention for Flash Attention)
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.self_attn_qkv = nn.Linear(d_model, 3 * d_model)
-        self.self_attn_out = nn.Linear(d_model, d_model)
-        self.self_attn_dropout = dropout
-        self.dropout1 = nn.Dropout(dropout)
+        # Post-sequence-model norm
         self.norm1 = nn.LayerNorm(d_model)
 
-        # 2. FluxAttention (Cross-attention) with predictive coding gate
+        # FluxAttention (Cross-attention) with predictive coding gate
         self.cross_attn = FluxAttention(
             d_model=d_model,
             n_levels=n_levels,
@@ -81,9 +80,6 @@ class DeformableDecoderLayer(nn.Module):
         )
         # Predictive coding gate (Rao & Ballard 1999):
         # Only prediction error (surprise) passes through, gain can amplify.
-        # Predictor: LM state -> predicted CA output (cortex -> thalamus)
-        # Surprise: CA(tgt) - prediction (what LM didn't know)
-        # Gain: per-token scalar, softplus -> can be > 1 (amplification)
         self.ca_predictor = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -96,7 +92,7 @@ class DeformableDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
-        # 3. FFN
+        # FFN
         self.ffn = nn.Sequential(
             nn.Linear(d_model, ff_dim),
             nn.GELU(),
@@ -106,19 +102,13 @@ class DeformableDecoderLayer(nn.Module):
         )
         self.norm3 = nn.LayerNorm(d_model)
 
-        # Content-Dependent Reference Points (key innovation!)
+        # Content-Dependent Reference Points
         if use_time_prior:
-            # Predict time location from position embedding
             self.time_prior = nn.Linear(d_model, 1)
         else:
             self.time_prior = None
 
         if use_freq_prior:
-            # Predict frequency region from hidden state (content-dependent!)
-            # n_freq_groups > 1: per-head freq_prior for multi-stream tracking
-            # e.g. n_freq_groups=4, n_heads=8 -> each group covers 2 heads
-            # Analogous to cochlear tonotopic organization: multiple parallel
-            # frequency trackers, each attending to different register
             assert n_heads % n_freq_groups == 0, \
                 f"n_heads ({n_heads}) must be divisible by n_freq_groups ({n_freq_groups})"
             self.heads_per_group = n_heads // n_freq_groups
@@ -141,11 +131,11 @@ class DeformableDecoderLayer(nn.Module):
 
         - freq_prior: Spread bias across frequency axis so each head group
           starts at a different register (bass/tenor/alto/soprano).
-          Weight gain=0.1 gives W@x std ≈ 0.14, enough for content-dependent
+          Weight gain=0.1 gives W@x std ~ 0.14, enough for content-dependent
           modulation within each band while keeping sigmoid gradient healthy.
         - reference_refine: std=0.01 (was 0.001) for visible initial offsets.
         - time_prior: Prefer fixed linspace (use_time_prior=False) because
-          position embeddings (std=0.02) are too small to produce a 0→1 ramp
+          position embeddings (std=0.02) are too small to produce a 0->1 ramp
           through a linear layer.
         """
         if self.time_prior is not None:
@@ -153,26 +143,21 @@ class DeformableDecoderLayer(nn.Module):
             nn.init.constant_(self.time_prior.bias, 0.)
 
         if self.freq_prior is not None:
-            # Weight: gain=0.1 for content-dependent modulation (W@x std ≈ 0.14)
             nn.init.xavier_uniform_(self.freq_prior.weight, gain=0.1)
 
-            # Bias: spread across frequency axis
-            # sigmoid(bias) -> target freq position
-            #   -1.386 -> 0.2 (bass)
-            #   -0.405 -> 0.4 (tenor)
-            #   +0.405 -> 0.6 (alto)
-            #   +1.386 -> 0.8 (soprano)
             import math
             n_groups = self.freq_prior.bias.shape[0]
             with torch.no_grad():
                 for g in range(n_groups):
-                    # Evenly spaced targets in (0, 1), e.g. [0.2, 0.4, 0.6, 0.8]
                     target = (g + 1) / (n_groups + 1)
                     self.freq_prior.bias[g] = math.log(target / (1 - target))
 
-        # Refinement: std=0.01 for meaningful initial offsets
         nn.init.normal_(self.reference_refine.weight, std=0.01)
         nn.init.constant_(self.reference_refine.bias, 0.)
+
+    def _sequence_forward(self, tgt, tgt_pos, past_state, use_cache):
+        """Override in subclass. Returns (output, new_state)."""
+        raise NotImplementedError
 
     def forward(
         self,
@@ -182,9 +167,9 @@ class DeformableDecoderLayer(nn.Module):
         level_start_index: torch.Tensor,
         valid_ratios: torch.Tensor,  # [B, L, 2]
         tgt_pos: Optional[torch.Tensor] = None,  # [B, S, D] or [1, S, D]
-        past_kv: Optional[tuple] = None,  # (k_cache, v_cache) each [B, H, S_prev, D_head]
+        past_state=None,
         use_cache: bool = False,
-        value_cache: Optional[List[torch.Tensor]] = None,  # pre-computed cross-attn values
+        value_cache: Optional[List[torch.Tensor]] = None,
     ):
         """Forward pass with content-dependent reference points.
 
@@ -195,64 +180,30 @@ class DeformableDecoderLayer(nn.Module):
             level_start_index: Start index per level [L]
             valid_ratios: Valid ratios for padding [B, L, 2]
             tgt_pos: Position embeddings [B, S, D] or [1, S, D]
-            past_kv: Cached K, V from previous steps (inference only)
-            use_cache: Whether to return updated KV cache
+            past_state: Layer-specific state (KV tuple for SA, InferenceParams for Mamba)
+            use_cache: Whether to return updated state
             value_cache: Pre-computed cross-attention value maps per level
 
         Returns:
             tgt: Updated decoder features [B, S, D]
-            new_kv: (only if use_cache=True) updated (k, v) cache
+            new_state: (only if use_cache=True) updated state
         """
         B, S, D = tgt.shape
 
-        # Add position embedding for self-attention
-        if tgt_pos is not None:
-            q_input = tgt + tgt_pos
-        else:
-            q_input = tgt
-
-        # 1. Self-Attention (with optional KV-cache for incremental decoding)
-        qkv = self.self_attn_qkv(q_input)  # [B, S, 3*D]
-        qkv = qkv.reshape(B, S, 3, self.n_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, D_head]
-        q_sa, k_sa, v_sa = qkv[0], qkv[1], qkv[2]
-
-        if past_kv is not None:
-            # Incremental: append new K, V to cache
-            k_sa = torch.cat([past_kv[0], k_sa], dim=2)  # [B, H, S_prev+S, D_head]
-            v_sa = torch.cat([past_kv[1], v_sa], dim=2)
-
-        new_kv = (k_sa, v_sa) if use_cache else None
-
-        # is_causal only valid for full-sequence mode (no cache, S > 1)
-        use_causal = past_kv is None and S > 1
-
-        attn_out = F.scaled_dot_product_attention(
-            q_sa, k_sa, v_sa,
-            dropout_p=self.self_attn_dropout if self.training else 0.0,
-            is_causal=use_causal,
-        )  # [B, H, S, D_head]
-
-        # Reshape back
-        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, -1)  # [B, S, D]
-        tgt2 = self.self_attn_out(attn_out)
-        tgt = tgt + self.dropout1(tgt2)
+        # 1. Sequence model (SA or Mamba)
+        tgt, new_state = self._sequence_forward(tgt, tgt_pos, past_state, use_cache)
         tgt = self.norm1(tgt)
 
-        # 2. Content-Dependent Reference Points (key innovation!)
+        # 2. Content-Dependent Reference Points
         reference_points = self._compute_reference_points(tgt, tgt_pos, B, S)
 
-        # 3. FluxAttention (Cross-attention) with gating
+        # 3. FluxAttention (Cross-attention) with PC gate
         tgt2 = self.cross_attn(
             tgt, reference_points, memory,
             spatial_shapes, level_start_index, valid_ratios,
             value_cache=value_cache,
         )
         # Predictive coding: only surprise (prediction error) passes through
-        # - predictor(tgt.detach()): LM predicts what CA should output
-        # - surprise = CA - prediction: what LM didn't know (pitch info)
-        # - gain * surprise: amplify novel information (gain can be > 1)
-        # - predictor.detach() in surprise: isolate MSE gradient from CE gradient
         prediction = self.ca_predictor(tgt.detach())       # [B, S, D]
         surprise = tgt2 - prediction.detach()               # [B, S, D]
         gain = F.softplus(self.ca_gain(tgt.detach()))       # [B, S, 1]
@@ -268,7 +219,7 @@ class DeformableDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
 
         if use_cache:
-            return tgt, new_kv
+            return tgt, new_state
         return tgt
 
     def _compute_reference_points(
@@ -280,16 +231,6 @@ class DeformableDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Compute content-dependent reference points (per-head).
 
-        This is the key innovation of FluxAttention:
-        - time_base: Predicted from position embedding (sequential progression)
-        - freq_base: Predicted from hidden state (content-dependent!)
-
-        Per-head freq_prior (n_freq_groups > 1):
-        - Each group of heads can focus on a different frequency register
-        - Analogous to cochlear tonotopic organization
-        - e.g. Group 0 -> bass, Group 1 -> tenor, Group 2 -> alto, Group 3 -> soprano
-        - Enables simultaneous multi-stream tracking (superhuman!)
-
         Returns:
             reference_points: [B, S, H, L, 2] where 2 = (time, freq)
         """
@@ -298,47 +239,34 @@ class DeformableDecoderLayer(nn.Module):
 
         # Time prior: from position embedding (shared across heads)
         if self.time_prior is not None and tgt_pos is not None:
-            time_base = self.time_prior(tgt_pos).sigmoid()  # [1, S, 1] or [B, S, 1]
-            # Expand to batch size if needed
+            time_base = self.time_prior(tgt_pos).sigmoid()
             if time_base.shape[0] == 1 and B > 1:
                 time_base = time_base.expand(B, -1, -1)
         else:
-            # Default: linear progression through time
             time_base = torch.linspace(0, 1, S, device=device)
             time_base = time_base.view(1, S, 1).expand(B, -1, -1)
 
-        # time_base: [B, S, 1] -> expand to [B, S, H, 1]
         time_base = time_base.unsqueeze(2).expand(-1, -1, H, -1)  # [B, S, H, 1]
 
         # Freq prior: from hidden state (CONTENT-DEPENDENT!)
         if self.freq_prior is not None:
-            # n_freq_groups=1: [B, S, 1] (original shared behavior)
-            # n_freq_groups=4: [B, S, 4] (per-group different freq regions)
             freq_groups = self.freq_prior(tgt).sigmoid()  # [B, S, n_freq_groups]
-
-            # Expand groups to heads: repeat_interleave
-            # e.g. groups [g0, g1, g2, g3] -> heads [g0, g0, g1, g1, g2, g2, g3, g3]
             freq_base = freq_groups.repeat_interleave(
                 self.heads_per_group, dim=-1
             )  # [B, S, H]
             freq_base = freq_base.unsqueeze(-1)  # [B, S, H, 1]
         else:
-            # Default: center of frequency axis
             freq_base = torch.full((B, S, H, 1), 0.5, device=device)
 
-        # Combine into base reference: [B, S, H, 2]
         base_ref = torch.cat([time_base, freq_base], dim=-1)  # [B, S, H, 2]
 
         # Content-based refinement (+/-10%), shared across heads
-        # detach: refine observes tgt to decide WHERE to look, but doesn't backprop
-        # (eliminates L0 reference_refine dominating 85% of total grad norm)
-        refine = self.reference_refine(tgt.detach()).tanh() * self.refine_range  # [B, S, 2]
+        refine = self.reference_refine(tgt.detach()).tanh() * self.refine_range
         refine = refine.unsqueeze(2)  # [B, S, 1, 2] -> broadcast to H
 
-        # Final reference point
         reference_points = (base_ref + refine).clamp(0, 1)  # [B, S, H, 2]
 
-        # Expand to all levels (shared reference across levels)
+        # Expand to all levels
         reference_points = reference_points.unsqueeze(3).expand(
             -1, -1, -1, self.n_levels, -1
         )  # [B, S, H, L, 2]
@@ -346,14 +274,122 @@ class DeformableDecoderLayer(nn.Module):
         return reference_points
 
 
+class SADecoderLayer(DecoderLayerBase):
+    """Self-Attention decoder layer.
+
+    Causal self-attention for constraint verification and retrieval:
+    - Look back at all tokens in the bar to verify beat sum
+    - Detect repeated sections (copy-paste patterns)
+    - Global attention over full sequence (no recurrence window limit)
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        d_model = kwargs['d_model']
+        n_heads = kwargs['n_heads']
+        dropout = kwargs['dropout']
+
+        self.sa_n_heads = n_heads
+        self.sa_head_dim = d_model // n_heads
+        self.self_attn_qkv = nn.Linear(d_model, 3 * d_model)
+        self.self_attn_out = nn.Linear(d_model, d_model)
+        self.self_attn_dropout = dropout
+        self.dropout1 = nn.Dropout(dropout)
+
+    def _sequence_forward(self, tgt, tgt_pos, past_kv, use_cache):
+        """Causal self-attention with optional KV-cache."""
+        B, S, D = tgt.shape
+
+        # SA needs explicit position embedding
+        if tgt_pos is not None:
+            q_input = tgt + tgt_pos
+        else:
+            q_input = tgt
+
+        qkv = self.self_attn_qkv(q_input)  # [B, S, 3*D]
+        qkv = qkv.reshape(B, S, 3, self.sa_n_heads, self.sa_head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, D_head]
+        q_sa, k_sa, v_sa = qkv[0], qkv[1], qkv[2]
+
+        if past_kv is not None:
+            k_sa = torch.cat([past_kv[0], k_sa], dim=2)
+            v_sa = torch.cat([past_kv[1], v_sa], dim=2)
+
+        new_kv = (k_sa, v_sa) if use_cache else None
+
+        # is_causal only valid for full-sequence mode (no cache, S > 1)
+        use_causal = past_kv is None and S > 1
+
+        attn_out = F.scaled_dot_product_attention(
+            q_sa, k_sa, v_sa,
+            dropout_p=self.self_attn_dropout if self.training else 0.0,
+            is_causal=use_causal,
+        )  # [B, H, S, D_head]
+
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, -1)
+        tgt2 = self.self_attn_out(attn_out)
+        tgt = tgt + self.dropout1(tgt2)
+        return tgt, new_kv
+
+
+class MambaDecoderLayer(DecoderLayerBase):
+    """Mamba2 decoder layer.
+
+    Linear recurrence for sequential writing and beat counting:
+    - h = A*h + B*x: A = exp(-Delta), Delta -> 0 means A -> 1 (exact hold)
+    - Barline resets state (Delta large -> A -> 0)
+    - Duration tokens decrement beat counter via B*x
+    - Non-duration tokens pass through (B*x -> 0)
+    - O(N log N) parallel scan during training, O(1) per step at inference
+    """
+
+    def __init__(self, d_state=128, d_conv=4, expand=2, **kwargs):
+        super().__init__(**kwargs)
+        from mamba_ssm import Mamba2
+
+        # layer_idx is set later by ClefDecoder after all layers are created.
+        # It's needed for InferenceParams to index per-layer state at inference.
+        self.mamba = Mamba2(
+            d_model=kwargs['d_model'],
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self._mamba_layer_idx_set = False
+        self.dropout1 = nn.Dropout(kwargs['dropout'])
+
+    def _sequence_forward(self, tgt, tgt_pos, inference_params, use_cache):
+        """Mamba2 forward. No position embedding needed (intrinsic via recurrence).
+
+        tgt_pos is NOT added to input (position is encoded in recurrence state).
+        tgt_pos is still used by _compute_reference_points in base class.
+
+        inference_params is a shared InferenceParams object across all Mamba layers;
+        mamba-ssm manages per-layer state internally via dict keyed by layer id.
+        """
+        tgt2 = self.mamba(tgt, inference_params=inference_params)
+        tgt = tgt + self.dropout1(tgt2)
+        # Return the same shared inference_params object
+        return tgt, inference_params
+
+
+# Keep backward compat alias
+DeformableDecoderLayer = SADecoderLayer
+
+
 class ClefDecoder(nn.Module):
-    """Full decoder stack with FluxAttention layers."""
+    """Jamba-style hybrid decoder: Mamba2 + Sparse Self-Attention.
+
+    Default layer pattern: [Mamba, Mamba, SA, Mamba, Mamba, SA]
+    - 4 Mamba layers: sequential writing, beat counting
+    - 2 SA layers: constraint verification, retrieval
+    - All layers share: FluxCA + PC gate + FFN + reference points
+    """
 
     def __init__(
         self,
         d_model: int = 512,
         n_heads: int = 8,
-        n_layers: int = 6,
         n_levels: int = 4,
         n_points_freq: int = 2,
         n_points_time: int = 2,
@@ -365,27 +401,57 @@ class ClefDecoder(nn.Module):
         use_freq_prior: bool = True,
         n_freq_groups: int = 1,
         refine_range: float = 0.1,
+        # Jamba-specific
+        decoder_layer_types: Optional[List[str]] = None,
+        d_state: int = 128,
+        d_conv: int = 4,
+        expand: int = 2,
+        # Legacy (ignored if decoder_layer_types is set)
+        n_layers: int = 6,
     ):
         super().__init__()
 
-        self.layers = nn.ModuleList([
-            DeformableDecoderLayer(
-                d_model=d_model,
-                n_heads=n_heads,
-                n_levels=n_levels,
-                n_points_freq=n_points_freq,
-                n_points_time=n_points_time,
-                freq_offset_scale=freq_offset_scale,
-                time_offset_scale=time_offset_scale,
-                ff_dim=ff_dim,
-                dropout=dropout,
-                use_time_prior=use_time_prior,
-                use_freq_prior=use_freq_prior,
-                n_freq_groups=n_freq_groups,
-                refine_range=refine_range,
-            )
-            for _ in range(n_layers)
-        ])
+        if decoder_layer_types is None:
+            # Legacy: all SA layers (backward compat with old checkpoints)
+            decoder_layer_types = ['sa'] * n_layers
+
+        self.layer_types = decoder_layer_types
+
+        # Shared kwargs for base class
+        base_kwargs = dict(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_levels=n_levels,
+            n_points_freq=n_points_freq,
+            n_points_time=n_points_time,
+            freq_offset_scale=freq_offset_scale,
+            time_offset_scale=time_offset_scale,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            use_time_prior=use_time_prior,
+            use_freq_prior=use_freq_prior,
+            n_freq_groups=n_freq_groups,
+            refine_range=refine_range,
+        )
+
+        self.layers = nn.ModuleList()
+        for lt in decoder_layer_types:
+            if lt == 'mamba':
+                self.layers.append(MambaDecoderLayer(
+                    d_state=d_state, d_conv=d_conv, expand=expand,
+                    **base_kwargs,
+                ))
+            elif lt == 'sa':
+                self.layers.append(SADecoderLayer(**base_kwargs))
+            else:
+                raise ValueError(f"Unknown decoder layer type: {lt}")
+
+        # Assign layer_idx to Mamba layers (needed for InferenceParams state indexing)
+        mamba_idx = 0
+        for layer in self.layers:
+            if isinstance(layer, MambaDecoderLayer):
+                layer.mamba.layer_idx = mamba_idx
+                mamba_idx += 1
 
         self.norm = nn.LayerNorm(d_model)
 
@@ -415,38 +481,38 @@ class ClefDecoder(nn.Module):
         level_start_index: torch.Tensor,
         valid_ratios: torch.Tensor,
         tgt_pos: Optional[torch.Tensor] = None,
-        past_kv_list: Optional[list] = None,
+        past_states: Optional[list] = None,
         use_cache: bool = False,
         value_cache_list: Optional[list] = None,
     ):
         """Forward through all decoder layers.
 
         Args:
-            past_kv_list: List of (k_cache, v_cache) per layer (inference only)
-            use_cache: Whether to return updated KV caches
+            past_states: List of per-layer state (KV tuple for SA, InferenceParams for Mamba)
+            use_cache: Whether to return updated states
             value_cache_list: List of cross-attn value caches per layer
 
         Returns:
             output: Decoder output [B, S, D]
-            new_kv_list: (only if use_cache=True) list of (k, v) per layer
+            new_states: (only if use_cache=True) list of states per layer
         """
         output = tgt
-        new_kv_list = [] if use_cache else None
+        new_states = [] if use_cache else None
 
         for i, layer in enumerate(self.layers):
-            layer_past_kv = past_kv_list[i] if past_kv_list else None
+            layer_state = past_states[i] if past_states else None
             layer_value_cache = value_cache_list[i] if value_cache_list else None
 
             if use_cache:
-                output, new_kv = layer(
+                output, new_state = layer(
                     output, memory,
                     spatial_shapes, level_start_index, valid_ratios,
                     tgt_pos=tgt_pos,
-                    past_kv=layer_past_kv,
+                    past_state=layer_state,
                     use_cache=True,
                     value_cache=layer_value_cache,
                 )
-                new_kv_list.append(new_kv)
+                new_states.append(new_state)
             else:
                 output = layer(
                     output, memory,
@@ -457,5 +523,5 @@ class ClefDecoder(nn.Module):
         output = self.norm(output)
 
         if use_cache:
-            return output, new_kv_list
+            return output, new_states
         return output

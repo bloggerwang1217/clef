@@ -86,8 +86,11 @@ def generate_kern_chunk(
 ) -> List[int]:
     """Generate token IDs from a single mel chunk.
 
-    Uses encoder caching (encode once) and decoder KV-cache for efficient
+    Uses encoder caching (encode once) and decoder state cache for efficient
     autoregressive generation. Each step only processes the new token.
+
+    Supports hybrid Mamba+SA decoder: Mamba layers use shared InferenceParams,
+    SA layers use KV-cache.
 
     Args:
         model: Trained ClefPianoBase model
@@ -109,11 +112,14 @@ def generate_kern_chunk(
     # Pre-compute cross-attention value projections (once per chunk)
     value_cache = model.prepare_value_cache(memory, spatial_shapes, level_start_index)
 
-    # First step: decode <sos>, get initial KV-cache
+    # Initialize inference states (Mamba InferenceParams + SA KV-cache)
+    past_states = model._init_inference_states(1, max_length, device)
+
+    # First step: decode <sos>
     input_ids = torch.tensor([[sos_id]], device=device)
-    logits, past_kv = model.decode(
+    logits, past_states = model.decode(
         input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
-        use_cache=True, value_cache=value_cache,
+        past_states=past_states, use_cache=True, value_cache=value_cache,
     )
 
     next_id = logits[:, -1, :].argmax(dim=-1).item()
@@ -124,13 +130,13 @@ def generate_kern_chunk(
 
     generated.append(next_id)
 
-    # Subsequent steps: decode one token at a time with KV-cache
+    # Subsequent steps: decode one token at a time with cache
     for step in range(1, max_length):
         input_ids = torch.tensor([[next_id]], device=device)
 
-        logits, past_kv = model.decode(
+        logits, past_states = model.decode(
             input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
-            past_kv=past_kv, use_cache=True, value_cache=value_cache,
+            past_states=past_states, use_cache=True, value_cache=value_cache,
         )
 
         next_id = logits[:, -1, :].argmax(dim=-1).item()

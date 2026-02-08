@@ -7,7 +7,7 @@ Inherited by piano/solo/tutti variants.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -65,6 +65,12 @@ class ClefConfig:
     ca_gate_type: str = 'predictive_coding'
     pred_loss_weight: float = 0.1     # Predictor MSE loss weight (predictive_coding mode only)
     decoder_layers: int = 6
+    decoder_layer_types: List[str] = field(
+        default_factory=lambda: ['mamba', 'mamba', 'sa', 'mamba', 'mamba', 'sa']
+    )
+    mamba_d_state: int = 128
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
     max_seq_len: int = 4096
     vocab_size: int = 512   # Will be set from tokenizer
 
@@ -81,6 +87,8 @@ class ClefConfig:
 
     def __post_init__(self):
         """Validate configuration."""
+        # Derive decoder_layers from decoder_layer_types for backward compat
+        self.decoder_layers = len(self.decoder_layer_types)
         assert self.n_heads > 0, "n_heads must be positive"
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
         n_swin_used = len(self.swin_dims) - self.swin_start_stage

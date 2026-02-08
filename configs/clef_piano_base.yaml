@@ -60,7 +60,11 @@ model:
   # Bridge
   bridge_layers: 2
 
-  # Decoder
+  # Decoder (Jamba-style: 4 Mamba + 2 SA)
+  decoder_layer_types: ["mamba", "mamba", "sa", "mamba", "mamba", "sa"]
+  mamba_d_state: 128
+  mamba_d_conv: 4
+  mamba_expand: 2
   ca_gate_type: "predictive_coding"
   pred_loss_weight: 0.1              # Predictor MSE loss weight (PC mode)
   decoder_layers: 6

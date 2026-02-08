@@ -215,7 +215,7 @@ class Trainer:
         V = self.config.vocab_size
 
         struct_names = {
-            '<pad>', '<sos>', '<eos>', '<unk>', '<coc>', '<bar>',
+            '<pad>', '<sos>', '<eos>', '<coc>', '<bar>',
             '<b>', '<continue>', '<nl>', '<split>', '<merge>', '<*>',
             '(', ')',    # slur start/end
             '{', '}',    # phrase start/end
@@ -559,6 +559,17 @@ class Trainer:
 
             # Train
             train_metrics = self.train_epoch()
+
+            # Log OOV skipped chunks (if any)
+            if self.rank == 0 and hasattr(self.train_loader.dataset, 'oov_skipped_chunks'):
+                skipped = self.train_loader.dataset.oov_skipped_chunks
+                if skipped > 0:
+                    total = len(self.train_loader.dataset)
+                    logger.info(
+                        f'Epoch {epoch}: skipped {skipped}/{total} chunks '
+                        f'due to OOV tokens ({skipped/total*100:.1f}%)'
+                    )
+                    self.train_loader.dataset.oov_skipped_chunks = 0
 
             # Validate at end of epoch
             valid_metrics = self.validate()

@@ -99,6 +99,10 @@ class ClefPianoConfig(ClefConfig):
             # Architecture
             bridge_layers=model_cfg.get("bridge_layers", defaults.bridge_layers),
             decoder_layers=model_cfg.get("decoder_layers", defaults.decoder_layers),
+            decoder_layer_types=model_cfg.get("decoder_layer_types", defaults.decoder_layer_types),
+            mamba_d_state=model_cfg.get("mamba_d_state", defaults.mamba_d_state),
+            mamba_d_conv=model_cfg.get("mamba_d_conv", defaults.mamba_d_conv),
+            mamba_expand=model_cfg.get("mamba_expand", defaults.mamba_expand),
             max_seq_len=model_cfg.get("max_seq_len", defaults.max_seq_len),
             vocab_size=model_cfg.get("vocab_size", defaults.vocab_size),
 

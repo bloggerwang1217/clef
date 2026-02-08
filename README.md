@@ -179,6 +179,35 @@ music21 ^9.1        # MusicXML handling
 [synthesis]  pyfluidsynth     # MIDI → Audio rendering (requires fluidsynth CLI)
 ```
 
+### Mamba2 Decoder (CUDA compilation required)
+
+The Jamba-style hybrid decoder uses [mamba-ssm](https://github.com/state-spaces/mamba)
+which compiles custom CUDA kernels at install time.
+
+**Requirements**: NVIDIA GPU (sm_70+), nvcc >= 11.6, PyTorch >= 2.0
+
+```bash
+# 1. Set CUDA_HOME to a toolkit with nvcc >= 11.6
+#    (system nvcc may be too old; check with: nvcc --version)
+export CUDA_HOME=/usr/local/cuda-12.4
+
+# 2. Set target GPU architectures
+#    RTX 3090 / A6000 = 8.6, TITAN RTX = 7.5
+export TORCH_CUDA_ARCH_LIST="8.6"
+
+# 3. Install causal-conv1d (mamba dependency)
+poetry run pip install causal-conv1d --no-build-isolation
+
+# 4. Install mamba-ssm
+poetry run pip install mamba-ssm --no-build-isolation
+
+# 5. Verify
+poetry run python -c "from mamba_ssm import Mamba2; print('Mamba2 OK')"
+```
+
+`--no-build-isolation` ensures pip uses the existing PyTorch in the virtualenv
+rather than downloading a potentially incompatible version during build.
+
 ## Current Status
 
 ### Completed
