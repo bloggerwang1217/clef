@@ -13,8 +13,8 @@ Supported repositories:
 - humdrum-chopin-first-editions
 
 Processing modes (via preset parameter):
-- "clef-piano-base": Chopin filter + Joplin remove **dynam & repeats
-- "clef-piano-full": Chopin filter only
+- "clef-piano-base": Remove **dynam
+- "clef-piano-full": Keep **dynam
 - None (default): No filtering (clef-tutti)
 """
 
