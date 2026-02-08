@@ -22,6 +22,9 @@ class BeatJitterRule(Rule):
         super().__init__(config)
         self.rng: Optional[np.random.Generator] = None  # Set by engine
         self.is_tempo_affecting = False  # Micro fluctuations
+        # Cache: chord notes at the same onset share the same jitter
+        self._last_onset = -1.0
+        self._last_jitter = 0.0
 
     def set_rng(self, rng: np.random.Generator):
         """Set random number generator."""
@@ -32,21 +35,34 @@ class BeatJitterRule(Rule):
         return 0.0
 
     def apply_timing(self, note: Any, features: Dict[str, Any]) -> float:
-        """Apply micro jitter timing variation."""
+        """Apply micro jitter timing variation.
+
+        Chord notes (same onset) share the same jitter value so
+        the chord moves as a unit rather than spreading apart.
+        """
         if not self.enabled:
             return 0.0
 
         if self.rng is None:
             return 0.0
 
-        # Random but correlated across nearby notes
-        # Base jitter: 5ms std (Very tight professional level)
-        # k=1.0 -> 5ms, k=2.0 -> 10ms (still tight)
-        base_jitter = self.rng.normal(0, 0.005)
+        onset = features.get('onset', -1.0)
 
-        # Downbeats tend to be slightly late (Weight/Stability)
-        if features.get('is_downbeat', False):
-            base_jitter += 0.002  # +2ms tendency
+        # Reuse jitter for chord notes at the same onset
+        if abs(onset - self._last_onset) < 1e-6:
+            base_jitter = self._last_jitter
+        else:
+            # New onset: generate fresh jitter
+            # Base jitter: 5ms std (Very tight professional level)
+            # k=1.0 -> 5ms, k=2.0 -> 10ms (still tight)
+            base_jitter = self.rng.normal(0, 0.005)
+
+            # Downbeats tend to be slightly late (Weight/Stability)
+            if features.get('is_downbeat', False):
+                base_jitter += 0.002  # +2ms tendency
+
+            self._last_onset = onset
+            self._last_jitter = base_jitter
 
         return self.k * base_jitter
 

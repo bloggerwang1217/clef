@@ -158,7 +158,12 @@ class TrillRule(Rule):
 
         current_time = onset
         end_time = onset + duration
-        note_duration = 1.0 / (self.k * self.trill_speed)
+
+        # Base trill speed: 16th note (tempo-dependent)
+        # k controls speed: k=1 means 16th notes, k=2 means 32nd notes (twice as fast)
+        beat_duration = features.get('beat_duration', 0.5)
+        sixteenth_duration = beat_duration / 4  # 16th note = 1/4 beat
+        note_duration = sixteenth_duration / self.k
 
         trill_interval = features.get('trill_interval', 2)  # Usually whole/half step
         upper_pitch = pitch + trill_interval
@@ -220,7 +225,11 @@ class MordentRule(Rule):
         duration = getattr(note, 'duration', 0.5)
         velocity = getattr(note, 'velocity', 64)
 
-        mordent_duration = self.k * 0.08  # ~80ms total for ornament
+        # Base mordent duration: ~80ms total
+        # k controls speed: higher k = faster (shorter duration)
+        # This matches trill behavior where k scales speed
+        base_duration = 0.08  # 80ms base
+        mordent_duration = base_duration / self.k  # k=1: 80ms, k=2: 40ms (faster)
         single_note_dur = mordent_duration / 3
 
         is_upper = features.get('mordent_type', 'upper') == 'upper'

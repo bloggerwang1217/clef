@@ -8,6 +8,9 @@ from typing import Dict, Any, List
 import numpy as np
 from .base import Rule
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 class TremoloRule(Rule):
     """
@@ -21,9 +24,15 @@ class TremoloRule(Rule):
     - 1 slash = 8th notes (1/8 beat)
     - 2 slashes = 16th notes (1/16 beat)
     - 3 slashes = 32nd notes (1/32 beat)
+
+    Humanization:
+    - Ramp-up: first few notes slightly slower (hand settling in)
+    - Velocity contour: gentle arch (louder in middle, softer at edges)
+    - Balanced alternation: both pitches at similar velocity
+    - Micro-timing jitter: small random variation per note
     """
 
-    def __init__(self, config, velocity_variation: float = 3.0, timing_jitter_ms: float = 5.0):
+    def __init__(self, config, velocity_variation: float = 0.5, timing_jitter_ms: float = 5.0):
         """
         Initialize tremolo rule.
 
@@ -49,11 +58,11 @@ class TremoloRule(Rule):
         features: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         """
-        Expand a tremolo pair into alternating notes.
+        Expand a tremolo pair into alternating notes with human-like feel.
 
         Args:
             note1: First note dict {pitch, onset, duration, velocity}
-            note2: Second note dict (can be same as note1 for single-note tremolo)
+            note2: Second note dict (same as note1 for single-note tremolo)
             tremolo_speed: Number of slashes (1=8th, 2=16th, 3=32nd)
             features: Additional features (beat_duration, etc.)
 
@@ -61,74 +70,113 @@ class TremoloRule(Rule):
             List of expanded note dicts
         """
         if not self.enabled:
-            # Return original notes unchanged
-            return [note1, note2] if note1 != note2 else [note1]
+            return [note1, note2] if note1['pitch'] != note2['pitch'] else [note1]
 
-        # Calculate tremolo note duration
-        beat_duration = features.get('beat_duration', 0.5)
-        slashes_to_subdivision = {1: 8, 2: 16, 3: 32}
-        subdivision = slashes_to_subdivision.get(tremolo_speed, 16)
-        tremolo_note_duration = beat_duration / (subdivision / 4)  # Convert to beat fraction
+        # Tremolo speed as hits-per-second (human motor frequency).
+        # Slash count is a hint, not a strict subdivision.
+        #
+        # Two-note alternation (different keys): fingers alternate freely,
+        # limited by hand speed. Range ~6-14 Hz.
+        #
+        # Single-note repetition (same key): key must fully reset (~40-50ms)
+        # before re-strike, even with finger alternation (2-1-2-1).
+        # Practical limit ~8-10 Hz.
+        is_single = (note1['pitch'] == note2['pitch'])
 
-        # Total duration covered by tremolo
-        # For two-note tremolo (beamed tremolo), the two notes occur sequentially
-        # in the score notation, but are replaced by rapid alternation between them.
-        # Total duration = span from first note onset to end of second note
+        if is_single:
+            SLASH_TO_HZ = {1: 6.0, 2: 8.0, 3: 10.0}
+        else:
+            SLASH_TO_HZ = {1: 8.0, 2: 11.0, 3: 14.0}
+
+        base_hz = SLASH_TO_HZ.get(tremolo_speed, 8.0 if is_single else 11.0)
+        base_note_duration = 1.0 / base_hz
+
         onset_start = note1['onset']
         onset_end = note2['onset'] + note2['duration']
         total_duration = onset_end - onset_start
 
-        # Calculate number of notes
-        num_notes = int(total_duration / tremolo_note_duration)
-        num_notes = max(2, num_notes)  # At least 2 notes
+        num_notes = int(total_duration / base_note_duration)
+        num_notes = max(4, num_notes)  # At least 4 hits for any tremolo
 
-        # Debug logging
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.debug(f"Tremolo calc: duration={total_duration:.3f}s, tremolo_note_dur={tremolo_note_duration:.3f}s, "
-                    f"num_notes={num_notes}, slashes={tremolo_speed}, pitches={note1['pitch']}-{note2['pitch']}")
+        # Average velocity for balanced alternation
+        avg_velocity = (note1['velocity'] + note2['velocity']) / 2
 
-        # Generate alternating notes
+        logger.debug(f"Tremolo: dur={total_duration:.3f}s, note_dur={base_note_duration:.3f}s, "
+                    f"n={num_notes}, {'single' if is_single else 'two-note'} "
+                    f"({note1['pitch']}-{note2['pitch']})")
+
         notes = []
         current_time = onset_start
         is_first = True
 
         for i in range(num_notes):
-            # Alternate between note1 and note2
-            source_note = note1 if is_first else note2
+            # Normalized position 0-1 through the tremolo
+            pos = i / max(1, num_notes - 1)
 
-            # Apply velocity variation (random per note)
-            if self.rng is not None:
-                velocity_delta = self.rng.normal(0, self.k * self.velocity_variation)
+            # 1. Ramp-up: first 2 notes are very slightly slower (hand settling in)
+            if i < 2:
+                ramp = 1.0 + (2 - i) * 0.04 * self.k  # +8%, +4%
             else:
-                velocity_delta = 0
+                ramp = 1.0
+            actual_note_dur = base_note_duration * ramp
 
-            # Apply timing jitter
+            # 2. Velocity contour: gentle arch shape
+            # Peak at ~60% through, softer at start and end
+            arch = 1.0 - 0.6 * (2 * pos - 1.2) ** 2  # peaks at pos=0.6
+            arch = max(0.0, min(1.0, arch))
+            # Scale: ±1dB contour at k=1
+            contour_dB = (arch - 0.5) * 2.0 * self.k
+
+            # 3. Per-note random jitter (small)
             if self.rng is not None:
-                timing_delta = self.rng.normal(0, self.k * self.timing_jitter_ms / 1000)
+                vel_noise = self.rng.normal(0, self.k * self.velocity_variation)
+                time_noise = self.rng.normal(0, self.k * self.timing_jitter_ms / 1000)
             else:
-                timing_delta = 0
+                vel_noise = 0
+                time_noise = 0
 
-            # Ensure we don't exceed the total duration
+            # 4. Pitch selection
+            if is_single:
+                pitch = note1['pitch']
+            else:
+                pitch = note1['pitch'] if is_first else note2['pitch']
+
+            # Ensure we don't exceed total duration
             remaining = onset_end - current_time
-            actual_duration = min(tremolo_note_duration, remaining)
-
-            if actual_duration <= 0:
+            final_dur = min(actual_note_dur, remaining)
+            if final_dur <= 0:
                 break
 
+            # For single-note tremolo, use wider gap to avoid same-pitch overlap
+            gap_ratio = 0.85 if is_single else 0.95
+
             notes.append({
-                'pitch': source_note['pitch'],
-                'onset': current_time + timing_delta,
-                'duration': actual_duration * 0.95,  # Slight gap between notes
-                'velocity': source_note['velocity'],
-                'velocity_delta_dB': velocity_delta,
-                'is_tremolo': True
+                'pitch': pitch,
+                'onset': current_time + time_noise,
+                'duration': final_dur * gap_ratio,
+                'velocity': int(np.clip(avg_velocity, 1, 127)),
+                'velocity_delta_dB': contour_dB + vel_noise,
+                'is_tremolo': True,
+                'original_note': note1.get('original_note'),
             })
 
-            current_time += tremolo_note_duration
+            current_time += final_dur
             is_first = not is_first
 
         return notes
+
+    def expand_single_tremolo(
+        self,
+        note: Dict[str, Any],
+        tremolo_speed: int,
+        features: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Expand a single-note tremolo into repeated notes.
+
+        Delegates to expand_tremolo with note2 = note1.
+        """
+        return self.expand_tremolo(note, note, tremolo_speed, features)
 
     def apply_velocity(self, note: Any, features: Dict[str, Any]) -> float:
         """No global velocity effect (handled in expand_tremolo)."""

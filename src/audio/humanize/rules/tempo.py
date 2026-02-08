@@ -170,11 +170,31 @@ class TempoInterpreter:
                             try:
                                 bpm = float(per_minute.text)
 
+                                # Convert to quarter-note BPM based on beat-unit
+                                # MusicXML per-minute is in the beat-unit's BPM,
+                                # but our engine uses quarter-note BPM throughout
+                                beat_unit = metronome.find('beat-unit')
+                                unit_to_quarters = {
+                                    'whole': 4.0,
+                                    'half': 2.0,
+                                    'quarter': 1.0,
+                                    'eighth': 0.5,
+                                    '16th': 0.25,
+                                    '32nd': 0.125,
+                                }
+                                if beat_unit is not None and beat_unit.text:
+                                    quarter_mult = unit_to_quarters.get(
+                                        beat_unit.text, 1.0
+                                    )
+                                else:
+                                    quarter_mult = 1.0  # Assume quarter
+
                                 # Check for dotted note (e.g., dotted quarter = 1.5x)
                                 beat_unit_dot = metronome.find('beat-unit-dot')
                                 if beat_unit_dot is not None:
-                                    bpm *= 1.5  # Convert to quarter note BPM
+                                    quarter_mult *= 1.5
 
+                                bpm *= quarter_mult
                                 return bpm
                             except ValueError:
                                 continue

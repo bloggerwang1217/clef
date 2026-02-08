@@ -28,8 +28,8 @@ class StaccatoRule(Rule):
         is_staccato = features.get('staccato', False)
 
         if is_staccato:
-            # 50% shorter at k=1
-            return 1.0 - self.k * 0.5
+            # 25% shorter at k=1
+            return 1.0 - self.k * 0.25
 
         return 1.0
 
@@ -64,10 +64,13 @@ class LegatoRule(Rule):
         in_slur = features.get('in_slur', False)
 
         if in_slur:
-            # Extend by overlap amount
+            # Extend by overlap amount, capped at 10% of note duration
+            # so short notes (e.g. 8th at fast tempo) don't get disproportionately long
             base_dur = features.get('duration', 0.5)
             if base_dur > 0:
-                overlap_ratio = (self.k * self.overlap_ms / 1000) / base_dur
+                overlap_sec = self.k * self.overlap_ms / 1000
+                max_overlap = base_dur * 0.10
+                overlap_ratio = min(overlap_sec, max_overlap) / base_dur
                 return 1.0 + overlap_ratio
 
         return 1.0
@@ -154,7 +157,11 @@ class AccentRule(Rule):
         is_accent = features.get('accent', False)
 
         if is_accent:
-            return self.k * self.velocity_boost_dB
+            # Short notes get less accent (human biomechanics)
+            beat_duration = features.get('beat_duration', 0.5)
+            duration = features.get('duration', beat_duration)
+            duration_scale = min(1.0, duration / beat_duration)
+            return self.k * self.velocity_boost_dB * duration_scale
 
         return 0.0
 

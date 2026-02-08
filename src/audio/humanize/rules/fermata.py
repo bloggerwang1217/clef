@@ -37,15 +37,11 @@ class FermataRule(Rule):
         return 0.0
 
     def apply_timing(self, note: Any, features: Dict[str, Any]) -> float:
-        """Add pause AFTER fermata note (affects subsequent notes)."""
-        if not self.enabled:
-            return 0.0
-
-        # Check if this is the note after a fermata
-        if features.get('after_fermata', False):
-            beat_duration = features.get('beat_duration', 0.5)
-            return self.k * self.pause_beats * beat_duration
-
+        """
+        Fermata timing is handled by engine post-processing (onset propagation),
+        not by per-note timing offset, because the shift must apply to ALL
+        subsequent notes, not just the one immediately after.
+        """
         return 0.0
 
     def apply_duration(self, note: Any, features: Dict[str, Any]) -> float:

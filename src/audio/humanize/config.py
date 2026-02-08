@@ -97,7 +97,7 @@ class HumanizationConfig:
 
     # Fermata handling
     fermata: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.0, 2.0)
+        k=1.0, k_range=(0.5, 1.5)
     ))
     fermata_duration_multiplier: float = 2.0
     fermata_pause_beats: float = 0.5
@@ -106,28 +106,17 @@ class HumanizationConfig:
     crescendo_tempo: RuleConfig = field(default_factory=lambda: RuleConfig(
         k=1.0, k_range=(0.0, 2.0)
     ))
-    crescendo_tempo_max_change: float = 0.1  # ±10% tempo
+    crescendo_tempo_max_change: float = 0.015  # ±1.5% tempo (subtle coupling)
     crescendo_velocity_max_change_dB: float = 3.0  # Max velocity change (subtle crescendo)
 
-    # Articulation-tempo coupling
-    articulation_tempo: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.0, 2.0)
-    ))
+
 
     # Punctuation (breathing between phrases)
     punctuation: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.0, 2.0)
+        k=1.0, k_range=(0.5, 1.5)
     ))
-    micropause_ms: float = 30.0
+    micropause_ms: float = 20.0
     phrase_end_shorten_ratio: float = 0.15
-
-    # Leap handling
-    leap: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.0, 2.0)
-    ))
-    leap_threshold_semitones: int = 7
-    leap_duration_effect: float = 0.1
-    leap_micropause_ms: float = 15.0
 
     # Repetition handling
     repetition: RuleConfig = field(default_factory=lambda: RuleConfig(
@@ -140,35 +129,35 @@ class HumanizationConfig:
     # Staccato shortening
     # Effect: duration × (1 - k × 0.5) for staccato notes
     staccato: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.7, 1.3)
+        k=1.0, k_range=(0.0, 2.0)
     ))
 
     # Legato overlap
     # Effect: +k × 30ms overlap for legato phrases
     legato: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.5, 1.5)
+        k=1.0, k_range=(0.0, 2.0)
     ))
     legato_overlap_base_ms: float = 30.0
 
     # Tenuto: hold full value, slightly lengthen
     # Effect: duration × (1 + k × 0.05), velocity +k × 1dB
     tenuto: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.5, 1.5)
+        k=1.0, k_range=(0.0, 2.0)
     ))
     tenuto_extension_ratio: float = 0.05  # 5% extension
 
     # Accent (>): emphasis through velocity and optional timing
     # Effect: velocity +k × 3dB
     accent: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.5, 2.0)
+        k=1.0, k_range=(0.0, 1.5)
     ))
-    accent_velocity_boost_dB: float = 3.0
+    accent_velocity_boost_dB: float = 1.5
     accent_delay_ms: float = 0.0  # Optional agogic delay (0 = disabled)
 
     # Marcato (^): strong accent
     # Effect: velocity +k × 5dB, duration × (1 - k × 0.05)
     marcato: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.5, 2.0)
+        k=1.0, k_range=(0.0, 2.0)
     ))
     marcato_velocity_boost_dB: float = 5.0
     marcato_shortening_ratio: float = 0.05  # 5% shortening
@@ -176,26 +165,26 @@ class HumanizationConfig:
     # === Ornament Rules ===
 
     grace_note: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.7, 1.3)
+        k=1.0, k_range=(0.5, 1.5)
     ))
     acciaccatura_ms: float = 50.0
     appoggiatura_ratio: float = 0.25
 
     trill: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.8, 1.2)
+        k=1.0, k_range=(1.0, 2.0)
     ))
     trill_speed: float = 8.0  # notes per second
     trill_start_on_upper: bool = False
 
     mordent: RuleConfig = field(default_factory=lambda: RuleConfig(
-        k=1.0, k_range=(0.8, 1.2)
+        k=1.0, k_range=(0.5, 2.0)
     ))
 
     tremolo: RuleConfig = field(default_factory=lambda: RuleConfig(
         k=1.0, k_range=(0.0, 2.0)  # k=0: no variation, k=2: strong variation (±1.0dB)
     ))
     tremolo_velocity_variation: float = 0.5  # dB variation between tremolo notes (k=1.0 → ±0.5dB, k=2.0 → ±1.0dB)
-    tremolo_timing_jitter_ms: float = 5.0    # Timing jitter per tremolo note
+    tremolo_timing_jitter_ms: float = 2.0    # Timing jitter per tremolo note (subtle, not hand-shaking)
 
     # === Safety Rules ===
 
@@ -249,25 +238,18 @@ class HumanizationConfig:
 
             # Timing rules
             phrase_rubato=self.phrase_rubato.randomize(rng),
-            beat_rubato=self.beat_rubato.randomize(rng),
+            beat_jitter=self.beat_jitter.randomize(rng),
             final_ritard=self.final_ritard.randomize(rng),
-            final_ritard_start=rng.uniform(0.85, 0.95),
-            timing_jitter=self.timing_jitter.randomize(rng),
-            timing_jitter_std_ms=self.timing_jitter_std_ms,
+            final_ritard_measures=self.final_ritard_measures,
             fermata=self.fermata.randomize(rng),
             fermata_duration_multiplier=self.fermata_duration_multiplier,
             fermata_pause_beats=self.fermata_pause_beats,
             crescendo_tempo=self.crescendo_tempo.randomize(rng),
             crescendo_tempo_max_change=self.crescendo_tempo_max_change,
             crescendo_velocity_max_change_dB=self.crescendo_velocity_max_change_dB,
-            articulation_tempo=self.articulation_tempo.randomize(rng),
             punctuation=self.punctuation.randomize(rng),
             micropause_ms=self.micropause_ms,
             phrase_end_shorten_ratio=self.phrase_end_shorten_ratio,
-            leap=self.leap.randomize(rng),
-            leap_threshold_semitones=self.leap_threshold_semitones,
-            leap_duration_effect=self.leap_duration_effect,
-            leap_micropause_ms=self.leap_micropause_ms,
             repetition=self.repetition.randomize(rng),
             repetition_micropause_ms=self.repetition_micropause_ms,
 
@@ -328,9 +310,7 @@ class HumanizationConfig:
             'final_ritard_measures': self.final_ritard_measures,
             'fermata_k': self.fermata.k,
             'crescendo_tempo_k': self.crescendo_tempo.k,
-            'articulation_tempo_k': self.articulation_tempo.k,
             'punctuation_k': self.punctuation.k,
-            'leap_k': self.leap.k,
             'repetition_k': self.repetition.k,
             'staccato_k': self.staccato.k,
             'legato_k': self.legato.k,

@@ -32,16 +32,7 @@ class RepetitionRule(Rule):
         return 0.0
 
     def apply_timing(self, note: Any, features: Dict[str, Any]) -> float:
-        """Slight delay on repeated notes."""
-        if not self.enabled:
-            return 0.0
-
-        is_repeated = features.get('is_repeated_note', False)
-
-        if is_repeated:
-            # Small random variation to avoid mechanical feel
-            return self.k * self.micropause_ms / 1000
-
+        """No timing effect - gap is created by shortening duration only."""
         return 0.0
 
     def apply_duration(self, note: Any, features: Dict[str, Any]) -> float:

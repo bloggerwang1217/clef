@@ -21,7 +21,7 @@ class PunctuationRule(Rule):
     def __init__(
         self,
         config,
-        micropause_ms: float = 30.0,
+        micropause_ms: float = 20.0,
         last_note_shorten_ratio: float = 0.15
     ):
         """
@@ -29,12 +29,14 @@ class PunctuationRule(Rule):
 
         Args:
             config: RuleConfig with k value
-            micropause_ms: Micropause duration (milliseconds), default 30
+            micropause_ms: Micropause duration (milliseconds), default 20
             last_note_shorten_ratio: How much to shorten phrase-end note (0-1)
         """
         super().__init__(config)
         self.micropause_ms = micropause_ms
         self.last_note_shorten_ratio = last_note_shorten_ratio
+        # Breathing is a global event: both hands pause together
+        self.is_tempo_affecting = True
 
     def apply_velocity(self, note: Any, features: Dict[str, Any]) -> float:
         """No velocity effect."""
@@ -49,8 +51,12 @@ class PunctuationRule(Rule):
         phrase_number = features.get('phrase_number', 0)
 
         # Add micropause before new phrase (but not the first phrase)
+        # Tempo-dependent: base micropause_ms calibrated at 120 BPM,
+        # scales proportionally with tempo (faster = shorter breath)
         if is_phrase_start and phrase_number > 0:
-            return self.k * self.micropause_ms / 1000
+            beat_duration = features.get('beat_duration', 0.5)
+            tempo_ratio = beat_duration / 0.5  # 1.0 at 120 BPM
+            return self.k * (self.micropause_ms / 1000) * tempo_ratio
 
         return 0.0
 
