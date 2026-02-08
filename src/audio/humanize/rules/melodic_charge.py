@@ -8,7 +8,7 @@ Effect (timing): slight delay for appoggiaturas (agogic accent)
 
 from typing import Dict, Any
 from .base import Rule
-from ..analysis.non_chord_tone import NonChordToneDetector, NCTType
+from ..non_chord_tone import NonChordToneDetector, NCTType
 
 
 class MelodicChargeRule(Rule):
