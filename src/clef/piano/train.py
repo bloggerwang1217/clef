@@ -191,6 +191,7 @@ class Trainer:
         # Training state
         self.epoch = 0
         self.global_step = 0
+        self.warmup_steps = warmup_steps
         self.best_valid_loss = float('inf')
         self.epochs_without_improvement = 0
 
@@ -203,10 +204,11 @@ class Trainer:
     def _build_token_type_masks(self):
         """Build boolean masks over vocab to classify token types.
 
-        Creates three 1-D boolean tensors of shape [vocab_size]:
-        - pitch_mask: pitch tokens (e.g. C, D#, ee, GG)
+        Creates four 1-D boolean tensors of shape [vocab_size]:
+        - pitch_mask: pitch tokens (e.g. C, D#, ee, GG, r)
         - duration_mask: duration tokens (e.g. 4, 8., 16, q)
         - struct_mask: structural tokens (<coc>, <bar>, <nl>, ...)
+        - schema_mask: schema tokens (<ts:N>, <key:X>) — isolated for fair comparison
 
         Used for per-type loss breakdown logged to wandb (monitoring only,
         does not affect training).
@@ -232,20 +234,36 @@ class Trainer:
             '[', ']', '_',  # tie start/end/continue (onset vs sustain)
             '\t', '\n',  # whitespace (should not appear in labels)
         }
+        # Schema tokens: time signature numerators + key signatures
+        # Isolated so they don't inflate/deflate struct or pitch loss
+        schema_names = {
+            # Time signature numerators
+            '<2>', '<3>', '<4>', '<5>', '<6>', '<7>',
+            '<8>', '<9>', '<10>', '<12>', '<17>',
+            # Key signatures
+            '<key:0>',
+            '<key:1#>', '<key:2#>', '<key:3#>', '<key:4#>',
+            '<key:5#>', '<key:6#>', '<key:7#>',
+            '<key:1b>', '<key:2b>', '<key:3b>', '<key:4b>',
+            '<key:5b>', '<key:6b>', '<key:7b>',
+        }
         # r (rest) stays in pitch: it's the "no pitch" decision, needs audio
 
         struct_ids = set()
         duration_ids = set()
         pitch_ids = set()
+        schema_ids = set()
 
         for tok_str, tok_id in tokenizer.vocab.items():
-            if tok_str in struct_names:
+            if tok_str in schema_names:
+                schema_ids.add(tok_id)
+            elif tok_str in struct_names:
                 struct_ids.add(tok_id)
             elif tok_str in duration_names:
                 duration_ids.add(tok_id)
 
-        # Everything else is a pitch token (including r, accidentals, etc.)
-        classified = struct_ids | duration_ids
+        # Everything else is a pitch token (note names, r, accidentals)
+        classified = struct_ids | duration_ids | schema_ids
         for tok_id in range(V):
             if tok_id not in classified:
                 pitch_ids.add(tok_id)
@@ -253,18 +271,22 @@ class Trainer:
         self._struct_mask = torch.zeros(V, dtype=torch.bool)
         self._duration_mask = torch.zeros(V, dtype=torch.bool)
         self._pitch_mask = torch.zeros(V, dtype=torch.bool)
+        self._schema_mask = torch.zeros(V, dtype=torch.bool)
         for i in struct_ids:
             self._struct_mask[i] = True
         for i in duration_ids:
             self._duration_mask[i] = True
         for i in pitch_ids:
             self._pitch_mask[i] = True
+        for i in schema_ids:
+            self._schema_mask[i] = True
 
         if self.rank == 0:
             logger.info(
                 f'Token type masks: {self._pitch_mask.sum()} pitch, '
                 f'{self._duration_mask.sum()} duration, '
-                f'{self._struct_mask.sum()} struct'
+                f'{self._struct_mask.sum()} struct, '
+                f'{self._schema_mask.sum()} schema'
             )
 
     @torch.no_grad()
@@ -282,10 +304,13 @@ class Trainer:
         pitch_mask = self._pitch_mask.to(flat_labels.device)
         duration_mask = self._duration_mask.to(flat_labels.device)
         struct_mask = self._struct_mask.to(flat_labels.device)
+        schema_mask = self._schema_mask.to(flat_labels.device)
 
-        is_pitch = pitch_mask[flat_labels] & (flat_labels != 0)
-        is_duration = duration_mask[flat_labels] & (flat_labels != 0)
-        is_struct = struct_mask[flat_labels] & (flat_labels != 0)
+        non_pad = flat_labels != 0
+        is_pitch = pitch_mask[flat_labels] & non_pad
+        is_duration = duration_mask[flat_labels] & non_pad
+        is_struct = struct_mask[flat_labels] & non_pad
+        is_schema = schema_mask[flat_labels] & non_pad
 
         result = {}
         if is_pitch.any():
@@ -294,6 +319,8 @@ class Trainer:
             result['loss_duration'] = per_token[is_duration].mean().item()
         if is_struct.any():
             result['loss_struct'] = per_token[is_struct].mean().item()
+        if is_schema.any():
+            result['loss_schema'] = per_token[is_schema].mean().item()
         return result
 
     def train_epoch(self) -> Dict[str, float]:
@@ -425,7 +452,7 @@ class Trainer:
                         logger.info(f'Step {self.global_step}: valid_loss={valid_metrics["valid_loss"]:.4f}')
                         if self.use_wandb:
                             valid_log = {'valid/loss': valid_metrics['valid_loss']}
-                            for k in ('loss_pitch', 'loss_duration', 'loss_struct'):
+                            for k in ('loss_pitch', 'loss_duration', 'loss_struct', 'loss_schema'):
                                 if k in valid_metrics:
                                     valid_log[f'valid/{k}'] = valid_metrics[k]
                             wandb.log(valid_log, step=self.global_step)
@@ -446,10 +473,14 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
         # Accumulators for per-type loss breakdown
-        type_loss_sums = {'loss_pitch': 0.0, 'loss_duration': 0.0, 'loss_struct': 0.0}
-        type_loss_counts = {'loss_pitch': 0, 'loss_duration': 0, 'loss_struct': 0}
+        type_loss_sums = {'loss_pitch': 0.0, 'loss_duration': 0.0, 'loss_struct': 0.0, 'loss_schema': 0.0}
+        type_loss_counts = {'loss_pitch': 0, 'loss_duration': 0, 'loss_struct': 0, 'loss_schema': 0}
 
-        for batch in self.valid_loader:
+        for batch_idx, batch in enumerate(self.valid_loader):
+            if batch is None:
+                if self.rank == 0:
+                    logger.warning(f'Validation: skipping batch {batch_idx} (all samples filtered)')
+                continue
             mel = batch['mel'].to(self.device)
             input_ids = batch['input_ids'].to(self.device)
             labels = batch['labels'].to(self.device)
@@ -588,7 +619,7 @@ class Trainer:
                     }
                     if 'valid_loss' in valid_metrics:
                         epoch_log['epoch/valid_loss'] = valid_metrics['valid_loss']
-                    for k in ('loss_pitch', 'loss_duration', 'loss_struct'):
+                    for k in ('loss_pitch', 'loss_duration', 'loss_struct', 'loss_schema'):
                         if k in valid_metrics:
                             epoch_log[f'epoch/valid_{k}'] = valid_metrics[k]
                     wandb.log(epoch_log, step=self.global_step)

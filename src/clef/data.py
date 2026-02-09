@@ -181,7 +181,20 @@ class ChunkedDataset(Dataset):
                 if kern_path:
                     with open(kern_path, 'r', encoding='utf-8') as f:
                         all_lines = f.readlines()
-                    chunk_kern = ''.join(all_lines[line_start - 1:line_end])
+
+                    # Extract header interpretation lines (*k[...], *M...)
+                    # so the tokenizer can insert schema tokens for all
+                    # chunks, not just those that happen to contain repeated
+                    # interpretation records mid-file.
+                    header_interps = []
+                    for hl in all_lines:
+                        hs = hl.strip()
+                        if hs.startswith('=') or (hs and not hs.startswith('*') and not hs.startswith('!')):
+                            break  # first barline or data line
+                        if hs.startswith('*k[') or (hs.startswith('*M') and '/' in hs):
+                            header_interps.append(hl)
+
+                    chunk_kern = ''.join(header_interps + all_lines[line_start - 1:line_end])
 
                     try:
                         tokens = self.tokenizer.encode(chunk_kern)

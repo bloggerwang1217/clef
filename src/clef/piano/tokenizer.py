@@ -201,6 +201,52 @@ def generate_pitch_tokens() -> List[str]:
 
 PITCH_TOKENS = generate_pitch_tokens()
 
+# Kern pitch to MIDI mapping
+_KERN_BASE_SEMITONES = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+
+
+def kern_pitch_to_midi(token: str) -> int:
+    """Convert a kern pitch token to MIDI number.
+
+    Uppercase = octave 3 and below, lowercase = octave 4 and above.
+    Examples: CCCC=12(C0), CCC=24(C1), CC=36(C2), C=48(C3),
+              c=60(C4), cc=72(C5), ccc=84(C6), cccc=96(C7), ccccc=108(C8)
+    Accidentals: # = +1, - = -1.
+    Returns -1 for rest (r) or unrecognized tokens.
+    """
+    if not token or token == 'r':
+        return -1
+
+    # Strip accidentals from the end
+    accidental = 0
+    core = token
+    while core.endswith('#'):
+        accidental += 1
+        core = core[:-1]
+    while core.endswith('-'):
+        accidental -= 1
+        core = core[:-1]
+
+    if not core:
+        return -1
+
+    letter = core[0].upper()
+    if letter not in _KERN_BASE_SEMITONES:
+        return -1
+
+    base = _KERN_BASE_SEMITONES[letter]
+
+    if core[0].isupper():
+        # Uppercase: C=48(oct3), CC=36(oct2), CCC=24(oct1), CCCC=12(oct0)
+        repeat = len(core)
+        midi = (5 - repeat) * 12 + base
+    else:
+        # Lowercase: c=60(oct4), cc=72(oct5), ccc=84(oct6), cccc=96(oct7)
+        repeat = len(core)
+        midi = (4 + repeat) * 12 + base
+
+    return midi + accidental
+
 # Modifier tokens
 MODIFIER_TOKENS = [
     # Ties

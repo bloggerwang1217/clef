@@ -71,8 +71,18 @@ class ClefPianoConfig(ClefConfig):
             flow_pool_stride=model_cfg.get("flow_pool_stride", defaults.flow_pool_stride),
             use_temporal_cnn=model_cfg.get("use_temporal_cnn", defaults.use_temporal_cnn),
             temporal_pool_stride=model_cfg.get("temporal_pool_stride", defaults.temporal_pool_stride),
+
+            # Octopus2D
+            use_octopus=model_cfg.get("use_octopus", defaults.use_octopus),
+            octopus_freq_kernel=model_cfg.get("octopus_freq_kernel", defaults.octopus_freq_kernel),
+            octopus_time_kernel=model_cfg.get("octopus_time_kernel", defaults.octopus_time_kernel),
+            octopus_channels=model_cfg.get("octopus_channels", defaults.octopus_channels),
+            octopus_time_pool_stride=model_cfg.get("octopus_time_pool_stride", defaults.octopus_time_pool_stride),
+
+            # Swin input mode
             swin_start_stage=model_cfg.get("swin_start_stage", defaults.swin_start_stage),
             swin_pool_strides=model_cfg.get("swin_pool_strides", defaults.swin_pool_strides),
+            swin_on_pitch_space=model_cfg.get("swin_on_pitch_space", defaults.swin_on_pitch_space),
 
             # Attention
             d_model=model_cfg.get("d_model", defaults.d_model),

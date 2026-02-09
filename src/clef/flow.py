@@ -188,6 +188,81 @@ def _init_difference_operator(conv: nn.Conv1d) -> None:
             conv.weight[c, c, 2] = +1.0  # t   (current)
 
 
+class Octopus2D(nn.Module):
+    """Cross-frequency onset detector (CN octopus cells).
+
+    Neuroscience analogy: cochlear nucleus octopus cells detect synchronous
+    onset across frequency bands via thick dendritic arbors spanning many
+    auditory nerve fibers.
+
+    Architecture: 2D conv with large freq kernel x small time kernel.
+    - freq_kernel=31: spans ~4 harmonics of a mid-register note
+    - time_kernel=3: captures onset transient (10-30ms)
+    - 32 output channels: different onset pattern detectors
+
+    Two outputs:
+    - Output A: onset-enhanced mel (residual addition) for downstream Flow
+    - Output B: onset timing features (freq-pooled) for FluxAttention Level 0
+
+    Input:  [B, 1, 128, T] mel spectrogram
+    Output: (enhanced_mel [B, 1, 128, T], onset_level [B, T//pool, 32])
+    """
+
+    def __init__(
+        self,
+        freq_kernel: int = 31,
+        time_kernel: int = 3,
+        channels: int = 32,
+        time_pool_stride: int = 2,
+    ):
+        super().__init__()
+        self.time_pool_stride = time_pool_stride
+
+        # Cross-frequency onset detector
+        # Odd kernel sizes for symmetric padding (same output shape)
+        self.conv = nn.Conv2d(
+            1, channels,
+            kernel_size=(freq_kernel, time_kernel),
+            padding=(freq_kernel // 2, time_kernel // 2),
+        )
+
+        # Project back to 1 channel for residual enhancement
+        self.proj_back = nn.Conv2d(channels, 1, kernel_size=1)
+
+        # Residual scale: start small to preserve mel for Flow
+        self.scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(
+        self, mel: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Detect cross-frequency onsets and enhance mel.
+
+        Args:
+            mel: [B, 1, 128, T] log-mel spectrogram
+
+        Returns:
+            enhanced_mel: [B, 1, 128, T] mel + onset residual (for Flow)
+            onset_level: [B, T//pool_stride, channels] onset features (for Level 0)
+        """
+        # Cross-frequency onset detection
+        onset = F.gelu(self.conv(mel))  # [B, C, 128, T]
+
+        # Output A: residual enhancement for downstream Flow
+        residual = self.proj_back(onset)  # [B, 1, 128, T]
+        enhanced = mel + self.scale * residual
+
+        # Output B: onset timing for FluxAttention Level 0
+        # Global average over freq (onset TYPE encoded in C channels, not spatial position)
+        onset_1d = onset.mean(dim=2)  # [B, C, T]
+        if self.time_pool_stride > 1:
+            onset_1d = F.avg_pool1d(
+                onset_1d, self.time_pool_stride, self.time_pool_stride
+            )  # [B, C, T//stride]
+        onset_level = onset_1d.transpose(1, 2)  # [B, T//stride, C]
+
+        return enhanced, onset_level
+
+
 class TemporalCNN(nn.Module):
     """Causal 1D CNN for temporal dynamics in pitch space.
 

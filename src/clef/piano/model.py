@@ -27,7 +27,7 @@ from transformers import Swinv2Model
 from .config import ClefPianoConfig
 from ..bridge import DeformableBridge
 from ..decoder import ClefDecoder, SADecoderLayer, MambaDecoderLayer
-from ..flow import HarmonizingFlow
+from ..flow import HarmonizingFlow, Octopus2D
 
 
 class ClefPianoBase(nn.Module):
@@ -61,9 +61,20 @@ class ClefPianoBase(nn.Module):
             for p in self.swin.parameters():
                 p.requires_grad = False
 
+        # === Octopus2D (optional, cross-frequency onset detection) ===
+        self.use_octopus = getattr(config, 'use_octopus', False)
+        if self.use_octopus:
+            self.octopus = Octopus2D(
+                freq_kernel=getattr(config, 'octopus_freq_kernel', 31),
+                time_kernel=getattr(config, 'octopus_time_kernel', 3),
+                channels=getattr(config, 'octopus_channels', 32),
+                time_pool_stride=getattr(config, 'octopus_time_pool_stride', 2),
+            )
+
         # === HarmonizingFlow (optional, pitch space transform) ===
         self.use_flow = getattr(config, 'use_flow', False)
         self.use_temporal_cnn = getattr(config, 'use_temporal_cnn', False)
+        self.swin_on_pitch_space = getattr(config, 'swin_on_pitch_space', False)
         if self.use_flow:
             self.flow = HarmonizingFlow(
                 n_mels=config.n_mels,
@@ -79,13 +90,16 @@ class ClefPianoBase(nn.Module):
             )
 
         # === Deformable Bridge ===
-        # Build bridge input dims based on active levels:
-        # Flow levels (n_mels each) + selected Swin stages
+        # Build bridge input dims based on active levels
         self.swin_start_stage = getattr(config, 'swin_start_stage', 0)
         swin_dims_used = config.swin_dims[self.swin_start_stage:]
 
         bridge_input_dims = None
-        if self.use_flow:
+        # Serial encoder: Octopus + Flow + Swin stages
+        if self.use_octopus and self.swin_on_pitch_space:
+            octopus_dim = getattr(config, 'octopus_channels', 32)
+            bridge_input_dims = [octopus_dim, config.n_mels] + swin_dims_used
+        elif self.use_flow:
             flow_dims = [config.n_mels]
             if self.use_temporal_cnn:
                 flow_dims = [config.n_mels, config.n_mels]
@@ -145,11 +159,13 @@ class ClefPianoBase(nn.Module):
 
         # Standard weight initialization for stable training
         # Skip Swin (pretrained) and Flow (physics-initialized) —
-        # only init bridge, decoder, embeddings, output_head
+        # only init bridge, decoder, embeddings, output_head, octopus
         self.bridge.apply(self._init_weights)
         self.decoder.apply(self._init_weights)
         self._init_weights(self.token_embed)
         self._init_weights(self.output_head)
+        if self.use_octopus:
+            self.octopus.apply(self._init_weights)
         # NOTE: Flow.transform is NOT re-initialized here — it uses physics init
 
         # Re-apply special initialization that _init_weights overwrites.
@@ -196,85 +212,20 @@ class ClefPianoBase(nn.Module):
         """
         B, C, H, T = mel.shape
 
-        # Pad to multiple of 32 (Swin V2 window size constraint)
-        padded_mel, (orig_H, orig_W) = self._pad_to_multiple(mel, multiple=32)
-        _, _, H_pad, T_pad = padded_mel.shape
-
-        # Compute valid ratios from original vs padded size
-        # This tells attention "which part is real vs padding"
-        valid_ratio_h = orig_H / H_pad  # freq axis (usually 1.0 since 128 % 32 == 0)
-        valid_ratio_w = orig_W / T_pad  # time axis
-
-        # Expand to 3 channels for Swin
-        x = padded_mel.repeat(1, 3, 1, 1)  # [B, 3, H_pad, T_pad]
-
-        # Run Swin encoder
-        ctx = torch.no_grad() if self.config.freeze_encoder else nullcontext()
-        with ctx:
-            swin_out = self.swin(x, output_hidden_states=True)
-
-        # Build feature list and spatial shapes
         features = []
         spatial_shapes_list = []
         valid_ratios_list = []
 
-        # Level 0 (+Level 1 if TemporalCNN): HarmonizingFlow
-        if self.use_flow:
-            flow_out = self.flow(mel)  # tuple or tensor
-
-            if self.use_temporal_cnn:
-                # flow_out = (pitch [B,T,128], temporal [B,T//tcnn_stride,128])
-                flow_feat, temporal_feat = flow_out
-            else:
-                flow_feat = flow_out
-
-            # Temporal pooling for pitch features to match Swin S0 resolution
-            pool_stride = getattr(self.config, 'flow_pool_stride', 4)
-            if pool_stride > 1:
-                flow_feat = flow_feat.permute(0, 2, 1)  # [B, 128, T]
-                flow_feat = F.avg_pool1d(flow_feat, kernel_size=pool_stride,
-                                         stride=pool_stride)
-                flow_feat = flow_feat.permute(0, 2, 1)  # [B, T//stride, 128]
-
-            # Level 0: pitch content
-            T_flow = flow_feat.shape[1]
-            features.append(flow_feat)
-            spatial_shapes_list.append((1, T_flow))
-            valid_ratios_list.append([1.0, 1.0])
-
-            # Level 1: temporal dynamics (onset/sustain/release)
-            if self.use_temporal_cnn:
-                T_temporal = temporal_feat.shape[1]
-                features.append(temporal_feat)
-                spatial_shapes_list.append((1, T_temporal))
-                valid_ratios_list.append([1.0, 1.0])
-
-        # Swin stages (skip stages before swin_start_stage)
-        # hidden_states: [stage0(96), stage1(192), stage2(384), stage3(768), stage4(768)]
-        # We use stages swin_start_stage..3 to match swin_dims[swin_start_stage:]
-        n_swin_stages = len(self.config.swin_dims)
-        all_swin_shapes = self._compute_spatial_shapes(H_pad, T_pad)
-        swin_pools = getattr(self.config, 'swin_pool_strides', [1] * n_swin_stages)
-
-        for i in range(self.swin_start_stage, n_swin_stages):
-            feat = swin_out.hidden_states[i]  # [B, N_patches, C]
-            H_s, W_s = all_swin_shapes[i]
-            pool_s = swin_pools[i] if i < len(swin_pools) else 1
-
-            # Pool in time to remove redundant overlapping windows
-            # Swin window_size=8 → each stage has ~8x temporal oversampling
-            if pool_s > 1:
-                feat = feat.view(B, H_s, W_s, -1)        # [B, H, W, C]
-                feat = feat.permute(0, 3, 1, 2)           # [B, C, H, W]
-                feat = F.avg_pool2d(feat, kernel_size=(1, pool_s),
-                                    stride=(1, pool_s))
-                feat = feat.permute(0, 2, 3, 1)           # [B, H, W_new, C]
-                W_s = feat.shape[2]
-                feat = feat.reshape(B, H_s * W_s, -1)     # [B, H*W_new, C]
-
-            features.append(feat)
-            spatial_shapes_list.append((H_s, W_s))
-            valid_ratios_list.append([valid_ratio_w, valid_ratio_h])
+        if self.use_octopus and self.swin_on_pitch_space:
+            # === Serial encoder: mel → Octopus → Flow → Swin (pitch space) ===
+            self._encode_serial(
+                mel, B, T, features, spatial_shapes_list, valid_ratios_list
+            )
+        else:
+            # === Legacy parallel encoder: Flow || Swin (both on mel) ===
+            self._encode_parallel(
+                mel, B, features, spatial_shapes_list, valid_ratios_list
+            )
 
         # Compute per-level valid ratios [B, L, 2]
         level_valid_ratios = torch.tensor(
@@ -288,6 +239,158 @@ class ClefPianoBase(nn.Module):
         )
 
         return memory, spatial_shapes, level_start_index, valid_ratios
+
+    def _encode_serial(
+        self,
+        mel: torch.Tensor,
+        B: int,
+        T: int,
+        features: list,
+        spatial_shapes_list: list,
+        valid_ratios_list: list,
+    ) -> None:
+        """Serial encoder: mel → Octopus2D → Flow → Swin on pitch space.
+
+        Brain-inspired serial pipeline:
+        - Octopus2D = CN octopus cells (cross-frequency onset detection)
+        - Flow = IC harmonic integration (pitch identification)
+        - Swin = A1 cortex (multi-scale 2D processing in pitch space)
+        """
+        # Step 1: Octopus2D — cross-frequency onset detection on raw mel
+        enhanced_mel, onset_level = self.octopus(mel)
+        # onset_level: [B, T//pool, C]
+        T_onset = onset_level.shape[1]
+        features.append(onset_level)
+        spatial_shapes_list.append((1, T_onset))
+        valid_ratios_list.append([1.0, 1.0])
+
+        # Step 2: Flow — harmonic template matching on onset-enhanced mel
+        # use_temporal_cnn=False in serial mode, so flow returns tensor directly
+        flow_feat = self.flow(enhanced_mel)  # [B, T, 128]
+
+        # Temporal pooling
+        pool_stride = getattr(self.config, 'flow_pool_stride', 4)
+        if pool_stride > 1:
+            flow_feat = flow_feat.permute(0, 2, 1)  # [B, 128, T]
+            flow_feat = F.avg_pool1d(
+                flow_feat, kernel_size=pool_stride, stride=pool_stride
+            )
+            flow_feat = flow_feat.permute(0, 2, 1)  # [B, T//4, 128]
+
+        T_flow = flow_feat.shape[1]
+        features.append(flow_feat)
+        spatial_shapes_list.append((1, T_flow))
+        valid_ratios_list.append([1.0, 1.0])
+
+        # Step 3: Reshape Flow output as pitch-space "image" for Swin
+        # flow_feat: [B, T_flow, 128] → [B, 1, 128, T_flow]
+        swin_input = flow_feat.detach().permute(0, 2, 1).unsqueeze(1)
+        swin_input, (orig_H_s, orig_W_s) = self._pad_to_multiple(swin_input, 32)
+        swin_input = swin_input.repeat(1, 3, 1, 1)  # [B, 3, 128, T_pad]
+        _, _, H_pad_s, T_pad_s = swin_input.shape
+
+        valid_ratio_h_s = orig_H_s / H_pad_s  # 128/128 = 1.0
+        valid_ratio_w_s = orig_W_s / T_pad_s
+
+        # Step 4: Run frozen Swin on pitch-space image
+        ctx = torch.no_grad() if self.config.freeze_encoder else nullcontext()
+        with ctx:
+            swin_out = self.swin(swin_input, output_hidden_states=True)
+
+        # Step 5: Collect Swin stages
+        n_swin_stages = len(self.config.swin_dims)
+        all_swin_shapes = self._compute_spatial_shapes(H_pad_s, T_pad_s)
+        swin_pools = getattr(self.config, 'swin_pool_strides', [1] * n_swin_stages)
+
+        for i in range(self.swin_start_stage, n_swin_stages):
+            feat = swin_out.hidden_states[i]  # [B, N_patches, C]
+            H_s, W_s = all_swin_shapes[i]
+            pool_s = swin_pools[i] if i < len(swin_pools) else 1
+
+            if pool_s > 1:
+                feat = feat.view(B, H_s, W_s, -1).permute(0, 3, 1, 2)
+                feat = F.avg_pool2d(feat, kernel_size=(1, pool_s),
+                                    stride=(1, pool_s))
+                feat = feat.permute(0, 2, 3, 1)
+                W_s = feat.shape[2]
+                feat = feat.reshape(B, H_s * W_s, -1)
+
+            features.append(feat)
+            spatial_shapes_list.append((H_s, W_s))
+            valid_ratios_list.append([valid_ratio_w_s, valid_ratio_h_s])
+
+    def _encode_parallel(
+        self,
+        mel: torch.Tensor,
+        B: int,
+        features: list,
+        spatial_shapes_list: list,
+        valid_ratios_list: list,
+    ) -> None:
+        """Legacy parallel encoder: Flow and Swin both read raw mel independently."""
+        # Pad to multiple of 32 (Swin V2 window size constraint)
+        padded_mel, (orig_H, orig_W) = self._pad_to_multiple(mel, multiple=32)
+        _, _, H_pad, T_pad = padded_mel.shape
+
+        valid_ratio_h = orig_H / H_pad
+        valid_ratio_w = orig_W / T_pad
+
+        # Expand to 3 channels for Swin
+        x = padded_mel.repeat(1, 3, 1, 1)  # [B, 3, H_pad, T_pad]
+
+        # Run Swin encoder
+        ctx = torch.no_grad() if self.config.freeze_encoder else nullcontext()
+        with ctx:
+            swin_out = self.swin(x, output_hidden_states=True)
+
+        # Level 0 (+Level 1 if TemporalCNN): HarmonizingFlow
+        if self.use_flow:
+            flow_out = self.flow(mel)  # tuple or tensor
+
+            if self.use_temporal_cnn:
+                flow_feat, temporal_feat = flow_out
+            else:
+                flow_feat = flow_out
+
+            pool_stride = getattr(self.config, 'flow_pool_stride', 4)
+            if pool_stride > 1:
+                flow_feat = flow_feat.permute(0, 2, 1)
+                flow_feat = F.avg_pool1d(flow_feat, kernel_size=pool_stride,
+                                         stride=pool_stride)
+                flow_feat = flow_feat.permute(0, 2, 1)
+
+            T_flow = flow_feat.shape[1]
+            features.append(flow_feat)
+            spatial_shapes_list.append((1, T_flow))
+            valid_ratios_list.append([1.0, 1.0])
+
+            if self.use_temporal_cnn:
+                T_temporal = temporal_feat.shape[1]
+                features.append(temporal_feat)
+                spatial_shapes_list.append((1, T_temporal))
+                valid_ratios_list.append([1.0, 1.0])
+
+        # Swin stages
+        n_swin_stages = len(self.config.swin_dims)
+        all_swin_shapes = self._compute_spatial_shapes(H_pad, T_pad)
+        swin_pools = getattr(self.config, 'swin_pool_strides', [1] * n_swin_stages)
+
+        for i in range(self.swin_start_stage, n_swin_stages):
+            feat = swin_out.hidden_states[i]
+            H_s, W_s = all_swin_shapes[i]
+            pool_s = swin_pools[i] if i < len(swin_pools) else 1
+
+            if pool_s > 1:
+                feat = feat.view(B, H_s, W_s, -1).permute(0, 3, 1, 2)
+                feat = F.avg_pool2d(feat, kernel_size=(1, pool_s),
+                                    stride=(1, pool_s))
+                feat = feat.permute(0, 2, 3, 1)
+                W_s = feat.shape[2]
+                feat = feat.reshape(B, H_s * W_s, -1)
+
+            features.append(feat)
+            spatial_shapes_list.append((H_s, W_s))
+            valid_ratios_list.append([valid_ratio_w, valid_ratio_h])
 
     def _pad_to_multiple(
         self, mel: torch.Tensor, multiple: int = 32
@@ -420,6 +523,12 @@ class ClefPianoBase(nn.Module):
                 use_cache=True,
                 value_cache_list=value_cache,
             )
+            # Increment Mamba InferenceParams.seqlen_offset after each step.
+            # mamba-ssm does NOT auto-increment; the caller must do it.
+            for state in new_states:
+                if hasattr(state, 'seqlen_offset'):
+                    state.seqlen_offset += S
+                    break  # shared object, only increment once
             logits = self.output_head(tgt)
             return logits, new_states
         else:
@@ -472,13 +581,14 @@ class ClefPianoBase(nn.Module):
                 labels.view(-1)
             )
 
+            loss = ce_loss
+
             # Predictive coding auxiliary loss (predictor MSE)
             pred_loss = self.decoder.collect_pred_loss()
             if pred_loss is not None:
-                loss = ce_loss + self.config.pred_loss_weight * pred_loss
+                loss = loss + self.config.pred_loss_weight * pred_loss
                 self._last_pred_loss = pred_loss.detach()
             else:
-                loss = ce_loss
                 self._last_pred_loss = None
 
         return logits, loss

@@ -31,8 +31,16 @@ class ClefConfig:
     use_temporal_cnn: bool = False  # Causal 1D CNN on Flow output for onset/duration
     temporal_pool_stride: int = 4   # Pool stride for temporal CNN output (T -> T/4)
 
+    # === Octopus2D (cross-frequency onset detection) ===
+    use_octopus: bool = False          # Enable Octopus2D onset detector
+    octopus_freq_kernel: int = 31      # Freq span (~4 harmonics of mid-register note)
+    octopus_time_kernel: int = 3       # Time span (onset transient: 10-30ms)
+    octopus_channels: int = 32         # Number of onset pattern detectors
+    octopus_time_pool_stride: int = 2  # Temporal pool for Level 0 (T -> T/2, 20ms)
+
     # === Swin Stage Selection ===
     swin_start_stage: int = 0  # Skip Swin stages before this index (0=use all, 1=skip S0)
+    swin_on_pitch_space: bool = False  # True = serial (Swin eats Flow output, not raw mel)
     # Time-axis pool per Swin stage (remove overlapping-window redundancy)
     # Swin0: RF~320ms, grid 40ms → pool 8x (Nyquist, chord is discrete)
     # Swin1: RF~640ms, grid 80ms → pool 4x (50% overlap, melody needs continuity)
@@ -94,10 +102,12 @@ class ClefConfig:
         n_swin_used = len(self.swin_dims) - self.swin_start_stage
         expected_levels = (n_swin_used
                           + (1 if self.use_flow else 0)
+                          + (1 if self.use_octopus else 0)
                           + (1 if self.use_temporal_cnn else 0))
         assert self.n_levels == expected_levels, (
             f"n_levels({self.n_levels}) must be "
             f"swin({n_swin_used}) + flow({1 if self.use_flow else 0}) "
+            f"+ octopus({1 if self.use_octopus else 0}) "
             f"+ cnn({1 if self.use_temporal_cnn else 0}) = {expected_levels}"
         )
         assert self.n_points_freq > 0, "n_points_freq must be positive"
