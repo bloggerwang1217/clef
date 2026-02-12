@@ -23,8 +23,8 @@ set -e
 # Configuration (can be overridden via environment variables)
 # =============================================================================
 
-# Paths
-CONFIG="${CONFIG:-configs/clef_piano_base.yaml}"
+# Paths (first positional arg or env var)
+CONFIG="${1:-${CONFIG:-configs/clef_piano_base.yaml}}"
 
 # Helper function to read config values
 read_config() {

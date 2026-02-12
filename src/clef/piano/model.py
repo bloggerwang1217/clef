@@ -125,10 +125,18 @@ class ClefPianoBase(nn.Module):
 
         # === Decoder ===
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
-        self.decoder_pos_embed = nn.Parameter(
-            torch.zeros(1, config.max_seq_len, config.d_model)
-        )
-        nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
+
+        # Position embedding: RoPE (default) or learned absolute
+        self.use_rope = getattr(config, 'use_rope', True)
+        if not self.use_rope:
+            # Legacy: learned absolute position embedding
+            self.decoder_pos_embed = nn.Parameter(
+                torch.zeros(1, config.max_seq_len, config.d_model)
+            )
+            nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
+        else:
+            # RoPE: no position embedding parameter needed
+            self.decoder_pos_embed = None
 
         self.decoder = ClefDecoder(
             d_model=config.d_model,
@@ -149,6 +157,7 @@ class ClefPianoBase(nn.Module):
             d_state=config.mamba_d_state,
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
+            use_rope=self.use_rope,
         )
 
         # === Output ===
@@ -158,10 +167,18 @@ class ClefPianoBase(nn.Module):
         self._causal_mask_cache: Dict[int, torch.Tensor] = {}
 
         # Standard weight initialization for stable training
-        # Skip Swin (pretrained) and Flow (physics-initialized) —
-        # only init bridge, decoder, embeddings, output_head, octopus
+        # Skip Swin (pretrained), Flow (physics-initialized), Mamba2 (own init)
         self.bridge.apply(self._init_weights)
-        self.decoder.apply(self._init_weights)
+        # Decoder: init shared components per layer, skip Mamba2 internals
+        for layer in self.decoder.layers:
+            layer.cross_attn.apply(self._init_weights)
+            layer.ffn.apply(self._init_weights)
+            # norms use default init (fine), reference predictors re-init below
+            if hasattr(layer, 'self_attn_qkv'):  # SA layer
+                self._init_weights(layer.self_attn_qkv)
+                self._init_weights(layer.self_attn_out)
+            # Mamba2 layer.mamba is NOT touched — preserve its init
+        self.decoder.norm.apply(self._init_weights)
         self._init_weights(self.token_embed)
         self._init_weights(self.output_head)
         if self.use_octopus:
@@ -173,12 +190,16 @@ class ClefPianoBase(nn.Module):
         # - FluxAttention offset bias (±0.5 grid pattern)
         # - FluxAttention level_weights bias (+1.0 level specialization)
         # - DecoderLayer freq_prior/time_prior/reference_refine bias
-        # - PC gain bias (softplus(0.7) ≈ 1.0, "start open")
         for layer in self.decoder.layers:
             layer._init_reference_predictors()
             layer.cross_attn._reset_parameters()
-            if hasattr(layer, 'ca_gain'):
-                nn.init.constant_(layer.ca_gain.bias, 0.7)
+
+    def train(self, mode: bool = True):
+        """Override to keep Swin in eval mode (disable DropPath)."""
+        super().train(mode)
+        if hasattr(self, 'swin') and getattr(self.config, 'freeze_encoder', True):
+            self.swin.eval()
+        return self
 
     @staticmethod
     def _init_weights(module: nn.Module):
@@ -258,10 +279,14 @@ class ClefPianoBase(nn.Module):
         """
         # Step 1: Octopus2D — cross-frequency onset detection on raw mel
         enhanced_mel, onset_level = self.octopus(mel)
-        # onset_level: [B, T//pool, C]
-        T_onset = onset_level.shape[1]
+        # onset_level: [B, H*W, C] where H=32 (freq bins), W=T//time_pool
+        # Calculate spatial shape from pooling strides
+        freq_pool = getattr(self.config, 'octopus_freq_pool_stride', 4)
+        time_pool = getattr(self.config, 'octopus_time_pool_stride', 2)
+        H_onset = 128 // freq_pool  # 128 mels / 4 = 32
+        W_onset = T // time_pool
         features.append(onset_level)
-        spatial_shapes_list.append((1, T_onset))
+        spatial_shapes_list.append((H_onset, W_onset))
         valid_ratios_list.append([1.0, 1.0])
 
         # Step 2: Flow — harmonic template matching on onset-enhanced mel
@@ -506,12 +531,20 @@ class ClefPianoBase(nn.Module):
         # Token embedding
         tgt = self.token_embed(input_ids)  # [B, S, D]
 
-        # Position embedding: use correct position offset when using cache
-        if past_states is not None:
-            cached_len = self._get_cached_len(past_states)
-            tgt_pos = self.decoder_pos_embed[:, cached_len:cached_len + S, :]
+        # Position info: RoPE uses offset (int), legacy uses embedding tensor
+        if self.use_rope:
+            # RoPE: pass position offset as int (SA layers handle internally)
+            if past_states is not None:
+                tgt_pos = self._get_cached_len(past_states)  # int offset
+            else:
+                tgt_pos = 0
         else:
-            tgt_pos = self.decoder_pos_embed[:, :S, :]
+            # Legacy: learned absolute position embedding
+            if past_states is not None:
+                cached_len = self._get_cached_len(past_states)
+                tgt_pos = self.decoder_pos_embed[:, cached_len:cached_len + S, :]
+            else:
+                tgt_pos = self.decoder_pos_embed[:, :S, :]
 
         # Run decoder
         if use_cache:
@@ -566,7 +599,7 @@ class ClefPianoBase(nn.Module):
 
         # Decode
         logits = self.decode(
-            input_ids, memory, spatial_shapes, level_start_index, valid_ratios
+            input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
         )
 
         # Compute loss
@@ -582,14 +615,6 @@ class ClefPianoBase(nn.Module):
             )
 
             loss = ce_loss
-
-            # Predictive coding auxiliary loss (predictor MSE)
-            pred_loss = self.decoder.collect_pred_loss()
-            if pred_loss is not None:
-                loss = loss + self.config.pred_loss_weight * pred_loss
-                self._last_pred_loss = pred_loss.detach()
-            else:
-                self._last_pred_loss = None
 
         return logits, loss
 
@@ -635,26 +660,44 @@ class ClefPianoBase(nn.Module):
         top_p: Optional[float] = None,
         sos_token_id: int = 1,
         eos_token_id: int = 2,
+        num_beams: Optional[int] = None,
+        length_penalty: float = 1.0,
     ) -> torch.Tensor:
         """Generate token sequence autoregressively.
 
         Args:
             mel: Log-mel spectrogram [B, 1, 128, T]
             max_length: Maximum sequence length
-            temperature: Sampling temperature
-            top_k: Top-k sampling (None for greedy)
-            top_p: Top-p (nucleus) sampling
+            temperature: Sampling temperature (ignored if num_beams > 1)
+            top_k: Top-k sampling (None for greedy, ignored if num_beams > 1)
+            top_p: Top-p (nucleus) sampling (ignored if num_beams > 1)
             sos_token_id: Start token ID
             eos_token_id: End token ID
+            num_beams: If > 1, use beam search instead of greedy/sampling
+            length_penalty: Length penalty for beam search (>1 = longer, <1 = shorter)
 
         Returns:
             generated: Generated token IDs [B, L]
         """
+        # Use beam search if num_beams > 1
+        if num_beams is not None and num_beams > 1:
+            return self.beam_search_generate(
+                mel=mel,
+                max_length=max_length,
+                num_beams=num_beams,
+                length_penalty=length_penalty,
+                sos_token_id=sos_token_id,
+                eos_token_id=eos_token_id,
+            )
+
         B = mel.shape[0]
         device = mel.device
 
         # Encode once
         memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
+
+        # Pre-compute cross-attention value projections (avoid recomputing each step)
+        value_cache = self.prepare_value_cache(memory, spatial_shapes, level_start_index)
 
         # Initialize inference states (Mamba InferenceParams + SA KV-cache)
         past_states = self._init_inference_states(B, max_length, device)
@@ -663,33 +706,37 @@ class ClefPianoBase(nn.Module):
         generated = torch.full((B, 1), sos_token_id, dtype=torch.long, device=device)
         input_ids = generated
 
-        for _ in range(max_length - 1):
+        step = 0
+        while step < max_length - 1:
             # Decode with cache
             logits, past_states = self.decode(
                 input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
                 past_states=past_states, use_cache=True,
+                value_cache=value_cache,
             )
 
             # Get last token logits
-            next_logits = logits[:, -1, :] / temperature
+            next_logits = logits[:, -1, :]  # [B, V]
 
-            # Apply top-k
-            if top_k is not None:
-                v, _ = torch.topk(next_logits, top_k)
-                next_logits[next_logits < v[:, [-1]]] = float('-inf')
-
-            # Apply top-p
-            if top_p is not None:
-                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                for b in range(B):
-                    next_logits[b, sorted_indices[b, sorted_indices_to_remove[b]]] = float('-inf')
-
-            # Sample or greedy
+            # Greedy or sampling
             if temperature > 0 and (top_k is not None or top_p is not None):
+                next_logits = next_logits / temperature
+
+                # Apply top-k
+                if top_k is not None:
+                    v, _ = torch.topk(next_logits, top_k)
+                    next_logits[next_logits < v[:, [-1]]] = float('-inf')
+
+                # Apply top-p
+                if top_p is not None:
+                    sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    for b in range(B):
+                        next_logits[b, sorted_indices[b, sorted_indices_to_remove[b]]] = float('-inf')
+
                 probs = F.softmax(next_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
             else:
@@ -698,12 +745,310 @@ class ClefPianoBase(nn.Module):
             # Append
             generated = torch.cat([generated, next_token], dim=1)
             input_ids = next_token  # next step: single token
+            step += 1
 
             # Check for EOS
             if (next_token == eos_token_id).all():
                 break
 
         return generated
+
+    def _clone_inference_states(self, past_states: list, device: torch.device) -> list:
+        """Deep clone inference states for beam search.
+
+        Mamba layers share a single InferenceParams object with key_value_memory_dict.
+        SA layers have (K, V) tuple caches.
+        """
+        from mamba_ssm.utils.generation import InferenceParams
+
+        cloned = []
+        inference_params_cloned = None
+
+        for state in past_states:
+            if state is None:
+                cloned.append(None)
+            elif hasattr(state, 'seqlen_offset'):
+                # InferenceParams - clone only once (shared across Mamba layers)
+                if inference_params_cloned is None:
+                    inference_params_cloned = InferenceParams(
+                        max_seqlen=state.max_seqlen,
+                        max_batch_size=state.max_batch_size,
+                        seqlen_offset=state.seqlen_offset,
+                    )
+                    # Deep copy key_value_memory_dict tensors
+                    for k, v in state.key_value_memory_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            inference_params_cloned.key_value_memory_dict[k] = v.clone()
+                        elif isinstance(v, tuple):
+                            inference_params_cloned.key_value_memory_dict[k] = tuple(
+                                t.clone() for t in v
+                            )
+                cloned.append(inference_params_cloned)
+            elif isinstance(state, tuple) and len(state) == 2:
+                # SA KV-cache: (K, V)
+                cloned.append((state[0].clone(), state[1].clone()))
+            else:
+                cloned.append(state)
+
+        return cloned
+
+    def _expand_states_for_beams(
+        self, past_states: list, num_beams: int, device: torch.device
+    ) -> list:
+        """Expand states batch dimension for beam search: B -> B * num_beams."""
+        from mamba_ssm.utils.generation import InferenceParams
+
+        expanded = []
+        inference_params_expanded = None
+
+        for state in past_states:
+            if state is None:
+                expanded.append(None)
+            elif hasattr(state, 'seqlen_offset'):
+                # InferenceParams - expand only once
+                if inference_params_expanded is None:
+                    inference_params_expanded = InferenceParams(
+                        max_seqlen=state.max_seqlen,
+                        max_batch_size=state.max_batch_size * num_beams,
+                        seqlen_offset=state.seqlen_offset,
+                    )
+                    # Expand key_value_memory_dict tensors
+                    for k, v in state.key_value_memory_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            # [B, ...] -> [B * num_beams, ...]
+                            inference_params_expanded.key_value_memory_dict[k] = (
+                                v.repeat_interleave(num_beams, dim=0)
+                            )
+                        elif isinstance(v, tuple):
+                            inference_params_expanded.key_value_memory_dict[k] = tuple(
+                                t.repeat_interleave(num_beams, dim=0) for t in v
+                            )
+                expanded.append(inference_params_expanded)
+            elif isinstance(state, tuple) and len(state) == 2:
+                # SA KV-cache: (K, V) [B, H, S, D] -> [B * num_beams, H, S, D]
+                expanded.append((
+                    state[0].repeat_interleave(num_beams, dim=0),
+                    state[1].repeat_interleave(num_beams, dim=0),
+                ))
+            else:
+                expanded.append(state)
+
+        return expanded
+
+    def _reorder_states_for_beams(
+        self, past_states: list, beam_idx: torch.Tensor
+    ) -> list:
+        """Reorder states according to beam selection indices.
+
+        Args:
+            past_states: List of states [B * num_beams, ...]
+            beam_idx: Selected beam indices [B * num_beams] (absolute indices)
+        """
+        reordered = []
+        inference_params_reordered = None
+
+        for state in past_states:
+            if state is None:
+                reordered.append(None)
+            elif hasattr(state, 'seqlen_offset'):
+                # InferenceParams - reorder only once
+                if inference_params_reordered is None:
+                    inference_params_reordered = state  # reuse same object
+                    # Reorder key_value_memory_dict tensors
+                    for k, v in state.key_value_memory_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            state.key_value_memory_dict[k] = v[beam_idx]
+                        elif isinstance(v, tuple):
+                            state.key_value_memory_dict[k] = tuple(
+                                t[beam_idx] for t in v
+                            )
+                reordered.append(inference_params_reordered)
+            elif isinstance(state, tuple) and len(state) == 2:
+                # SA KV-cache: (K, V)
+                reordered.append((state[0][beam_idx], state[1][beam_idx]))
+            else:
+                reordered.append(state)
+
+        return reordered
+
+    @torch.no_grad()
+    def beam_search_generate(
+        self,
+        mel: torch.Tensor,
+        max_length: int = 4096,
+        num_beams: int = 4,
+        length_penalty: float = 1.0,
+        sos_token_id: int = 1,
+        eos_token_id: int = 2,
+        pad_token_id: int = 0,
+    ) -> torch.Tensor:
+        """Generate token sequence using beam search.
+
+        Properly handles Mamba states by maintaining separate state copies for each beam.
+
+        Args:
+            mel: Log-mel spectrogram [B, 1, 128, T]
+            max_length: Maximum sequence length
+            num_beams: Number of beams
+            length_penalty: Exponential penalty for length (>1 = longer, <1 = shorter)
+            sos_token_id: Start token ID
+            eos_token_id: End token ID
+            pad_token_id: Padding token ID
+
+        Returns:
+            generated: Best beam sequences [B, L]
+        """
+        B = mel.shape[0]
+        device = mel.device
+        # Encode once
+        memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
+
+        # Pre-compute cross-attention value projections before beam expansion
+        value_cache = self.prepare_value_cache(memory, spatial_shapes, level_start_index)
+
+        # Expand encoder outputs for beams: B -> B * num_beams
+        memory = memory.repeat_interleave(num_beams, dim=0)
+        valid_ratios = valid_ratios.repeat_interleave(num_beams, dim=0)
+        # spatial_shapes and level_start_index are shared (no batch dim)
+        # Expand value_cache for beams: [B*H, ...] -> [(B*num_beams)*H, ...]
+        H = self.decoder.layers[0].n_heads
+        expanded_cache = []
+        for layer_cache in value_cache:
+            expanded_layer = []
+            for v in layer_cache:
+                # v: [B*H, D_head, H_l, W_l] -> [B, H, ...] -> [B*num_beams, H, ...] -> [(B*num_beams)*H, ...]
+                shape = v.shape  # [B*H, D_head, H_l, W_l]
+                v = v.view(B, H, *shape[1:])  # [B, H, D_head, H_l, W_l]
+                v = v.repeat_interleave(num_beams, dim=0)  # [B*num_beams, H, ...]
+                v = v.view(B * num_beams * H, *shape[1:])  # [(B*num_beams)*H, ...]
+                expanded_layer.append(v)
+            expanded_cache.append(expanded_layer)
+        value_cache = expanded_cache
+
+        # Initialize inference states for expanded batch (B * num_beams)
+        past_states = self._init_inference_states(B * num_beams, max_length, device)
+
+        # Initialize beams
+        # beam_scores: [B, num_beams] log probabilities
+        beam_scores = torch.zeros(B, num_beams, device=device)
+        beam_scores[:, 1:] = -1e9  # Only first beam active initially
+
+        # generated: [B * num_beams, seq_len]
+        generated = torch.full(
+            (B * num_beams, 1), sos_token_id, dtype=torch.long, device=device
+        )
+        input_ids = generated  # [B * num_beams, 1]
+
+        # Track which beams are done
+        done = torch.zeros(B, num_beams, dtype=torch.bool, device=device)
+
+        # Store finished beams: list of (score, sequence) per batch
+        finished_beams = [[] for _ in range(B)]
+
+        for step in range(max_length - 1):
+            # Decode with cache
+            logits, past_states = self.decode(
+                input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
+                past_states=past_states, use_cache=True,
+                value_cache=value_cache,
+            )
+
+            # Get vocab logits: [B * num_beams, vocab_size]
+            next_logits = logits[:, -1, :]
+            vocab_size = next_logits.shape[-1]
+
+            # Log probabilities
+            log_probs = F.log_softmax(next_logits, dim=-1)  # [B * num_beams, V]
+
+            # Reshape for beam operations: [B, num_beams, V]
+            log_probs = log_probs.view(B, num_beams, vocab_size)
+
+            # Add previous beam scores: [B, num_beams, V]
+            next_scores = beam_scores.unsqueeze(-1) + log_probs
+
+            # For done beams, only allow pad token
+            for b in range(B):
+                for beam in range(num_beams):
+                    if done[b, beam]:
+                        next_scores[b, beam, :] = -1e9
+                        next_scores[b, beam, pad_token_id] = beam_scores[b, beam]
+
+            # Flatten for top-k selection: [B, num_beams * V]
+            next_scores = next_scores.view(B, -1)
+
+            # Select top num_beams candidates per batch
+            top_scores, top_indices = next_scores.topk(num_beams, dim=-1)  # [B, num_beams]
+
+            # Convert flat indices to (beam_idx, token_idx)
+            beam_indices = top_indices // vocab_size  # [B, num_beams]
+            token_indices = top_indices % vocab_size  # [B, num_beams]
+
+            # Compute absolute beam indices for state reordering
+            # [B, num_beams] -> [B * num_beams]
+            batch_offsets = torch.arange(B, device=device).unsqueeze(1) * num_beams
+            abs_beam_indices = (batch_offsets + beam_indices).view(-1)
+
+            # Reorder states and done mask according to selected beams
+            past_states = self._reorder_states_for_beams(past_states, abs_beam_indices)
+            done = torch.gather(done, dim=1, index=beam_indices)
+
+            # Update generated sequences
+            # Gather from previous sequences using beam indices
+            prev_sequences = generated.view(B, num_beams, -1)  # [B, num_beams, seq_len]
+            new_sequences = torch.gather(
+                prev_sequences,
+                dim=1,
+                index=beam_indices.unsqueeze(-1).expand(-1, -1, prev_sequences.size(-1)),
+            )  # [B, num_beams, seq_len]
+
+            # Append new tokens
+            new_tokens = token_indices.unsqueeze(-1)  # [B, num_beams, 1]
+            generated = torch.cat([new_sequences, new_tokens], dim=-1)  # [B, num_beams, seq_len+1]
+            generated = generated.view(B * num_beams, -1)  # [B * num_beams, seq_len+1]
+
+            # Update beam scores
+            beam_scores = top_scores  # [B, num_beams]
+
+            # Check for EOS
+            eos_mask = token_indices == eos_token_id  # [B, num_beams]
+
+            # Save finished beams and mark as done
+            for b in range(B):
+                for beam in range(num_beams):
+                    if eos_mask[b, beam] and not done[b, beam]:
+                        # Apply length penalty
+                        seq_len = generated.shape[1]
+                        final_score = beam_scores[b, beam] / (seq_len ** length_penalty)
+                        seq = generated[b * num_beams + beam].clone()
+                        finished_beams[b].append((final_score.item(), seq))
+                        done[b, beam] = True
+
+            # Update input for next step
+            input_ids = token_indices.view(B * num_beams, 1)
+
+            # Early stopping if all beams are done
+            if done.all():
+                break
+
+        # Select best beam for each batch
+        results = []
+        for b in range(B):
+            if finished_beams[b]:
+                # Sort by score and take best
+                best_score, best_seq = max(finished_beams[b], key=lambda x: x[0])
+                results.append(best_seq)
+            else:
+                # No beam finished, take highest scoring active beam
+                best_beam = beam_scores[b].argmax().item()
+                results.append(generated[b * num_beams + best_beam])
+
+        # Pad to same length
+        max_len = max(seq.size(0) for seq in results)
+        padded = torch.full((B, max_len), pad_token_id, dtype=torch.long, device=device)
+        for b, seq in enumerate(results):
+            padded[b, :seq.size(0)] = seq
+
+        return padded
 
     def get_num_params(self, trainable_only: bool = True) -> int:
         """Count model parameters."""

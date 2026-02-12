@@ -70,8 +70,6 @@ class ClefConfig:
     bridge_layers: int = 2
 
     # === Decoder ===
-    ca_gate_type: str = 'predictive_coding'
-    pred_loss_weight: float = 0.1     # Predictor MSE loss weight (predictive_coding mode only)
     decoder_layers: int = 6
     decoder_layer_types: List[str] = field(
         default_factory=lambda: ['mamba', 'mamba', 'sa', 'mamba', 'mamba', 'sa']
@@ -81,6 +79,7 @@ class ClefConfig:
     mamba_expand: int = 2
     max_seq_len: int = 4096
     vocab_size: int = 512   # Will be set from tokenizer
+    use_rope: bool = True   # RoPE for SA layers (no max_seq_len limit, saves memory)
 
     # === Audio Transform ===
     sample_rate: int = 16000
@@ -97,6 +96,7 @@ class ClefConfig:
         """Validate configuration."""
         # Derive decoder_layers from decoder_layer_types for backward compat
         self.decoder_layers = len(self.decoder_layer_types)
+
         assert self.n_heads > 0, "n_heads must be positive"
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
         n_swin_used = len(self.swin_dims) - self.swin_start_stage

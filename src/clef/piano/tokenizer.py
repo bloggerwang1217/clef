@@ -699,6 +699,16 @@ class KernTokenizer:
             ids.append(self.vocab[t])
         return ids
 
+    def is_duration_id(self, token_id: int) -> bool:
+        """Check if a token ID is a duration token."""
+        token = self.id_to_token.get(token_id, "")
+        return token in self._valid_durations
+
+    def is_pitch_id(self, token_id: int) -> bool:
+        """Check if a token ID is a pitch token (including rest 'r')."""
+        token = self.id_to_token.get(token_id, "")
+        return token in self._valid_pitches
+
     def decode(self, token_ids: List[int], skip_special: bool = True) -> str:
         """Decode token IDs back to kern format.
 

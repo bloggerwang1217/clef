@@ -52,7 +52,7 @@ MAX_EPOCHS="${MAX_EPOCHS:-$(read_config 'training.max_epochs' '50')}"
 VALIDATE_EVERY="${VALIDATE_EVERY:-500}"
 EARLY_STOPPING="${EARLY_STOPPING:-5}"
 MANIFEST_DIR="${MANIFEST_DIR:-data/experiments/clef_piano_base}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpoints/clef_piano_base_mamba}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-checkpoints/clef_piano_base}"
 RESUME="${RESUME:-}"
 
 # Wandb (read from config if not set)
@@ -119,7 +119,7 @@ CMD="$CMD --gradient-clip $GRADIENT_CLIP"
 CMD="$CMD --max-epochs $MAX_EPOCHS"
 CMD="$CMD --validate-every-n-steps $VALIDATE_EVERY"
 CMD="$CMD --early-stopping-patience $EARLY_STOPPING"
-CMD="$CMD --num-workers 4"
+CMD="$CMD --num-workers 0"
 
 if [ "$WANDB" = "true" ]; then
     CMD="$CMD --wandb"
@@ -144,4 +144,5 @@ echo "CUDA_VISIBLE_DEVICES=$GPU $CMD"
 echo ""
 
 cd "$(dirname "$0")/../../.."
-CUDA_VISIBLE_DEVICES=$GPU $CMD
+# Disable Python bytecode cache to avoid stale .pyc issues
+PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES=$GPU $CMD

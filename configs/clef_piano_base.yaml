@@ -1,19 +1,19 @@
 # clef-piano-base Training Configuration
 # =======================================
 #
-# ISMIR 2026 target: Swin V2 + ClefAttention for piano transcription
+# ISMIR 2026 target: Serial encoder (Octopus → Flow → Swin pitch space)
 #
-# Fair comparison with Zeng et al. (2024):
-# - Uses Zeng's vocabulary (extended with grace notes)
-# - Same time resolution (100 fps)
-# - Same frequency range (A0 = 27.5 Hz)
+# Architecture: bio-inspired serial pipeline
+# - Octopus2D = CN octopus cells (cross-frequency onset detection)
+# - Flow = IC harmonic integration (mel → pitch space)
+# - Swin = A1 cortex (multi-scale 2D on pitch space)
 
 # =============================================================================
 # Seeds
 # =============================================================================
 seed:
-  data_augmentation: 0    # Used during data preprocessing/augmentation
-  training: 1234          # Used during model training
+  data_augmentation: 0
+  training: 1234
 
 # =============================================================================
 # Model Architecture
@@ -26,38 +26,41 @@ model:
   swin_dims: [96, 192, 384, 768]
   freeze_encoder: true
 
-  # Swin stage pooling (remove overlapping-window redundancy)
-  # Swin0: RF~320ms, grid 40ms -> pool 8x (Nyquist, chord is discrete)
-  # Swin1: RF~640ms, grid 80ms -> pool 4x (50% overlap, melody needs continuity)
-  swin_pool_strides: [8, 4, 1, 1]
+  # Serial encoder: Swin eats Flow output (pitch space)
+  swin_on_pitch_space: true
+  swin_pool_strides: [1, 1, 1, 1]  # Flow already reduced T, no extra pool needed
 
-  # HarmonizingFlow (pitch space transform)
+  # Octopus2D (CN octopus cells: cross-frequency onset detection)
+  use_octopus: true
+  octopus_freq_kernel: 31      # ~4 harmonics span
+  octopus_time_kernel: 3       # onset transient (30ms)
+  octopus_channels: 32         # different onset pattern detectors
+  octopus_time_pool_stride: 2  # T → T/2
+  octopus_freq_pool_stride: 4  # 128 mels → 32 freq bins
+
+  # HarmonizingFlow (IC harmonic integration: mel → pitch space)
   use_flow: true
   n_harmonics: 6
-  flow_pool_stride: 4   # Temporal pooling: T -> T/4 (matches Swin S0, prevents grad explosion)
-  use_temporal_cnn: true  # Causal 1D CNN for onset/duration detection
-  temporal_pool_stride: 4
+  flow_pool_stride: 4          # T → T/4
+  use_temporal_cnn: false      # Serial mode: no CNN, Octopus provides onset
 
-  # Deformable Attention (CLEF: Content-aware Learned-prior Event Focusing)
+  # Deformable Attention (CLEF)
   d_model: 512
   n_heads: 8
-  n_levels: 6  # 1 (Flow) + 1 (CNN) + 4 (Swin stages)
+  n_levels: 6                  # Octopus + Flow + S0-S3
   ff_dim: 2048
   dropout: 0.1
 
-  # Square sampling + Content-Dependent Prior (key design)
-  n_points_freq: 2          # Frequency direction: local detail
-  n_points_time: 2          # Time direction: local detail
-  freq_offset_scale: 1.0    # ±1 pixel in feature map space (was 0.15, caused 2x2 degeneration)
-  time_offset_scale: 1.0    # ±1 pixel in feature map space (was 0.15, caused 2x2 degeneration)
+  n_points_freq: 2
+  n_points_time: 2
+  freq_offset_scale: 1.0
+  time_offset_scale: 1.0
 
-  # Content-Dependent Reference Points (key innovation)
-  use_time_prior: false     # Fixed linspace(0,1,S); learned prior doesn't work because pos_embed std=0.02 is too small
-  use_freq_prior: true      # freq_prior(tgt) -> freq region (stream tracking)
-  n_freq_groups: 4          # Per-head freq_prior (4 groups x 2 heads = 8 heads)
-  refine_range: 0.1         # +/-10% refinement
+  use_time_prior: true
+  use_freq_prior: true
+  n_freq_groups: 4
+  refine_range: 0.1
 
-  # Bridge
   bridge_layers: 2
 
   # Decoder (Jamba-style: 4 Mamba + 2 SA)
@@ -65,45 +68,37 @@ model:
   mamba_d_state: 128
   mamba_d_conv: 4
   mamba_expand: 2
-  ca_gate_type: "predictive_coding"
-  pred_loss_weight: 0.1              # Predictor MSE loss weight (PC mode)
   decoder_layers: 6
   max_seq_len: 16384
-  vocab_size: 512           # ~220 factorized tokens + padding
+  vocab_size: 272
 
-  # Training
   label_smoothing: 0.0
 
 # =============================================================================
 # Data
 # =============================================================================
 data:
-  # Datasets
   datasets:
     - musesyn
     - humsyn
 
-  # Vocabulary: Zeng's LabelsMultiple + grace notes
   vocabulary: "zeng_extended"
 
-  # Audio features (matches Zeng's time resolution for fair comparison)
   audio:
     sample_rate: 16000
-    feature: "log_mel"      # Zeng uses VQT, but Mel enables Swin V2 pretrained weights
-    n_mels: 128             # Zeng: 480 bins (60 x 8 octaves)
+    feature: "log_mel"
+    n_mels: 128
     n_fft: 2048
-    hop_length: 160         # 100 fps (same as Zeng)
-    f_min: 27.5             # A0 = 27.5 Hz (piano lowest, same as Zeng)
-    f_max: 7040.0           # 8 octaves from A0
+    hop_length: 160             # 100 fps
+    f_min: 27.5                 # A0
+    f_max: 7040.0               # 8 octaves
 
-  # Chunking for long pieces
   chunking:
     enabled: true
-    chunk_frames: 24000     # 4 min @ 100 fps
-    overlap_frames: 12000   # 2 min overlap
-    min_chunk_ratio: 0.5    # Last chunk at least 2 min
+    chunk_frames: 24000         # 4 min
+    overlap_frames: 12000       # 2 min overlap
+    min_chunk_ratio: 0.5
 
-  # Augmentation (matching Zeng)
   augmentation:
     transpose:
       enabled: true
@@ -125,14 +120,14 @@ training:
     num_gpus: 2
 
   precision: "bf16"
-  batch_size: 1             # per GPU
+  batch_size: 1
   gradient_accumulation_steps: 2
-  effective_batch_size: 4   # 2 GPU x 1 batch x 2 accum
+  effective_batch_size: 4
 
-  learning_rate: 2.0e-5      # Base LR; offset params use 0.1x (2e-6); gamma uses constant 2e-4
+  learning_rate: 2.0e-5
   weight_decay: 0.01
   max_epochs: 50
-  warmup_steps: 5000        # ~5.3 epochs warmup (944 steps/epoch)
+  warmup_steps: 5000
   gradient_clip: 1.0
 
   save_every_n_epochs: 10
@@ -143,7 +138,7 @@ training:
   wandb:
     enabled: true
     project: "clef-piano-base"
-    tags: ["piano", "a2s", "swin", "clef-attention", "multi-head", "rtx3090", "harmonic-flow", "predictive-coding"]
+    tags: ["piano", "a2s", "serial-encoder", "rtx3090"]
 
 # =============================================================================
 # Paths

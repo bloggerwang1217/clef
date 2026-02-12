@@ -342,7 +342,10 @@ class FluxAttention(nn.Module):
         # Convert sampling_locations to grid_sample format [-1, 1]
         sampling_grids = 2 * sampling_locations - 1
 
-        sampling_value_list = []
+        # Accumulate weighted sum directly (no stack, saves 768 MB peak memory)
+        # Old: stack 6 levels -> [B, H, D_head, N_q, K, L] -> weighted sum
+        # New: for each level, compute weighted contribution and accumulate
+        output = torch.zeros(B, N_q, H, D_head, device=value.device, dtype=value.dtype)
 
         for lid in range(L):
             H_l, W_l = spatial_shapes[lid].tolist()
@@ -369,20 +372,19 @@ class FluxAttention(nn.Module):
                 align_corners=False
             )  # [B*H, D_head, N_q, K]
 
-            sampled = sampled.view(B, H, D_head, N_q, K)
-            sampling_value_list.append(sampled)
+            sampled = sampled.view(B, H, D_head, N_q, K)  # [B, H, D_head, N_q, K]
 
-        # Stack levels: [B, H, D_head, N_q, K, L]
-        sampling_values = torch.stack(sampling_value_list, dim=-1)
+            # Get this level's attention weights: [B, N_q, H, K]
+            attn_l = attention_weights[:, :, :, lid, :]  # [B, N_q, H, K]
 
-        # Reorder for attention: [B, N_q, H, D_head, L, K]
-        sampling_values = sampling_values.permute(0, 3, 1, 2, 5, 4)
+            # Weighted sum over K points for this level
+            # sampled: [B, H, D_head, N_q, K] -> permute to [B, N_q, H, D_head, K]
+            # attn_l: [B, N_q, H, K] -> [B, N_q, H, 1, K]
+            sampled = sampled.permute(0, 3, 1, 2, 4)  # [B, N_q, H, D_head, K]
+            attn_l = attn_l.unsqueeze(3)  # [B, N_q, H, 1, K]
 
-        # attention_weights: [B, N_q, H, L, K] -> [B, N_q, H, 1, L, K]
-        attn_weights = attention_weights.unsqueeze(3)
-
-        # Weighted sum: [B, N_q, H, D_head]
-        output = (sampling_values * attn_weights).sum(dim=[-1, -2])
+            # Accumulate: [B, N_q, H, D_head]
+            output = output + (sampled * attn_l).sum(dim=-1)
 
         # Reshape: [B, N_q, D]
         output = output.reshape(B, N_q, -1)
@@ -398,6 +400,7 @@ class FluxAttention(nn.Module):
         """Deformable attention using pre-computed value cache.
 
         Skips value_proj and per-level reshape (already done in compute_value_cache).
+        Uses accumulation instead of stack to save memory.
         """
         B, N_q, H, L, K, _ = sampling_locations.shape
         D_head = level_values[0].shape[1]
@@ -405,7 +408,8 @@ class FluxAttention(nn.Module):
         # Convert to grid_sample format [-1, 1]
         sampling_grids = 2 * sampling_locations - 1
 
-        sampling_value_list = []
+        # Accumulate weighted sum directly (no stack, saves memory)
+        output = torch.zeros(B, N_q, H, D_head, device=sampling_locations.device, dtype=level_values[0].dtype)
 
         for lid in range(L):
             value_l = level_values[lid]  # [B*H, D_head, H_l, W_l]
@@ -419,14 +423,14 @@ class FluxAttention(nn.Module):
                 mode='bilinear', padding_mode='zeros', align_corners=False,
             )  # [B*H, D_head, N_q, K]
 
-            sampled = sampled.view(B, H, D_head, N_q, K)
-            sampling_value_list.append(sampled)
+            sampled = sampled.view(B, H, D_head, N_q, K)  # [B, H, D_head, N_q, K]
 
-        sampling_values = torch.stack(sampling_value_list, dim=-1)
-        sampling_values = sampling_values.permute(0, 3, 1, 2, 5, 4)
+            # Get this level's attention weights and accumulate
+            attn_l = attention_weights[:, :, :, lid, :]  # [B, N_q, H, K]
+            sampled = sampled.permute(0, 3, 1, 2, 4)  # [B, N_q, H, D_head, K]
+            attn_l = attn_l.unsqueeze(3)  # [B, N_q, H, 1, K]
+            output = output + (sampled * attn_l).sum(dim=-1)
 
-        attn_weights = attention_weights.unsqueeze(3)
-        output = (sampling_values * attn_weights).sum(dim=[-1, -2])
         output = output.reshape(B, N_q, -1)
 
         return output

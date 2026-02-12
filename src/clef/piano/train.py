@@ -171,9 +171,10 @@ class Trainer:
             {'params': other_params, 'lr': base_lr},
         ], weight_decay=weight_decay)
 
-        # Learning rate scheduler (main optimizer only)
+        # Learning rate scheduler
         total_steps = len(train_loader) * (config.max_epochs if hasattr(config, 'max_epochs') else 50)
         total_steps = total_steps // gradient_accumulation_steps
+        self.total_steps = total_steps
         warmup_steps = config.warmup_steps if hasattr(config, 'warmup_steps') else 1000
 
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -330,6 +331,7 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
         accumulated_loss = 0.0
+        micro_batch_count = 0  # count successful micro-batches (not raw batch_idx)
 
         pbar = tqdm(
             self.train_loader,
@@ -350,9 +352,11 @@ class Trainer:
             labels = batch['labels'].to(self.device)
             mel_valid_ratios = batch['mel_valid_ratios'].to(self.device)
 
+            micro_batch_count += 1
+
             # Skip DDP all-reduce on non-update micro-batches to save
             # communication overhead during gradient accumulation.
-            is_update_step = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+            is_update_step = micro_batch_count % self.gradient_accumulation_steps == 0
             maybe_no_sync = (
                 self.model.no_sync()
                 if isinstance(self.model, DDP) and not is_update_step
@@ -380,7 +384,7 @@ class Trainer:
             accumulated_loss += loss.item() * self.gradient_accumulation_steps
 
             # Update weights every gradient_accumulation_steps
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+            if is_update_step:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
 
@@ -392,12 +396,17 @@ class Trainer:
                 grad_norm = torch.nn.utils.clip_grad_norm_(base_params, self.gradient_clip)
 
                 if self.scaler is not None:
+                    old_scale = self.scaler.get_scale()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    # Only step scheduler if optimizer actually updated
+                    # (scaler skips on inf/NaN gradients)
+                    if self.scaler.get_scale() >= old_scale:
+                        self.scheduler.step()
                 else:
                     self.optimizer.step()
+                    self.scheduler.step()
 
-                self.scheduler.step()
                 self.optimizer.zero_grad()
 
                 # Update metrics (average over accumulation steps)
@@ -408,9 +417,6 @@ class Trainer:
 
                 # Log to wandb
                 if self.use_wandb:
-                    model_unwrapped = self.model.module if isinstance(self.model, DDP) else self.model
-                    layers = model_unwrapped.decoder.layers
-
                     log_dict = {
                         'train/loss': avg_accum_loss,
                         'train/grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
@@ -420,14 +426,6 @@ class Trainer:
                         'train/epoch': self.epoch,
                         'system/gpu_memory_gb': torch.cuda.max_memory_allocated(self.device) / 1024**3,
                     }
-
-                    # Predictive coding gate: log gain and pred_loss
-                    gain_mean = sum(
-                        F.softplus(l.ca_gain.bias.data).item() for l in layers
-                    ) / len(layers)
-                    log_dict['train/pc_gain_mean'] = gain_mean
-                    if model_unwrapped._last_pred_loss is not None:
-                        log_dict['train/pred_loss'] = model_unwrapped._last_pred_loss.item()
 
                     # Per-token-type loss breakdown (last micro-batch only)
                     breakdown = self._compute_loss_breakdown(logits.detach(), labels)
@@ -561,7 +559,7 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-        self.epoch = checkpoint['epoch']
+        self.epoch = checkpoint['epoch'] + 1  # resume from NEXT epoch
         self.global_step = checkpoint['global_step']
         self.best_valid_loss = checkpoint['best_valid_loss']
         self.epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
@@ -700,6 +698,26 @@ def sanity_check(model: ClefPianoBase, train_loader: DataLoader, device: torch.d
 
 
 def main():
+    # Handle Ctrl+C gracefully - finish wandb and kill child processes
+    import signal
+    import os
+
+    def cleanup_and_exit(signum, frame):
+        print("\n[INFO] Caught signal, cleaning up...", flush=True)
+        # Finish wandb run (so it doesn't stay "running" on server)
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.finish(exit_code=1)
+        except Exception:
+            pass
+        # Kill all processes in our process group
+        os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
+
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, cleanup_and_exit)
+    signal.signal(signal.SIGTERM, cleanup_and_exit)
+
     parser = argparse.ArgumentParser(description='Train clef-piano-base')
     parser.add_argument('--config', type=str, default='configs/clef_piano_base.yaml',
                         help='Path to config file')

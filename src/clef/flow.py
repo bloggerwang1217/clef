@@ -214,9 +214,11 @@ class Octopus2D(nn.Module):
         time_kernel: int = 3,
         channels: int = 32,
         time_pool_stride: int = 2,
+        freq_pool_stride: int = 4,  # 128 mels / 4 = 32 freq bins
     ):
         super().__init__()
         self.time_pool_stride = time_pool_stride
+        self.freq_pool_stride = freq_pool_stride
 
         # Cross-frequency onset detector
         # Odd kernel sizes for symmetric padding (same output shape)
@@ -242,7 +244,9 @@ class Octopus2D(nn.Module):
 
         Returns:
             enhanced_mel: [B, 1, 128, T] mel + onset residual (for Flow)
-            onset_level: [B, T//pool_stride, channels] onset features (for Level 0)
+            onset_level: [B, H*W, C] onset features with 2D spatial info (for Level 0)
+                         H = 128 // freq_pool_stride (default 32)
+                         W = T // time_pool_stride
         """
         # Cross-frequency onset detection
         onset = F.gelu(self.conv(mel))  # [B, C, 128, T]
@@ -251,14 +255,17 @@ class Octopus2D(nn.Module):
         residual = self.proj_back(onset)  # [B, 1, 128, T]
         enhanced = mel + self.scale * residual
 
-        # Output B: onset timing for FluxAttention Level 0
-        # Global average over freq (onset TYPE encoded in C channels, not spatial position)
-        onset_1d = onset.mean(dim=2)  # [B, C, T]
-        if self.time_pool_stride > 1:
-            onset_1d = F.avg_pool1d(
-                onset_1d, self.time_pool_stride, self.time_pool_stride
-            )  # [B, C, T//stride]
-        onset_level = onset_1d.transpose(1, 2)  # [B, T//stride, C]
+        # Output B: onset features with 2D spatial structure for FluxAttention Level 0
+        # Preserve frequency axis (onset SHAPE across freq bands = timbre/pitch cue)
+        # Pool to [B, C, H, W] where H=32 (freq), W=T//stride (time)
+        onset_pooled = F.avg_pool2d(
+            onset,
+            kernel_size=(self.freq_pool_stride, self.time_pool_stride),
+            stride=(self.freq_pool_stride, self.time_pool_stride),
+        )  # [B, C, H, W]
+        B, C, H, W = onset_pooled.shape
+        # Flatten spatial dims: [B, C, H, W] -> [B, H*W, C]
+        onset_level = onset_pooled.permute(0, 2, 3, 1).reshape(B, H * W, C)
 
         return enhanced, onset_level
 

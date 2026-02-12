@@ -97,9 +97,6 @@ class ClefPianoConfig(ClefConfig):
             freq_offset_scale=model_cfg.get("freq_offset_scale", defaults.freq_offset_scale),
             time_offset_scale=model_cfg.get("time_offset_scale", defaults.time_offset_scale),
 
-            # Gating
-            ca_gate_type=model_cfg.get("ca_gate_type", defaults.ca_gate_type),
-            pred_loss_weight=model_cfg.get("pred_loss_weight", defaults.pred_loss_weight),
             # Priors
             use_time_prior=model_cfg.get("use_time_prior", defaults.use_time_prior),
             use_freq_prior=model_cfg.get("use_freq_prior", defaults.use_freq_prior),
@@ -115,6 +112,7 @@ class ClefPianoConfig(ClefConfig):
             mamba_expand=model_cfg.get("mamba_expand", defaults.mamba_expand),
             max_seq_len=model_cfg.get("max_seq_len", defaults.max_seq_len),
             vocab_size=model_cfg.get("vocab_size", defaults.vocab_size),
+            use_rope=model_cfg.get("use_rope", defaults.use_rope),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),

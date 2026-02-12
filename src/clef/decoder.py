@@ -10,16 +10,21 @@ Layer pattern (default): [Mamba, Mamba, SA, Mamba, Mamba, SA]
 
 Shared across all layers:
 - FluxAttention cross-attention with content-dependent reference points
-- Predictive coding gate (surprise-driven information flow)
 - FFN
 
 Key innovation: Content-Dependent Reference Points
-- time_prior: Predict "which time point to look at" from positional embedding
-- freq_prior: Predict "high or low frequency region" from hidden state
-- This corresponds to stream tracking in human auditory perception (Bregman, 1990)
+- time_prior: sinusoidal PE -> Linear -> sigmoid.
+  Provides absolute time position in [0, 1] for Deformable Attention.
+  Sinusoidal PE gives stable position signal; Linear learns average
+  position-to-time mapping. reference_refine handles per-sample variation.
+- freq_prior: Predict "high or low frequency region" from hidden state.
+  Pitch -> frequency is a universal constant -> learns well.
+- Corresponds to stream tracking in human auditory perception (Bregman, 1990)
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+import math
 
 import torch
 import torch.nn as nn
@@ -28,14 +33,109 @@ import torch.nn.functional as F
 from .attention import FluxAttention
 
 
+class RotaryPositionalEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE).
+
+    RoPE encodes position information by rotating Q/K vectors in 2D subspaces.
+    Benefits over learned absolute position embeddings:
+    - No max_seq_len limit (position is computed on-the-fly)
+    - Better length generalization
+    - O(1) memory (no stored embedding table)
+
+    Reference: Su et al., "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+    """
+
+    def __init__(self, head_dim: int, base: float = 10000.0):
+        """
+        Args:
+            head_dim: Dimension per attention head (must be even)
+            base: Base for geometric frequency spacing (default 10000 from paper)
+        """
+        super().__init__()
+        assert head_dim % 2 == 0, "head_dim must be even for RoPE"
+        self.head_dim = head_dim
+        self.base = base
+
+        # Precompute inverse frequencies: 1 / (base^(2i/d)) for i in [0, d/2)
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+        # Cache for cos/sin tables (expanded on demand)
+        self._cos_cache: Optional[torch.Tensor] = None
+        self._sin_cache: Optional[torch.Tensor] = None
+        self._cache_seq_len = 0
+
+    def _update_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        """Expand cos/sin cache if needed."""
+        # Check seq_len, device, and dtype to avoid stale cache issues in DDP
+        if (seq_len <= self._cache_seq_len
+            and self._cos_cache is not None
+            and self._cos_cache.device == device
+            and self._cos_cache.dtype == dtype):
+            return
+
+        # Compute position indices
+        t = torch.arange(seq_len, device=device, dtype=dtype)
+        # Outer product: [seq_len] x [head_dim/2] -> [seq_len, head_dim/2]
+        freqs = torch.outer(t, self.inv_freq.to(device=device, dtype=dtype))
+        # Duplicate for (cos, sin) pairs: [seq_len, head_dim]
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self._cos_cache = emb.cos()
+        self._sin_cache = emb.sin()
+        self._cache_seq_len = seq_len
+
+    def forward(
+        self,
+        q: torch.Tensor,  # [B, H, S, D_head]
+        k: torch.Tensor,  # [B, H, S, D_head]
+        position_offset: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary position embedding to Q and K.
+
+        Args:
+            q: Query tensor [B, H, S, D_head]
+            k: Key tensor [B, H, S, D_head]
+            position_offset: Starting position (for incremental decoding with KV-cache)
+
+        Returns:
+            q_rotated: Q with position encoding [B, H, S, D_head]
+            k_rotated: K with position encoding [B, H, S, D_head]
+        """
+        B, H, S, D = q.shape
+        total_len = position_offset + S
+
+        # Expand cache if needed
+        self._update_cache(total_len, q.device, q.dtype)
+
+        # Slice cache for current positions
+        cos = self._cos_cache[position_offset:total_len]  # [S, D]
+        sin = self._sin_cache[position_offset:total_len]  # [S, D]
+
+        # Broadcast to [1, 1, S, D] for batch and heads
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+
+        # Apply rotation: q_rot = q * cos + rotate_half(q) * sin
+        q_rotated = q * cos + self._rotate_half(q) * sin
+        k_rotated = k * cos + self._rotate_half(k) * sin
+
+        return q_rotated, k_rotated
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """Rotate half the hidden dims: [x1, x2] -> [-x2, x1]."""
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([-x2, x1], dim=-1)
+
+
 class DecoderLayerBase(nn.Module):
-    """Base decoder layer: FluxCA + PC gate + FFN + reference points.
+    """Base decoder layer: FluxCA + FFN + reference points.
 
     Subclasses implement _sequence_forward() for SA or Mamba.
 
     Structure:
     1. Sequence model (SA or Mamba) — subclass-defined
-    2. FluxAttention with content-dependent reference points + PC gate
+    2. FluxAttention with content-dependent reference points
     3. FFN
     """
 
@@ -68,7 +168,7 @@ class DecoderLayerBase(nn.Module):
         # Post-sequence-model norm
         self.norm1 = nn.LayerNorm(d_model)
 
-        # FluxAttention (Cross-attention) with predictive coding gate
+        # FluxAttention (Cross-attention)
         self.cross_attn = FluxAttention(
             d_model=d_model,
             n_levels=n_levels,
@@ -78,17 +178,7 @@ class DecoderLayerBase(nn.Module):
             freq_offset_scale=freq_offset_scale,
             time_offset_scale=time_offset_scale,
         )
-        # Predictive coding gate (Rao & Ballard 1999):
-        # Only prediction error (surprise) passes through, gain can amplify.
-        self.ca_predictor = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
-        self.ca_gain = nn.Linear(d_model, 1)
-        # Auxiliary loss storage (training only, cleared after collection)
-        self._last_prediction = None
-        self._last_ca_output = None
+
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -103,8 +193,15 @@ class DecoderLayerBase(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
 
         # Content-Dependent Reference Points
+        # Time prior: sinusoidal PE → Linear → sigmoid
+        # Sinusoidal PE provides stable position signal (not learned, like RoPE).
+        # Linear learns average position-to-time mapping across training data.
+        # reference_refine (±10%) handles per-sample variation.
+        self.use_time_prior = use_time_prior
         if use_time_prior:
-            self.time_prior = nn.Linear(d_model, 1)
+            pe_dim = 64  # small sinusoidal encoding for position
+            self.time_pe_dim = pe_dim
+            self.time_prior = nn.Linear(pe_dim, 1)
         else:
             self.time_prior = None
 
@@ -125,22 +222,19 @@ class DecoderLayerBase(nn.Module):
     def _init_reference_predictors(self):
         """Initialize reference point predictors.
 
-        Key insight: gain=0.001 causes reference points to be stuck at
-        sigmoid(0)=0.5 (feature map center). The gradient signal from the
-        language model prior is too weak to push them out. Instead:
+        time_prior: Sinusoidal PE → Linear → sigmoid.
+        Initialized so that sigmoid output ≈ linspace(0, 1, S).
+        Linear weight is zero-init, bias=0 → sigmoid(0)=0.5 as starting point.
+        The sinusoidal PE provides position signal; Linear learns the mapping.
 
-        - freq_prior: Spread bias across frequency axis so each head group
-          starts at a different register (bass/tenor/alto/soprano).
-          Weight gain=0.1 gives W@x std ~ 0.14, enough for content-dependent
-          modulation within each band while keeping sigmoid gradient healthy.
-        - reference_refine: std=0.01 (was 0.001) for visible initial offsets.
-        - time_prior: Prefer fixed linspace (use_time_prior=False) because
-          position embeddings (std=0.02) are too small to produce a 0->1 ramp
-          through a linear layer.
+        freq_prior: Spread bias across frequency axis so each head group
+        starts at a different register (bass/tenor/alto/soprano).
+
+        reference_refine: ±10% content-dependent adjustment.
         """
         if self.time_prior is not None:
             nn.init.xavier_uniform_(self.time_prior.weight, gain=0.1)
-            nn.init.constant_(self.time_prior.bias, 0.)
+            nn.init.constant_(self.time_prior.bias, 0.0)
 
         if self.freq_prior is not None:
             nn.init.xavier_uniform_(self.freq_prior.weight, gain=0.1)
@@ -197,21 +291,13 @@ class DecoderLayerBase(nn.Module):
         # 2. Content-Dependent Reference Points
         reference_points = self._compute_reference_points(tgt, tgt_pos, B, S)
 
-        # 3. FluxAttention (Cross-attention) with PC gate
+        # 3. FluxAttention (Cross-attention)
         tgt2 = self.cross_attn(
             tgt, reference_points, memory,
             spatial_shapes, level_start_index, valid_ratios,
             value_cache=value_cache,
         )
-        # Predictive coding: only surprise (prediction error) passes through
-        prediction = self.ca_predictor(tgt.detach())       # [B, S, D]
-        surprise = tgt2 - prediction.detach()               # [B, S, D]
-        gain = F.softplus(self.ca_gain(tgt.detach()))       # [B, S, 1]
-        tgt = tgt + gain * self.dropout2(surprise)
-        # Store for auxiliary MSE loss (training only)
-        if self.training:
-            self._last_prediction = prediction
-            self._last_ca_output = tgt2.detach()
+        tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
 
         # 4. FFN
@@ -222,28 +308,65 @@ class DecoderLayerBase(nn.Module):
             return tgt, new_state
         return tgt
 
+    @staticmethod
+    def _sinusoidal_pe(positions: torch.Tensor, dim: int) -> torch.Tensor:
+        """Generate sinusoidal positional encoding.
+
+        Args:
+            positions: [S] or [B, S] position indices (int or float)
+            dim: encoding dimension (must be even)
+
+        Returns:
+            pe: [..., dim] sinusoidal encoding
+        """
+        half = dim // 2
+        freq = torch.exp(
+            -torch.arange(half, device=positions.device, dtype=torch.float32)
+            * (math.log(10000.0) / half)
+        )  # [half]
+        # positions: [...] → [..., 1] * [half] → [..., half]
+        angles = positions.unsqueeze(-1).float() * freq
+        return torch.cat([angles.sin(), angles.cos()], dim=-1)  # [..., dim]
+
     def _compute_reference_points(
         self,
         tgt: torch.Tensor,      # [B, S, D]
-        tgt_pos: Optional[torch.Tensor],  # [B, S, D] or [1, S, D]
+        tgt_pos,  # [B, S, D], [1, S, D], or int (RoPE offset)
         B: int,
         S: int,
     ) -> torch.Tensor:
         """Compute content-dependent reference points (per-head).
 
+        Time coordinate: sinusoidal PE → Linear → sigmoid.
+        Each token independently predicts an absolute time position in [0, 1].
+        Sinusoidal PE provides stable position signal; Linear learns the
+        average position-to-time mapping. Train/inference identical.
+
+        For inference (step-by-step), tgt_pos is an int offset, so
+        positions = [offset, offset+1, ..., offset+S-1].
+
         Returns:
             reference_points: [B, S, H, L, 2] where 2 = (time, freq)
         """
         device = tgt.device
+        dtype = tgt.dtype
         H = self.n_heads
 
-        # Time prior: from position embedding (shared across heads)
-        if self.time_prior is not None and tgt_pos is not None:
-            time_base = self.time_prior(tgt_pos).sigmoid()
-            if time_base.shape[0] == 1 and B > 1:
-                time_base = time_base.expand(B, -1, -1)
+        # Time prior: sinusoidal PE → Linear → sigmoid
+        if self.time_prior is not None:
+            # Build position indices
+            if isinstance(tgt_pos, int):
+                # RoPE mode: tgt_pos is offset (int)
+                positions = torch.arange(tgt_pos, tgt_pos + S, device=device)
+            else:
+                # Legacy mode: use sequential indices
+                positions = torch.arange(S, device=device)
+            pe = self._sinusoidal_pe(positions, self.time_pe_dim)  # [S, pe_dim]
+            time_base = self.time_prior(pe).sigmoid()  # [S, 1]
+            time_base = time_base.unsqueeze(0).expand(B, -1, -1)  # [B, S, 1]
         else:
-            time_base = torch.linspace(0, 1, S, device=device)
+            # Fallback: linear interpolation
+            time_base = torch.linspace(0, 1, S, device=device, dtype=dtype)
             time_base = time_base.view(1, S, 1).expand(B, -1, -1)
 
         time_base = time_base.unsqueeze(2).expand(-1, -1, H, -1)  # [B, S, H, 1]
@@ -275,15 +398,17 @@ class DecoderLayerBase(nn.Module):
 
 
 class SADecoderLayer(DecoderLayerBase):
-    """Self-Attention decoder layer.
+    """Self-Attention decoder layer with RoPE.
 
     Causal self-attention for constraint verification and retrieval:
     - Look back at all tokens in the bar to verify beat sum
     - Detect repeated sections (copy-paste patterns)
     - Global attention over full sequence (no recurrence window limit)
+
+    Uses Rotary Position Embedding (RoPE) instead of additive position embedding.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, use_rope: bool = True, **kwargs):
         super().__init__(**kwargs)
         d_model = kwargs['d_model']
         n_heads = kwargs['n_heads']
@@ -296,21 +421,47 @@ class SADecoderLayer(DecoderLayerBase):
         self.self_attn_dropout = dropout
         self.dropout1 = nn.Dropout(dropout)
 
+        # RoPE for position encoding (no max_seq_len limit)
+        self.use_rope = use_rope
+        if use_rope:
+            self.rope = RotaryPositionalEmbedding(self.sa_head_dim)
+
     def _sequence_forward(self, tgt, tgt_pos, past_kv, use_cache):
-        """Causal self-attention with optional KV-cache."""
+        """Causal self-attention with RoPE and optional KV-cache.
+
+        Args:
+            tgt: Input tensor [B, S, D]
+            tgt_pos: Position info - either embedding [B, S, D] or offset int (for RoPE)
+            past_kv: Cached (K, V) from previous steps
+            use_cache: Whether to return updated KV cache
+        """
         B, S, D = tgt.shape
 
-        # SA needs explicit position embedding
-        if tgt_pos is not None:
-            q_input = tgt + tgt_pos
+        # Compute Q, K, V (without adding position embedding - RoPE does rotation)
+        if self.use_rope:
+            qkv = self.self_attn_qkv(tgt)  # [B, S, 3*D]
         else:
-            q_input = tgt
+            # Legacy: additive position embedding
+            q_input = tgt + tgt_pos if tgt_pos is not None else tgt
+            qkv = self.self_attn_qkv(q_input)
 
-        qkv = self.self_attn_qkv(q_input)  # [B, S, 3*D]
         qkv = qkv.reshape(B, S, 3, self.sa_n_heads, self.sa_head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, D_head]
         q_sa, k_sa, v_sa = qkv[0], qkv[1], qkv[2]
 
+        # Apply RoPE to Q and K
+        if self.use_rope:
+            # Get position offset from tgt_pos (int) or past_kv length
+            if isinstance(tgt_pos, int):
+                position_offset = tgt_pos
+            elif past_kv is not None:
+                position_offset = past_kv[0].shape[2]  # K cache length
+            else:
+                position_offset = 0
+
+            q_sa, k_sa = self.rope(q_sa, k_sa, position_offset=position_offset)
+
+        # Concatenate with cached K, V
         if past_kv is not None:
             k_sa = torch.cat([past_kv[0], k_sa], dim=2)
             v_sa = torch.cat([past_kv[1], v_sa], dim=2)
@@ -383,7 +534,7 @@ class ClefDecoder(nn.Module):
     Default layer pattern: [Mamba, Mamba, SA, Mamba, Mamba, SA]
     - 4 Mamba layers: sequential writing, beat counting
     - 2 SA layers: constraint verification, retrieval
-    - All layers share: FluxCA + PC gate + FFN + reference points
+    - All layers share: FluxCA + FFN + reference points
     """
 
     def __init__(
@@ -406,6 +557,8 @@ class ClefDecoder(nn.Module):
         d_state: int = 128,
         d_conv: int = 4,
         expand: int = 2,
+        # Position encoding
+        use_rope: bool = True,  # RoPE for SA layers (no max_seq_len limit)
         # Legacy (ignored if decoder_layer_types is set)
         n_layers: int = 6,
     ):
@@ -416,6 +569,7 @@ class ClefDecoder(nn.Module):
             decoder_layer_types = ['sa'] * n_layers
 
         self.layer_types = decoder_layer_types
+        self.use_rope = use_rope
 
         # Shared kwargs for base class
         base_kwargs = dict(
@@ -442,7 +596,7 @@ class ClefDecoder(nn.Module):
                     **base_kwargs,
                 ))
             elif lt == 'sa':
-                self.layers.append(SADecoderLayer(**base_kwargs))
+                self.layers.append(SADecoderLayer(use_rope=use_rope, **base_kwargs))
             else:
                 raise ValueError(f"Unknown decoder layer type: {lt}")
 
@@ -454,24 +608,6 @@ class ClefDecoder(nn.Module):
                 mamba_idx += 1
 
         self.norm = nn.LayerNorm(d_model)
-
-    def collect_pred_loss(self) -> Optional[torch.Tensor]:
-        """Collect predictor MSE loss from all layers (predictive_coding mode).
-
-        Returns average MSE across layers, or None if not in PC mode.
-        Clears stored predictions to prevent stale data.
-        """
-        losses = []
-        for layer in self.layers:
-            if getattr(layer, '_last_prediction', None) is not None:
-                losses.append(
-                    F.mse_loss(layer._last_prediction, layer._last_ca_output)
-                )
-                layer._last_prediction = None
-                layer._last_ca_output = None
-        if losses:
-            return torch.stack(losses).mean()
-        return None
 
     def forward(
         self,
