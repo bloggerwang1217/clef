@@ -34,30 +34,47 @@ class ChunkedDataset(Dataset):
     This is essential for training on long piano pieces (often 5-15 minutes)
     while keeping memory usage manageable.
 
+    Primary chunking: chunk_frames / overlap_frames (e.g. 4min / 2min).
+    Fallback chunking: if the full-piece token count exceeds max_seq_len, the
+    piece is re-chunked with fallback_chunk_frames / fallback_overlap_frames
+    (e.g. 2min / 1min) so that every chunk fits within max_seq_len.
+
     Args:
         base_dataset: Underlying dataset that returns (mel, tokens, metadata)
-        chunk_frames: Maximum chunk length in mel frames (default: 4 min @ 100 fps)
-        overlap_frames: Overlap between chunks in frames (default: 2 min)
+        tokenizer: KernTokenizer for re-tokenizing chunk kern
+        chunk_frames: Primary chunk length in mel frames (default: 4 min @ 100 fps)
+        overlap_frames: Primary overlap in frames (default: 2 min)
         min_chunk_ratio: Minimum ratio of chunk_frames for the last chunk (default: 0.5)
+        max_seq_len: Token budget per chunk; pieces whose full token count exceeds
+            this threshold are re-chunked with the fallback parameters (default: None = no fallback)
+        fallback_chunk_frames: Fallback chunk length in frames (default: 2 min)
+        fallback_overlap_frames: Fallback overlap in frames (default: 1 min)
     """
 
     def __init__(
         self,
         base_dataset: Dataset,
         tokenizer: Any = None,  # KernTokenizer for re-tokenizing chunk kern
-        chunk_frames: int = 24000,      # 4 min @ 100 fps
-        overlap_frames: int = 12000,    # 2 min overlap
-        min_chunk_ratio: float = 0.5,   # Last chunk at least 2 min
+        chunk_frames: int = 24000,           # 4 min @ 100 fps
+        overlap_frames: int = 12000,         # 2 min overlap
+        min_chunk_ratio: float = 0.5,        # Last chunk at least 2 min
+        max_seq_len: Optional[int] = None,   # Token budget; triggers fallback if exceeded
+        fallback_chunk_frames: int = 12000,  # 2 min fallback chunk
+        fallback_overlap_frames: int = 6000, # 1 min fallback overlap
     ):
         self.base_dataset = base_dataset
         self.tokenizer = tokenizer
         self.chunk_frames = chunk_frames
         self.overlap_frames = overlap_frames
-        self.stride = chunk_frames - overlap_frames  # 12000 frames = 2 min
+        self.stride = chunk_frames - overlap_frames
         self.min_chunk_frames = int(chunk_frames * min_chunk_ratio)
+        self.max_seq_len = max_seq_len
+        self.fallback_chunk_frames = fallback_chunk_frames
+        self.fallback_overlap_frames = fallback_overlap_frames
+        self.fallback_stride = fallback_chunk_frames - fallback_overlap_frames
+        self.fallback_min_chunk_frames = int(fallback_chunk_frames * min_chunk_ratio)
 
-        # Pre-compute all chunks
-        self.chunks = self._create_chunks()
+        self.chunks = self._load_or_create_chunks()
 
         # OOV skip counter (reset per epoch for logging)
         self.oov_skipped_chunks = 0
@@ -67,30 +84,123 @@ class ChunkedDataset(Dataset):
             f"(chunk={chunk_frames} frames, overlap={overlap_frames} frames)"
         )
 
+    def _chunk_list_path(self) -> Path:
+        """Fixed path for the human-readable chunk list txt.
+        Stored alongside the manifest so it's easy to find.
+        """
+        manifest_path = getattr(self.base_dataset, 'manifest_path', None)
+        if manifest_path:
+            manifest_path = Path(manifest_path)
+            return manifest_path.parent / f'chunk_list_{manifest_path.stem}.txt'
+        # Fallback: put next to this file
+        return Path(__file__).resolve().parent / 'chunk_list_unknown.txt'
+
+    def _load_or_create_chunks(self) -> List[Tuple[int, int, int]]:
+        """Load chunks from txt if it exists, otherwise build and save it."""
+        txt_path = self._chunk_list_path()
+        if txt_path.exists():
+            chunks = self._read_chunk_list_txt(txt_path)
+            logger.info(f"ChunkedDataset: loaded {len(chunks)} chunks from {txt_path.name}")
+            return chunks
+
+        chunks = self._create_chunks()
+        self._write_chunk_list_txt(chunks, txt_path)
+        return chunks
+
+    def _write_chunk_list_txt(self, chunks: List[Tuple[int, int, int]], txt_path: Path):
+        """Write a human-readable chunk list to txt_path."""
+        fps = 100  # mel frames per second
+        items = getattr(self.base_dataset, 'items', None)  # ManifestDataset.items
+
+        txt_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(txt_path, 'w') as f:
+            f.write(f"# chunk_list — {len(chunks)} chunks from {len(self.base_dataset)} pieces\n")
+            f.write(f"# chunk_frames={self.chunk_frames}  overlap={self.overlap_frames}  "
+                    f"fallback={self.fallback_chunk_frames}/{self.fallback_overlap_frames}  "
+                    f"max_seq_len={self.max_seq_len}\n")
+            f.write(f"# {'idx':>5}  {'piece_idx':>9}  {'start_s':>7}  {'end_s':>6}  {'dur_s':>6}  stem\n")
+            for i, (pidx, start, end) in enumerate(chunks):
+                start_s = start / fps
+                end_s = end / fps
+                dur_s = end_s - start_s
+                stem = ''
+                if items is not None and pidx < len(items):
+                    audio_path = items[pidx].get('audio', items[pidx].get('mel', ''))
+                    stem = Path(audio_path).stem
+                f.write(f"  {i:>5}  {pidx:>9}  {start_s:>7.1f}  {end_s:>6.1f}  {dur_s:>6.1f}  {stem}\n")
+        logger.info(f"ChunkedDataset: wrote chunk list to {txt_path}")
+
+    def _read_chunk_list_txt(self, txt_path: Path) -> List[Tuple[int, int, int]]:
+        """Read chunks back from a previously written txt file."""
+        fps = 100
+        chunks = []
+        with open(txt_path, 'r') as f:
+            for line in f:
+                if line.startswith('#') or not line.strip():
+                    continue
+                parts = line.split()
+                # idx  piece_idx  start_s  end_s  dur_s  [stem]
+                pidx = int(parts[1])
+                start = round(float(parts[2]) * fps)
+                end = round(float(parts[3]) * fps)
+                chunks.append((pidx, start, end))
+        return chunks
+
     def _create_chunks(self) -> List[Tuple[int, int, int]]:
         """Pre-compute all chunk boundaries.
+
+        For each piece, tokenize the full kern to get the true token count.
+        If token count exceeds max_seq_len, use fallback (smaller) chunk params;
+        otherwise use primary chunk params.
 
         Returns:
             List of (base_idx, start_frame, end_frame) tuples
         """
         chunks = []
+        n_primary = 0
+        n_fallback = 0
 
         for idx in range(len(self.base_dataset)):
             length = self._get_audio_length(idx)
 
-            if length <= self.chunk_frames:
-                # Short piece: treat as single chunk
+            # Decide chunking params based on full-piece token count
+            use_fallback = False
+            if self.max_seq_len is not None:
+                _, tokens, _ = self.base_dataset[idx]
+                if len(tokens) > self.max_seq_len:
+                    use_fallback = True
+
+            if use_fallback:
+                chunk = self.fallback_chunk_frames
+                stride = self.fallback_stride
+                min_chunk = self.fallback_min_chunk_frames
+                n_fallback += 1
+            else:
+                chunk = self.chunk_frames
+                stride = self.stride
+                min_chunk = self.min_chunk_frames
+                n_primary += 1
+
+            if length <= chunk and not use_fallback:
+                # Short piece that fits in one primary chunk: keep as-is
                 chunks.append((idx, 0, length))
             else:
-                # Long piece: split into overlapping chunks
+                # Long piece, or short piece that needs fallback chunking
                 start = 0
-                while start + self.min_chunk_frames <= length:
-                    end = min(start + self.chunk_frames, length)
+                while start + min_chunk <= length:
+                    end = min(start + chunk, length)
                     chunks.append((idx, start, end))
-
                     if end >= length:
                         break
-                    start += self.stride
+                    start += stride
+
+        if self.max_seq_len is not None:
+            logger.info(
+                f"ChunkedDataset: {n_primary} pieces use primary chunking "
+                f"({self.chunk_frames} frames), "
+                f"{n_fallback} pieces use fallback chunking "
+                f"({self.fallback_chunk_frames} frames)"
+            )
 
         return chunks
 
@@ -135,6 +245,8 @@ class ChunkedDataset(Dataset):
         audio_measures = meta.get('audio_measures', [])
         kern_measures = meta.get('kern_measures', [])
         is_last_chunk = True  # default: single chunk or no alignment info
+        first_m = None
+        last_m = None
 
         if not audio_measures or not kern_measures or self.tokenizer is None:
             if start_frame == 0 and not meta.get('has_oov', False):
@@ -236,6 +348,12 @@ class ChunkedDataset(Dataset):
             'is_chunked': True,
             'is_last_chunk': is_last_chunk,
         }
+
+        # Add chunk-local audio_measures for bar time warm start
+        # first_m/last_m are only defined in the alignment branch above
+        if audio_measures and first_m is not None and last_m is not None:
+            chunk_meta['chunk_audio_measures'] = audio_measures[first_m:last_m + 1]
+            chunk_meta['chunk_duration_sec'] = (end_frame - start_frame) / 100.0
 
         return mel_chunk, tokens, chunk_meta
 
@@ -361,6 +479,8 @@ class ManifestDataset(Dataset):
                 metadata['audio_measures'] = aug_info['audio_measures']
             if aug_info.get('kern_measures'):
                 metadata['kern_measures'] = aug_info['kern_measures']
+            if aug_info.get('duration_sec'):
+                metadata['duration_sec'] = aug_info['duration_sec']
 
         return mel, tokens, metadata
 

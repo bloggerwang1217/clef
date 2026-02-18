@@ -7,7 +7,7 @@ Inherited by piano/solo/tutti variants.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 
 @dataclass
@@ -22,6 +22,10 @@ class ClefConfig:
     swin_model: str = "microsoft/swinv2-tiny-patch4-window8-256"
     swin_dims: List[int] = field(default_factory=lambda: [96, 192, 384, 768])
     freeze_encoder: bool = True
+    # Selective unfreeze: fine-tune specific Swin components while keeping attention frozen
+    # Valid components: "patch_embed", "position_bias", "downsample"
+    swin_unfreeze: List[str] = field(default_factory=list)
+    swin_lr_scale: float = 0.1  # LR multiplier for unfrozen Swin params (vs base_lr)
 
     # === HarmonizingFlow (pitch space transform) ===
     use_flow: bool = False
@@ -46,7 +50,6 @@ class ClefConfig:
     # Swin1: RF~640ms, grid 80ms → pool 4x (50% overlap, melody needs continuity)
     # Swin2/3: keep as-is (already compact)
     swin_pool_strides: List[int] = field(default_factory=lambda: [1, 1, 1, 1])
-
     # === Deformable Attention (CLEF) ===
     d_model: int = 512
     n_heads: int = 8
@@ -61,10 +64,15 @@ class ClefConfig:
     time_offset_scale: float = 0.15   # +/-15% (same as freq for square)
 
     # Content-Dependent Reference Points
-    use_time_prior: bool = True    # time_prior(tgt_pos) -> time location
+    use_time_prior: bool = True    # RoPE + Mamba learns content + position aware delta_t
     use_freq_prior: bool = True    # freq_prior(tgt) -> freq region
     n_freq_groups: int = 1         # Per-head freq_prior groups (1=shared, n_heads=fully independent)
     refine_range: float = 0.1      # +/-10% refinement
+
+    # Time prior: Two-stage Mamba (context + time)
+    rope_base: float = 10000.0     # RoPE frequency base (same as SA layers)
+    time_prior_d_state: int = 128  # Time Mamba state dimension (multi-scale timing)
+    time_prior_d_state_context: int = 32  # Context Mamba state dimension (temporal structure)
 
     # === Bridge ===
     bridge_layers: int = 2
@@ -72,14 +80,19 @@ class ClefConfig:
     # === Decoder ===
     decoder_layers: int = 6
     decoder_layer_types: List[str] = field(
-        default_factory=lambda: ['mamba', 'mamba', 'sa', 'mamba', 'mamba', 'sa']
+        default_factory=lambda: ['perceiver', 'full_ca', 'mamba_only', 'window_ca', 'mamba_only', 'window_ca', 'mamba_only']
     )
+    decoder_layer_ca_levels: Optional[List] = None  # per-layer active CA levels, None=all
     mamba_d_state: int = 128
     mamba_d_conv: int = 4
     mamba_expand: int = 2
     max_seq_len: int = 4096
     vocab_size: int = 512   # Will be set from tokenizer
     use_rope: bool = True   # RoPE for SA layers (no max_seq_len limit, saves memory)
+    # Window cross-attention (for 'window_ca' layer type)
+    window_time_frames: Union[int, List[int]] = 16   # int (all levels) or List[int] (per level)
+    window_freq_bins: Union[int, List[int]] = 8      # int (all levels) or List[int] (per level)
+    window_seq_chunk_size: int = 10000               # process N_q in chunks; large = no chunking
 
     # === Audio Transform ===
     sample_rate: int = 16000

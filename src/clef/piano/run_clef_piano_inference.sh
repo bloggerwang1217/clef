@@ -26,7 +26,7 @@ set -e
 GPU="${GPU:-0}"
 
 # Checkpoint path
-CHECKPOINT="${CHECKPOINT:-checkpoints/clef_piano_base_best/best.pt}"
+CHECKPOINT="${CHECKPOINT:-checkpoints/clef_piano_base/best.pt}"
 
 # Config (optional, will use checkpoint config if available)
 CONFIG="${CONFIG:-configs/clef_piano_base.yaml}"

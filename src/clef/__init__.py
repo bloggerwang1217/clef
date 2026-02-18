@@ -4,21 +4,17 @@
 # - clef_tutti: multi-instrument
 
 from .config import ClefConfig
-from .attention import FluxAttention, DeformableEncoderLayer
+from .attention import WindowCrossAttention
 from .bridge import DeformableBridge
-from .decoder import DeformableDecoderLayer, SADecoderLayer, MambaDecoderLayer, ClefDecoder
+from .decoder import ClefDecoder
 from .flow import HarmonizingFlow
 from .data import ChunkedDataset, ManifestDataset
 from .collate import BucketSampler, DistributedBucketSampler, ClefCollator, create_dataloader
 
 __all__ = [
     "ClefConfig",
-    "FluxAttention",
-    "DeformableEncoderLayer",
+    "WindowCrossAttention",
     "DeformableBridge",
-    "DeformableDecoderLayer",
-    "SADecoderLayer",
-    "MambaDecoderLayer",
     "ClefDecoder",
     "HarmonizingFlow",
     "ChunkedDataset",

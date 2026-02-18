@@ -47,12 +47,11 @@ SPECIAL_TOKENS = {
     "<eos>": 2,
     "<coc>": 3,      # Change of Column (multi-track separator)
     "<bar>": 4,      # Bar line
-    "<b>": 5,        # Beat boundary
-    "<continue>": 6, # Chunk boundary (piece continues in next chunk)
-    "<nl>": 7,       # Newline (line separator within measure)
-    "<split>": 8,    # Spine split (*^)
-    "<merge>": 9,    # Spine merge (*v)
-    "<*>": 10,       # Null interpretation (* in split/merge lines)
+    "<continue>": 5, # Chunk boundary (piece continues in next chunk)
+    "<nl>": 6,       # Newline (line separator within measure)
+    "<split>": 7,    # Spine split (*^)
+    "<merge>": 8,    # Spine merge (*v)
+    "<*>": 9,        # Null interpretation (* in split/merge lines)
 }
 
 # Schema tokens: time signature numerators (beats per measure)

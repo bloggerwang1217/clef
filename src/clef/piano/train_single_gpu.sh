@@ -140,9 +140,9 @@ fi
 # =============================================================================
 
 echo "Running command:"
-echo "CUDA_VISIBLE_DEVICES=$GPU $CMD"
+echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=$GPU $CMD"
 echo ""
 
 cd "$(dirname "$0")/../../.."
 # Disable Python bytecode cache to avoid stale .pyc issues
-PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES=$GPU $CMD
+PYTHONDONTWRITEBYTECODE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=$GPU $CMD

@@ -23,6 +23,8 @@ The matrix is a learnable nn.Parameter: physics gives structure,
 end-to-end training refines for inharmonicity, polyphonic interference, etc.
 """
 
+from typing import Tuple
+
 import librosa
 import numpy as np
 import torch
@@ -38,7 +40,7 @@ def _build_harmonic_template(
     f_max: float = 7040.0,
     sample_rate: int = 16000,
     n_fft: int = 2048,
-    sigma: float = 0.5,
+    sigma_bins: float = 1.0,
 ) -> torch.Tensor:
     """Build harmonic template matrix using physics of piano overtones.
 
@@ -53,22 +55,27 @@ def _build_harmonic_template(
         f_max: Maximum frequency (Hz)
         sample_rate: Audio sample rate
         n_fft: FFT size (for mel filterbank computation)
-        sigma: Gaussian spread in mel bins (accounts for filter overlap)
+        sigma_bins: Gaussian spread in mel BIN units (not raw mel values).
+            1.0 = FWHM of ~2.4 bins, matching mel filterbank overlap.
 
     Returns:
         template: [n_pitches, n_mels] normalized harmonic templates
     """
     # Get mel filterbank center frequencies
-    # librosa.mel_frequencies returns n_mels+2 frequencies (including edges)
-    mel_freqs = librosa.mel_frequencies(n_mels=n_mels + 2, fmin=f_min, fmax=f_max)
-    # Center frequencies are indices 1 to n_mels (skip edges)
+    # IMPORTANT: use htk=True to match torchaudio.transforms.MelSpectrogram
+    # (which defaults to mel_scale="htk"). Using librosa's default (Slaney)
+    # places harmonic peaks at wrong mel bins — up to 30% frequency error.
+    mel_freqs = librosa.mel_frequencies(
+        n_mels=n_mels + 2, fmin=f_min, fmax=f_max, htk=True)
     center_freqs = mel_freqs[1:-1]  # [n_mels]
+    center_mels = librosa.hz_to_mel(center_freqs, htk=True)  # [n_mels]
 
-    # Convert center frequencies to mel scale for distance computation
-    center_mels = librosa.hz_to_mel(center_freqs)  # [n_mels]
+    # Convert sigma from bin units to mel units
+    # Mel bins are equally spaced in mel, so spacing is constant
+    mel_bin_spacing = center_mels[1] - center_mels[0]
+    sigma_mel = sigma_bins * mel_bin_spacing
 
     # Piano key frequencies: A0 (27.5 Hz) to C8 (4186 Hz)
-    # MIDI note 21 (A0) to 108 (C8)
     midi_notes = np.arange(21, 21 + n_pitches)
     key_freqs = 440.0 * (2.0 ** ((midi_notes - 69) / 12.0))  # [n_pitches]
 
@@ -79,16 +86,13 @@ def _build_harmonic_template(
         for h in range(1, n_harmonics + 1):
             fh = f0 * h  # h-th harmonic frequency
 
-            # Skip if harmonic is above Nyquist or f_max
             if fh > min(sample_rate / 2, f_max):
                 break
 
-            # Convert harmonic frequency to mel scale
-            fh_mel = librosa.hz_to_mel(fh)
+            fh_mel = librosa.hz_to_mel(fh, htk=True)
 
             # Gaussian activation centered at harmonic's mel position
-            # Distance in mel scale (more perceptually uniform)
-            distances = (center_mels - fh_mel) / sigma
+            distances = (center_mels - fh_mel) / sigma_mel
             activation = np.exp(-0.5 * distances ** 2)
 
             # Weight by 1/h (natural harmonic amplitude rolloff)
@@ -205,7 +209,7 @@ class Octopus2D(nn.Module):
     - Output B: onset timing features (freq-pooled) for FluxAttention Level 0
 
     Input:  [B, 1, 128, T] mel spectrogram
-    Output: (enhanced_mel [B, 1, 128, T], onset_level [B, T//pool, 32])
+    Output: onset_level [B, T//pool, 32]
     """
 
     def __init__(
@@ -228,34 +232,26 @@ class Octopus2D(nn.Module):
             padding=(freq_kernel // 2, time_kernel // 2),
         )
 
-        # Project back to 1 channel for residual enhancement
-        self.proj_back = nn.Conv2d(channels, 1, kernel_size=1)
+    def forward(self, mel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Detect cross-frequency onsets.
 
-        # Residual scale: start small to preserve mel for Flow
-        self.scale = nn.Parameter(torch.tensor(0.1))
-
-    def forward(
-        self, mel: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Detect cross-frequency onsets and enhance mel.
+        IC harmonic neurons eat CN stellate output (= raw mel magnitude),
+        NOT octopus onset output. Flow and Octopus are parallel from mel.
 
         Args:
             mel: [B, 1, 128, T] log-mel spectrogram
 
         Returns:
-            enhanced_mel: [B, 1, 128, T] mel + onset residual (for Flow)
             onset_level: [B, H*W, C] onset features with 2D spatial info (for Level 0)
                          H = 128 // freq_pool_stride (default 32)
                          W = T // time_pool_stride
+            onset_raw: [B, C, 128, T] pre-pooling onset activations (reused by
+                       onset_to_pitch projection to avoid recomputing conv)
         """
         # Cross-frequency onset detection
         onset = F.gelu(self.conv(mel))  # [B, C, 128, T]
 
-        # Output A: residual enhancement for downstream Flow
-        residual = self.proj_back(onset)  # [B, 1, 128, T]
-        enhanced = mel + self.scale * residual
-
-        # Output B: onset features with 2D spatial structure for FluxAttention Level 0
+        # Onset features with 2D spatial structure for FluxAttention Level 0
         # Preserve frequency axis (onset SHAPE across freq bands = timbre/pitch cue)
         # Pool to [B, C, H, W] where H=32 (freq), W=T//stride (time)
         onset_pooled = F.avg_pool2d(
@@ -267,7 +263,7 @@ class Octopus2D(nn.Module):
         # Flatten spatial dims: [B, C, H, W] -> [B, H*W, C]
         onset_level = onset_pooled.permute(0, 2, 3, 1).reshape(B, H * W, C)
 
-        return enhanced, onset_level
+        return onset_level, onset
 
 
 class TemporalCNN(nn.Module):

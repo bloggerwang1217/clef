@@ -2,18 +2,13 @@
 Clef Piano Base Model
 =====================
 
-ISMIR 2026 version: Swin V2 + FluxAttention
+ISMIR 2026 version: Swin V2 + WindowCrossAttention
 
 Architecture highlights:
 - Swin V2 (frozen) extracts F1/F2/F3/F4 four-scale features
 - Deformable Bridge: Sparse self-attention fuses multi-scale features
-- FluxAttention Decoder: Content-aware Learned-prior Event Focusing
+- WindowCrossAttention Decoder: Dense window cross-attention for audio-to-score decoding
 - Solves grace note problem: Can directly access F1 (10ms resolution, 100 fps)
-
-FluxAttention features:
-- freq_prior: Predict "high or low frequency" from content (stream tracking)
-- time_prior: Predict "which time point" from position
-- Square sampling 2x2: prior locates, offset refines locally
 """
 
 from contextlib import nullcontext
@@ -26,12 +21,12 @@ from transformers import Swinv2Model
 
 from .config import ClefPianoConfig
 from ..bridge import DeformableBridge
-from ..decoder import ClefDecoder, SADecoderLayer, MambaDecoderLayer
+from ..decoder import ClefDecoder, MambaOnlyLayer
 from ..flow import HarmonizingFlow, Octopus2D
 
 
 class ClefPianoBase(nn.Module):
-    """Clef Piano Base: Swin V2 + FluxAttention for piano transcription.
+    """Clef Piano Base: Swin V2 + WindowCrossAttention for piano transcription.
 
     Model flow:
     1. Mel spectrogram -> Swin V2 (frozen) -> F1, F2, F3, F4
@@ -60,6 +55,10 @@ class ClefPianoBase(nn.Module):
             self.swin.eval()
             for p in self.swin.parameters():
                 p.requires_grad = False
+            # Selective unfreeze: fine-tune specific components
+            swin_unfreeze = getattr(config, 'swin_unfreeze', [])
+            if swin_unfreeze:
+                self._unfreeze_swin_components(swin_unfreeze)
 
         # === Octopus2D (optional, cross-frequency onset detection) ===
         self.use_octopus = getattr(config, 'use_octopus', False)
@@ -71,10 +70,19 @@ class ClefPianoBase(nn.Module):
                 time_pool_stride=getattr(config, 'octopus_time_pool_stride', 2),
             )
 
+            # Project onset from mel space to pitch space for Swin integration
+            # Conv2d(32→1, 1×1): learns weighted combination of 32 onset detectors
+            octopus_channels = getattr(config, 'octopus_channels', 32)
+            self.onset_to_pitch = nn.Conv2d(octopus_channels, 1, kernel_size=1)
+            # Small weight init: onset starts with minimal influence, grows if useful
+            nn.init.normal_(self.onset_to_pitch.weight, mean=0, std=0.01)
+            nn.init.zeros_(self.onset_to_pitch.bias)
+
         # === HarmonizingFlow (optional, pitch space transform) ===
         self.use_flow = getattr(config, 'use_flow', False)
         self.use_temporal_cnn = getattr(config, 'use_temporal_cnn', False)
         self.swin_on_pitch_space = getattr(config, 'swin_on_pitch_space', False)
+
         if self.use_flow:
             self.flow = HarmonizingFlow(
                 n_mels=config.n_mels,
@@ -153,7 +161,14 @@ class ClefPianoBase(nn.Module):
             use_freq_prior=config.use_freq_prior,
             n_freq_groups=config.n_freq_groups,
             refine_range=config.refine_range,
+            rope_base=config.rope_base,
+            time_prior_d_state=config.time_prior_d_state,
+            time_prior_d_state_context=config.time_prior_d_state_context,
+            window_time_frames=config.window_time_frames,
+            window_freq_bins=config.window_freq_bins,
+            window_seq_chunk_size=config.window_seq_chunk_size,
             decoder_layer_types=config.decoder_layer_types,
+            decoder_layer_ca_levels=getattr(config, 'decoder_layer_ca_levels', None),
             d_state=config.mamba_d_state,
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
@@ -171,10 +186,12 @@ class ClefPianoBase(nn.Module):
         self.bridge.apply(self._init_weights)
         # Decoder: init shared components per layer, skip Mamba2 internals
         for layer in self.decoder.layers:
-            layer.cross_attn.apply(self._init_weights)
-            layer.ffn.apply(self._init_weights)
+            if hasattr(layer, 'cross_attn'):
+                layer.cross_attn.apply(self._init_weights)
+            if hasattr(layer, 'ffn'):
+                layer.ffn.apply(self._init_weights)
             # norms use default init (fine), reference predictors re-init below
-            if hasattr(layer, 'self_attn_qkv'):  # SA layer
+            if hasattr(layer, 'self_attn_qkv'):  # SA-based decoder layers
                 self._init_weights(layer.self_attn_qkv)
                 self._init_weights(layer.self_attn_out)
             # Mamba2 layer.mamba is NOT touched — preserve its init
@@ -187,12 +204,73 @@ class ClefPianoBase(nn.Module):
 
         # Re-apply special initialization that _init_weights overwrites.
         # _init_weights sets all Linear biases to 0, which destroys:
-        # - FluxAttention offset bias (±0.5 grid pattern)
-        # - FluxAttention level_weights bias (+1.0 level specialization)
-        # - DecoderLayer freq_prior/time_prior/reference_refine bias
+        # - WindowCrossAttention projection biases
+        # - DecoderLayer reference predictor biases
         for layer in self.decoder.layers:
-            layer._init_reference_predictors()
-            layer.cross_attn._reset_parameters()
+            if hasattr(layer, '_init_reference_predictors'):
+                layer._init_reference_predictors()
+            if hasattr(layer, 'cross_attn'):
+                layer.cross_attn._reset_parameters()
+
+    def _unfreeze_swin_components(self, components: list):
+        """Selectively unfreeze Swin V2 components for fine-tuning.
+
+        Valid components:
+        - "patch_embed": Conv2d patch projection + post-embed LayerNorm (4,896 params)
+        - "position_bias": Continuous relative position bias MLP per block (~62K params)
+        - "downsample": Patch merging Linear + LayerNorm between stages (~1.55M params)
+
+        Note: encoder.layers.3 (last Swin stage) is excluded because the model
+        uses hidden_states[0..3] which maps to [embedding, S0_out, S1_out, S2_out].
+        Stage 3's output (hidden_states[4]) is not used, so its params have no gradient.
+        """
+        # Map component names to parameter name patterns
+        pattern_map = {
+            'patch_embed': [
+                'embeddings.patch_embeddings.',
+                'embeddings.norm.',
+            ],
+            'position_bias': [
+                'continuous_position_bias_mlp.',
+            ],
+            'downsample': [
+                '.downsample.',
+            ],
+        }
+
+        # Stage 3 (encoder.layers.3) is unused — hidden_states[3] = S2 downsample
+        # output, not S3 block output. Unfreezing S3 params would cause DDP errors.
+        n_swin_stages = len(self.config.swin_dims)
+        unused_stage = f'encoder.layers.{n_swin_stages - 1}.'
+
+        unfrozen_count = 0
+        unfrozen_params = 0
+        for component in components:
+            if component not in pattern_map:
+                raise ValueError(
+                    f"Unknown swin_unfreeze component: '{component}'. "
+                    f"Valid: {list(pattern_map.keys())}"
+                )
+            patterns = pattern_map[component]
+            for name, param in self.swin.named_parameters():
+                if unused_stage in name:
+                    continue
+                if any(p in name for p in patterns):
+                    param.requires_grad = True
+                    unfrozen_count += 1
+                    unfrozen_params += param.numel()
+
+        # Log unfrozen components
+        total_swin = sum(p.numel() for p in self.swin.parameters())
+        frozen_swin = sum(p.numel() for p in self.swin.parameters()
+                         if not p.requires_grad)
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f'Swin selective unfreeze: {components} -> '
+            f'{unfrozen_count} params unfrozen ({unfrozen_params:,} / '
+            f'{total_swin:,} = {unfrozen_params/total_swin:.1%})'
+        )
 
     def train(self, mode: bool = True):
         """Override to keep Swin in eval mode (disable DropPath)."""
@@ -277,9 +355,10 @@ class ClefPianoBase(nn.Module):
         - Flow = IC harmonic integration (pitch identification)
         - Swin = A1 cortex (multi-scale 2D processing in pitch space)
         """
-        # Step 1: Octopus2D — cross-frequency onset detection on raw mel
-        enhanced_mel, onset_level = self.octopus(mel)
+        # Step 1: Octopus2D — cross-frequency onset detection (parallel CN pathway)
+        onset_level, onset_raw = self.octopus(mel)
         # onset_level: [B, H*W, C] where H=32 (freq bins), W=T//time_pool
+        # onset_raw: [B, C, 128, T] pre-pooling activations (reused in Step 2.5)
         # Calculate spatial shape from pooling strides
         freq_pool = getattr(self.config, 'octopus_freq_pool_stride', 4)
         time_pool = getattr(self.config, 'octopus_time_pool_stride', 2)
@@ -289,9 +368,9 @@ class ClefPianoBase(nn.Module):
         spatial_shapes_list.append((H_onset, W_onset))
         valid_ratios_list.append([1.0, 1.0])
 
-        # Step 2: Flow — harmonic template matching on onset-enhanced mel
+        # Step 2: Flow — harmonic template matching on raw mel (IC eats stellate, not octopus)
         # use_temporal_cnn=False in serial mode, so flow returns tensor directly
-        flow_feat = self.flow(enhanced_mel)  # [B, T, 128]
+        flow_feat = self.flow(mel)  # [B, T, 128]
 
         # Temporal pooling
         pool_stride = getattr(self.config, 'flow_pool_stride', 4)
@@ -303,13 +382,34 @@ class ClefPianoBase(nn.Module):
             flow_feat = flow_feat.permute(0, 2, 1)  # [B, T//4, 128]
 
         T_flow = flow_feat.shape[1]
-        features.append(flow_feat)
+
+        # Step 2.5: Integrate onset into pitch space (IC-level fusion)
+        # Reuse onset_raw from Step 1 (avoids recomputing octopus conv, saves ~400 MB)
+
+        # Project 32 onset detectors to single onset map (mel space)
+        onset_signal = self.onset_to_pitch(onset_raw).squeeze(1)  # [B, 128, T]
+
+        # Match temporal resolution with flow_feat
+        if pool_stride > 1:
+            onset_signal = F.avg_pool1d(
+                onset_signal, kernel_size=pool_stride, stride=pool_stride
+            )  # [B, 128, T//4]
+
+        # Transform to pitch space using Flow's harmonic template
+        onset_signal = onset_signal.permute(0, 2, 1)  # [B, T//4, 128]
+        onset_in_pitch = onset_signal @ self.flow.transform.T  # [B, T//4, 128]
+
+        # Fuse: IC neurons receive both pitch (stellate) and onset (VNLL) inputs
+        flow_with_onset = flow_feat + onset_in_pitch
+
+        # Integrated signal serves both decoder (Level 1) and Swin (A1 cortex)
+        features.append(flow_with_onset)
         spatial_shapes_list.append((1, T_flow))
         valid_ratios_list.append([1.0, 1.0])
 
-        # Step 3: Reshape Flow output as pitch-space "image" for Swin
-        # flow_feat: [B, T_flow, 128] → [B, 1, 128, T_flow]
-        swin_input = flow_feat.detach().permute(0, 2, 1).unsqueeze(1)
+        # Step 3: Reshape integrated signal as pitch-space "image" for Swin
+        # flow_with_onset: [B, T_flow, 128] → [B, 1, 128, T_flow]
+        swin_input = flow_with_onset.permute(0, 2, 1).unsqueeze(1)
         swin_input, (orig_H_s, orig_W_s) = self._pad_to_multiple(swin_input, 32)
         swin_input = swin_input.repeat(1, 3, 1, 1)  # [B, 3, 128, T_pad]
         _, _, H_pad_s, T_pad_s = swin_input.shape
@@ -318,7 +418,9 @@ class ClefPianoBase(nn.Module):
         valid_ratio_w_s = orig_W_s / T_pad_s
 
         # Step 4: Run frozen Swin on pitch-space image
-        ctx = torch.no_grad() if self.config.freeze_encoder else nullcontext()
+        swin_fully_frozen = (self.config.freeze_encoder
+                             and not getattr(self.config, 'swin_unfreeze', []))
+        ctx = torch.no_grad() if swin_fully_frozen else nullcontext()
         with ctx:
             swin_out = self.swin(swin_input, output_hidden_states=True)
 
@@ -330,6 +432,7 @@ class ClefPianoBase(nn.Module):
         for i in range(self.swin_start_stage, n_swin_stages):
             feat = swin_out.hidden_states[i]  # [B, N_patches, C]
             H_s, W_s = all_swin_shapes[i]
+
             pool_s = swin_pools[i] if i < len(swin_pools) else 1
 
             if pool_s > 1:
@@ -364,7 +467,9 @@ class ClefPianoBase(nn.Module):
         x = padded_mel.repeat(1, 3, 1, 1)  # [B, 3, H_pad, T_pad]
 
         # Run Swin encoder
-        ctx = torch.no_grad() if self.config.freeze_encoder else nullcontext()
+        swin_fully_frozen = (self.config.freeze_encoder
+                             and not getattr(self.config, 'swin_unfreeze', []))
+        ctx = torch.no_grad() if swin_fully_frozen else nullcontext()
         with ctx:
             swin_out = self.swin(x, output_hidden_states=True)
 
@@ -478,9 +583,19 @@ class ClefPianoBase(nn.Module):
         """
         value_cache_list = []
         for layer in self.decoder.layers:
-            cache = layer.cross_attn.compute_value_cache(
-                memory, spatial_shapes, level_start_index,
-            )
+            if hasattr(layer, 'cross_attn'):
+                # Layers with deformable cross_attn: pre-compute value cache
+                cache = layer.cross_attn.compute_value_cache(
+                    memory, spatial_shapes, level_start_index,
+                )
+            elif hasattr(layer, 'window_ca'):
+                # SAWindowCALayer: WindowCrossAttention KV cache (only active levels)
+                cache = layer.window_ca.compute_kv_cache(
+                    memory, spatial_shapes, level_start_index,
+                    active_levels=layer.active_ca_levels,
+                )
+            else:
+                cache = None  # MambaOnlyLayer, PerceiverLayer, SAFullCALayer
             value_cache_list.append(cache)
         return value_cache_list
 
@@ -488,15 +603,21 @@ class ClefPianoBase(nn.Module):
         """Get the number of previously cached tokens from past_states.
 
         Checks SA layers for KV-cache shape, or Mamba InferenceParams for seqlen_offset.
+        State structure: (layer_state, time_cumsum, time_prior_params) 3-tuple.
         """
         for i, layer in enumerate(self.decoder.layers):
             state = past_states[i]
             if state is None:
                 continue
-            if isinstance(layer, SADecoderLayer) and isinstance(state, tuple):
-                return state[0].shape[2]  # K cache: [B, H, S_cached, D_head]
-            if hasattr(state, 'seqlen_offset'):
-                return state.seqlen_offset  # Mamba InferenceParams
+            layer_state = state[0]
+            if layer_state is None:
+                continue
+            # SA-based layers (SAFullCALayer, SAWindowCALayer):
+            # state = ((k, v), ...), so layer_state = (k, v), layer_state[0] = k tensor
+            if isinstance(layer_state, tuple) and isinstance(layer_state[0], torch.Tensor):
+                return layer_state[0].shape[2]  # K cache: [B, H, S_cached, D_head]
+            if hasattr(layer_state, 'seqlen_offset'):
+                return layer_state.seqlen_offset  # Mamba InferenceParams
         return 0
 
     def decode(
@@ -523,8 +644,8 @@ class ClefPianoBase(nn.Module):
             value_cache: Pre-computed cross-attn value maps (from prepare_value_cache)
 
         Returns:
-            logits: Output logits [B, S, vocab_size]
-            new_states: (only if use_cache=True) list of states per layer
+            Without use_cache: logits [B, S, vocab_size]
+            With use_cache: (logits [B, S, vocab_size], new_states list)
         """
         B, S = input_ids.shape
 
@@ -558,10 +679,24 @@ class ClefPianoBase(nn.Module):
             )
             # Increment Mamba InferenceParams.seqlen_offset after each step.
             # mamba-ssm does NOT auto-increment; the caller must do it.
+            # State structure: (layer_state, time_prior_params) 2-tuple
+            decoder_mamba_done = False
             for state in new_states:
-                if hasattr(state, 'seqlen_offset'):
-                    state.seqlen_offset += S
-                    break  # shared object, only increment once
+                if state is None:
+                    continue
+                layer_state = state[0]
+                time_prior_params = state[1] if len(state) > 1 else None
+
+                # Shared decoder Mamba InferenceParams (increment only once)
+                if not decoder_mamba_done and hasattr(layer_state, 'seqlen_offset'):
+                    layer_state.seqlen_offset += S
+                    decoder_mamba_done = True
+
+                # Per-layer time_prior InferenceParams (not shared)
+                if time_prior_params is not None:
+                    for tp in time_prior_params:
+                        if tp is not None:
+                            tp.seqlen_offset += S
             logits = self.output_head(tgt)
             return logits, new_states
         else:
@@ -590,7 +725,7 @@ class ClefPianoBase(nn.Module):
 
         Returns:
             logits: Output logits [B, S, vocab_size]
-            loss: Cross-entropy loss (if labels provided)
+            loss: CE loss (if labels provided)
         """
         # Encode
         memory, spatial_shapes, level_start_index, valid_ratios = self.encode(
@@ -602,52 +737,48 @@ class ClefPianoBase(nn.Module):
             input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
         )
 
-        # Compute loss
+        # Compute loss (CE only)
         loss = None
         if labels is not None:
             loss_fn = nn.CrossEntropyLoss(
                 ignore_index=0,  # <pad> token
                 label_smoothing=self.config.label_smoothing,
             )
-            ce_loss = loss_fn(
+            loss = loss_fn(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1)
             )
 
-            loss = ce_loss
-
         return logits, loss
-
-    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Get or create causal attention mask.
-
-        Returns:
-            mask: [S, S] with -inf for positions that should not attend
-        """
-        if seq_len not in self._causal_mask_cache:
-            mask = torch.triu(
-                torch.full((seq_len, seq_len), float('-inf'), device=device),
-                diagonal=1
-            )
-            self._causal_mask_cache[seq_len] = mask
-
-        return self._causal_mask_cache[seq_len].to(device)
 
     def _init_inference_states(self, batch_size: int, max_length: int, device: torch.device) -> list:
         """Initialize per-layer inference states.
 
         SA layers: None (KV-cache built incrementally)
         Mamba layers: shared InferenceParams object (mamba-ssm manages per-layer state)
+        Time prior: per-layer InferenceParams pair (time_mamba, context_mamba)
+
+        State structure: (layer_state, time_cumsum, time_prior_params) 3-tuple per layer.
+        time_cumsum starts as None, gets populated during forward.
+        time_prior_params = (time_InferenceParams, context_InferenceParams) or None.
         """
         from mamba_ssm.utils.generation import InferenceParams
         mamba_params = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
 
         past_states = []
         for layer in self.decoder.layers:
-            if isinstance(layer, MambaDecoderLayer):
-                past_states.append(mamba_params)  # shared object
+            # Time prior params (per-layer, each has own context_mamba + time_mamba)
+            if hasattr(layer, 'time_prior') and layer.time_prior is not None:
+                tp_time = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
+                tp_ctx = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
+                tp_params = (tp_time, tp_ctx)
             else:
-                past_states.append(None)  # SA, no cache yet
+                tp_params = None
+
+            if isinstance(layer, MambaOnlyLayer):
+                past_states.append((mamba_params, None, tp_params))
+            else:
+                past_states.append((None, None, tp_params))
         return past_states
 
     @torch.no_grad()
@@ -753,85 +884,166 @@ class ClefPianoBase(nn.Module):
 
         return generated
 
+    @staticmethod
+    def _clone_ip(ip):
+        """Deep clone a single InferenceParams object."""
+        from mamba_ssm.utils.generation import InferenceParams
+        cloned = InferenceParams(
+            max_seqlen=ip.max_seqlen,
+            max_batch_size=ip.max_batch_size,
+            seqlen_offset=ip.seqlen_offset,
+        )
+        for k, v in ip.key_value_memory_dict.items():
+            if isinstance(v, torch.Tensor):
+                cloned.key_value_memory_dict[k] = v.clone()
+            elif isinstance(v, tuple):
+                cloned.key_value_memory_dict[k] = tuple(t.clone() for t in v)
+        return cloned
+
+    @staticmethod
+    def _expand_ip(ip, num_beams):
+        """Expand InferenceParams batch dim: B -> B * num_beams."""
+        from mamba_ssm.utils.generation import InferenceParams
+        expanded = InferenceParams(
+            max_seqlen=ip.max_seqlen,
+            max_batch_size=ip.max_batch_size * num_beams,
+            seqlen_offset=ip.seqlen_offset,
+        )
+        for k, v in ip.key_value_memory_dict.items():
+            if isinstance(v, torch.Tensor):
+                expanded.key_value_memory_dict[k] = v.repeat_interleave(num_beams, dim=0)
+            elif isinstance(v, tuple):
+                expanded.key_value_memory_dict[k] = tuple(
+                    t.repeat_interleave(num_beams, dim=0) for t in v
+                )
+        return expanded
+
+    @staticmethod
+    def _reorder_ip(ip, beam_idx):
+        """Reorder InferenceParams tensors according to beam indices (in-place)."""
+        for k, v in ip.key_value_memory_dict.items():
+            if isinstance(v, torch.Tensor):
+                ip.key_value_memory_dict[k] = v[beam_idx]
+            elif isinstance(v, tuple):
+                ip.key_value_memory_dict[k] = tuple(t[beam_idx] for t in v)
+        return ip
+
+    def _clone_tp_params(self, tp_params):
+        """Clone time_prior InferenceParams tuple."""
+        if tp_params is None:
+            return None
+        return tuple(self._clone_ip(p) if p is not None else None for p in tp_params)
+
+    def _expand_tp_params(self, tp_params, num_beams):
+        """Expand time_prior InferenceParams tuple for beam search."""
+        if tp_params is None:
+            return None
+        return tuple(
+            self._expand_ip(p, num_beams) if p is not None else None for p in tp_params
+        )
+
+    def _reorder_tp_params(self, tp_params, beam_idx):
+        """Reorder time_prior InferenceParams tuple for beam search."""
+        if tp_params is None:
+            return None
+        return tuple(
+            self._reorder_ip(p, beam_idx) if p is not None else None for p in tp_params
+        )
+
+    @staticmethod
+    def _unpack_state(state):
+        """Unpack layer state, handling both 2-tuple and 3-tuple formats.
+
+        _init_inference_states creates 3-tuples: (layer_state, time_cumsum, tp_params)
+        Layers return 2-tuples: (layer_state, tp_params_or_none)
+        """
+        if len(state) >= 3:
+            return state[0], state[1], state[2]
+        elif len(state) == 2:
+            return state[0], None, state[1]
+        else:
+            return state[0], None, None
+
     def _clone_inference_states(self, past_states: list, device: torch.device) -> list:
         """Deep clone inference states for beam search.
 
+        State structure: (layer_state, time_cumsum, time_prior_params) per layer.
         Mamba layers share a single InferenceParams object with key_value_memory_dict.
         SA layers have (K, V) tuple caches.
+        Handles both 2-tuple and 3-tuple state formats.
         """
-        from mamba_ssm.utils.generation import InferenceParams
-
         cloned = []
         inference_params_cloned = None
 
         for state in past_states:
             if state is None:
                 cloned.append(None)
-            elif hasattr(state, 'seqlen_offset'):
-                # InferenceParams - clone only once (shared across Mamba layers)
+                continue
+
+            layer_state, time_cumsum, tp_params = self._unpack_state(state)
+
+            cloned_time_cumsum = time_cumsum.clone() if time_cumsum is not None else None
+            cloned_tp = self._clone_tp_params(tp_params)
+
+            if layer_state is None:
+                cloned.append((None, cloned_time_cumsum, cloned_tp))
+            elif hasattr(layer_state, 'seqlen_offset'):
+                # InferenceParams - clone only once (shared across decoder Mamba layers)
                 if inference_params_cloned is None:
-                    inference_params_cloned = InferenceParams(
-                        max_seqlen=state.max_seqlen,
-                        max_batch_size=state.max_batch_size,
-                        seqlen_offset=state.seqlen_offset,
-                    )
-                    # Deep copy key_value_memory_dict tensors
-                    for k, v in state.key_value_memory_dict.items():
-                        if isinstance(v, torch.Tensor):
-                            inference_params_cloned.key_value_memory_dict[k] = v.clone()
-                        elif isinstance(v, tuple):
-                            inference_params_cloned.key_value_memory_dict[k] = tuple(
-                                t.clone() for t in v
-                            )
-                cloned.append(inference_params_cloned)
-            elif isinstance(state, tuple) and len(state) == 2:
+                    inference_params_cloned = self._clone_ip(layer_state)
+                cloned.append((inference_params_cloned, cloned_time_cumsum, cloned_tp))
+            elif isinstance(layer_state, tuple) and len(layer_state) == 2:
                 # SA KV-cache: (K, V)
-                cloned.append((state[0].clone(), state[1].clone()))
+                cloned.append((
+                    (layer_state[0].clone(), layer_state[1].clone()),
+                    cloned_time_cumsum,
+                    cloned_tp,
+                ))
             else:
-                cloned.append(state)
+                cloned.append((layer_state, cloned_time_cumsum, cloned_tp))
 
         return cloned
 
     def _expand_states_for_beams(
         self, past_states: list, num_beams: int, device: torch.device
     ) -> list:
-        """Expand states batch dimension for beam search: B -> B * num_beams."""
-        from mamba_ssm.utils.generation import InferenceParams
+        """Expand states batch dimension for beam search: B -> B * num_beams.
 
+        Handles both 2-tuple and 3-tuple state formats.
+        """
         expanded = []
         inference_params_expanded = None
 
         for state in past_states:
             if state is None:
                 expanded.append(None)
-            elif hasattr(state, 'seqlen_offset'):
-                # InferenceParams - expand only once
+                continue
+
+            layer_state, time_cumsum, tp_params = self._unpack_state(state)
+
+            expanded_time_cumsum = (
+                time_cumsum.repeat_interleave(num_beams, dim=0)
+                if time_cumsum is not None else None
+            )
+            expanded_tp = self._expand_tp_params(tp_params, num_beams)
+
+            if layer_state is None:
+                expanded.append((None, expanded_time_cumsum, expanded_tp))
+            elif hasattr(layer_state, 'seqlen_offset'):
+                # InferenceParams - expand only once (shared)
                 if inference_params_expanded is None:
-                    inference_params_expanded = InferenceParams(
-                        max_seqlen=state.max_seqlen,
-                        max_batch_size=state.max_batch_size * num_beams,
-                        seqlen_offset=state.seqlen_offset,
-                    )
-                    # Expand key_value_memory_dict tensors
-                    for k, v in state.key_value_memory_dict.items():
-                        if isinstance(v, torch.Tensor):
-                            # [B, ...] -> [B * num_beams, ...]
-                            inference_params_expanded.key_value_memory_dict[k] = (
-                                v.repeat_interleave(num_beams, dim=0)
-                            )
-                        elif isinstance(v, tuple):
-                            inference_params_expanded.key_value_memory_dict[k] = tuple(
-                                t.repeat_interleave(num_beams, dim=0) for t in v
-                            )
-                expanded.append(inference_params_expanded)
-            elif isinstance(state, tuple) and len(state) == 2:
+                    inference_params_expanded = self._expand_ip(layer_state, num_beams)
+                expanded.append((inference_params_expanded, expanded_time_cumsum, expanded_tp))
+            elif isinstance(layer_state, tuple) and len(layer_state) == 2:
                 # SA KV-cache: (K, V) [B, H, S, D] -> [B * num_beams, H, S, D]
                 expanded.append((
-                    state[0].repeat_interleave(num_beams, dim=0),
-                    state[1].repeat_interleave(num_beams, dim=0),
+                    (layer_state[0].repeat_interleave(num_beams, dim=0),
+                     layer_state[1].repeat_interleave(num_beams, dim=0)),
+                    expanded_time_cumsum,
+                    expanded_tp,
                 ))
             else:
-                expanded.append(state)
+                expanded.append((layer_state, expanded_time_cumsum, expanded_tp))
 
         return expanded
 
@@ -839,6 +1051,8 @@ class ClefPianoBase(nn.Module):
         self, past_states: list, beam_idx: torch.Tensor
     ) -> list:
         """Reorder states according to beam selection indices.
+
+        Handles both 2-tuple and 3-tuple state formats.
 
         Args:
             past_states: List of states [B * num_beams, ...]
@@ -850,24 +1064,29 @@ class ClefPianoBase(nn.Module):
         for state in past_states:
             if state is None:
                 reordered.append(None)
-            elif hasattr(state, 'seqlen_offset'):
-                # InferenceParams - reorder only once
+                continue
+
+            layer_state, time_cumsum, tp_params = self._unpack_state(state)
+
+            reordered_time_cumsum = time_cumsum[beam_idx] if time_cumsum is not None else None
+            reordered_tp = self._reorder_tp_params(tp_params, beam_idx)
+
+            if layer_state is None:
+                reordered.append((None, reordered_time_cumsum, reordered_tp))
+            elif hasattr(layer_state, 'seqlen_offset'):
+                # InferenceParams - reorder only once (shared)
                 if inference_params_reordered is None:
-                    inference_params_reordered = state  # reuse same object
-                    # Reorder key_value_memory_dict tensors
-                    for k, v in state.key_value_memory_dict.items():
-                        if isinstance(v, torch.Tensor):
-                            state.key_value_memory_dict[k] = v[beam_idx]
-                        elif isinstance(v, tuple):
-                            state.key_value_memory_dict[k] = tuple(
-                                t[beam_idx] for t in v
-                            )
-                reordered.append(inference_params_reordered)
-            elif isinstance(state, tuple) and len(state) == 2:
+                    inference_params_reordered = self._reorder_ip(layer_state, beam_idx)
+                reordered.append((inference_params_reordered, reordered_time_cumsum, reordered_tp))
+            elif isinstance(layer_state, tuple) and len(layer_state) == 2:
                 # SA KV-cache: (K, V)
-                reordered.append((state[0][beam_idx], state[1][beam_idx]))
+                reordered.append((
+                    (layer_state[0][beam_idx], layer_state[1][beam_idx]),
+                    reordered_time_cumsum,
+                    reordered_tp,
+                ))
             else:
-                reordered.append(state)
+                reordered.append((layer_state, reordered_time_cumsum, reordered_tp))
 
         return reordered
 
@@ -910,18 +1129,25 @@ class ClefPianoBase(nn.Module):
         memory = memory.repeat_interleave(num_beams, dim=0)
         valid_ratios = valid_ratios.repeat_interleave(num_beams, dim=0)
         # spatial_shapes and level_start_index are shared (no batch dim)
-        # Expand value_cache for beams: [B*H, ...] -> [(B*num_beams)*H, ...]
-        H = self.decoder.layers[0].n_heads
+        # Expand value_cache for beams: [B, N_l, D] -> [B*num_beams, N_l, D]
+
+        def _expand_seq(s: torch.Tensor) -> torch.Tensor:
+            """Expand [B, N_l, D] to [B*num_beams, N_l, D]."""
+            return s.repeat_interleave(num_beams, dim=0)
+
         expanded_cache = []
         for layer_cache in value_cache:
+            if layer_cache is None:
+                expanded_cache.append(None)
+                continue
+            # window_ca: list of (k_seq, v_seq, H_l, W_l) tuples per level (None for inactive)
             expanded_layer = []
-            for v in layer_cache:
-                # v: [B*H, D_head, H_l, W_l] -> [B, H, ...] -> [B*num_beams, H, ...] -> [(B*num_beams)*H, ...]
-                shape = v.shape  # [B*H, D_head, H_l, W_l]
-                v = v.view(B, H, *shape[1:])  # [B, H, D_head, H_l, W_l]
-                v = v.repeat_interleave(num_beams, dim=0)  # [B*num_beams, H, ...]
-                v = v.view(B * num_beams * H, *shape[1:])  # [(B*num_beams)*H, ...]
-                expanded_layer.append(v)
+            for item in layer_cache:
+                if item is None:
+                    expanded_layer.append(None)
+                else:
+                    k_seq, v_seq, H_l, W_l = item
+                    expanded_layer.append((_expand_seq(k_seq), _expand_seq(v_seq), H_l, W_l))
             expanded_cache.append(expanded_layer)
         value_cache = expanded_cache
 

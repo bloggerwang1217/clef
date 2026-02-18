@@ -133,43 +133,47 @@ class Trainer:
         # Model
         self.model = model.to(self.device)
         if world_size > 1:
-            self.model = DDP(self.model, device_ids=[local_rank])
+            self.model = DDP(
+                self.model, device_ids=[local_rank],
+                find_unused_parameters=False,
+            )
 
         # Data loaders
         self.train_loader = train_loader
         self.valid_loader = valid_loader
 
         # Optimizer setup:
-        # - Main optimizer (OneCycleLR): offset params (0.1x) + everything else (1x)
+        # - 2 groups: other (base_lr) + swin (0.1x)
+        # Window CA architecture: no deformable offsets, no time_prior — all params use base_lr.
+        # Swin unfrozen params use 0.1x to preserve pretrained features.
         base_lr = config.learning_rate if hasattr(config, 'learning_rate') else 1e-4
-        offset_lr = base_lr * 0.1  # 0.1x for offset-related params
+        swin_lr_scale = getattr(config, 'swin_lr_scale', 0.1)
+        swin_lr = base_lr * swin_lr_scale
         weight_decay = config.weight_decay if hasattr(config, 'weight_decay') else 0.01
 
-        offset_param_names = [
-            'time_prior', 'reference_refine',                  # Decoder reference points
-            'time_offset_proj', 'freq_offset_proj',           # Attention offsets
-        ]
-        offset_params = []
+        swin_params = []
         other_params = []
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if any(offset_name in name for offset_name in offset_param_names):
-                offset_params.append(param)
+            if name.startswith('swin.'):
+                swin_params.append(param)
                 if self.rank == 0:
-                    logger.debug(f'Offset param (lr={offset_lr:.2e}): {name}')
+                    logger.debug(f'Swin param (lr={swin_lr:.2e}): {name}')
             else:
                 other_params.append(param)
 
         if self.rank == 0:
-            logger.info(f'Optimizer: {len(offset_params)} offset params (lr={offset_lr:.2e}), '
-                       f'{len(other_params)} other params (lr={base_lr:.2e})')
+            logger.info(f'Optimizer: {len(other_params)} other params (lr={base_lr:.2e}), '
+                       f'{len(swin_params)} swin params (lr={swin_lr:.2e})')
 
-        self.optimizer = torch.optim.AdamW([
-            {'params': offset_params, 'lr': offset_lr},
-            {'params': other_params, 'lr': base_lr},
-        ], weight_decay=weight_decay)
+        # Group order: [0] other, [1] swin (optional)
+        param_groups = [{'params': other_params, 'lr': base_lr}]
+        if swin_params:
+            param_groups.append({'params': swin_params, 'lr': swin_lr})
+
+        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
 
         # Learning rate scheduler
         total_steps = len(train_loader) * (config.max_epochs if hasattr(config, 'max_epochs') else 50)
@@ -177,9 +181,13 @@ class Trainer:
         self.total_steps = total_steps
         warmup_steps = config.warmup_steps if hasattr(config, 'warmup_steps') else 1000
 
+        # max_lrs must match param_groups: [other, (swin)]
+        max_lrs = [base_lr]
+        if swin_params:
+            max_lrs.append(swin_lr)
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=[offset_lr, base_lr],  # 2 groups: offset, other
+            max_lr=max_lrs,
             total_steps=total_steps,
             pct_start=warmup_steps / total_steps,
             anneal_strategy='cos',
@@ -219,7 +227,7 @@ class Trainer:
 
         struct_names = {
             '<pad>', '<sos>', '<eos>', '<coc>', '<bar>',
-            '<b>', '<continue>', '<nl>', '<split>', '<merge>', '<*>',
+            '<continue>', '<nl>', '<split>', '<merge>', '<*>',
             '(', ')',    # slur start/end
             '{', '}',    # phrase start/end
             'L', 'J',    # beam start/end
@@ -342,8 +350,17 @@ class Trainer:
         self.optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
-            # Skip batches where all samples were filtered out
-            if batch is None:
+            # DDP-safe skip: all ranks must agree to skip, otherwise
+            # the rank that skips misses a gradient all-reduce and NCCL
+            # times out waiting for the missing collective.
+            if isinstance(self.model, DDP):
+                has_data = torch.tensor(
+                    [batch is not None], device=self.device, dtype=torch.int32
+                )
+                dist.all_reduce(has_data, op=dist.ReduceOp.MIN)
+                if has_data.item() == 0:
+                    continue
+            elif batch is None:
                 continue
 
             # Move to device
@@ -351,7 +368,6 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             labels = batch['labels'].to(self.device)
             mel_valid_ratios = batch['mel_valid_ratios'].to(self.device)
-
             micro_batch_count += 1
 
             # Skip DDP all-reduce on non-update micro-batches to save
@@ -388,12 +404,12 @@ class Trainer:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
 
-                # Per-group clipping: offset/base clipped independently
-                # so reference_refine's huge gradient doesn't starve base params
-                offset_params = [p for p in self.optimizer.param_groups[0]['params']]
-                base_params = [p for p in self.optimizer.param_groups[1]['params']]
-                offset_grad_norm = torch.nn.utils.clip_grad_norm_(offset_params, self.gradient_clip)
+                # Gradient clipping — Groups: [0] other, [1] swin (optional)
+                base_params = [p for p in self.optimizer.param_groups[0]['params']]
                 grad_norm = torch.nn.utils.clip_grad_norm_(base_params, self.gradient_clip)
+                if len(self.optimizer.param_groups) > 1:
+                    swin_params_clip = [p for p in self.optimizer.param_groups[1]['params']]
+                    torch.nn.utils.clip_grad_norm_(swin_params_clip, self.gradient_clip)
 
                 if self.scaler is not None:
                     old_scale = self.scaler.get_scale()
@@ -417,12 +433,11 @@ class Trainer:
 
                 # Log to wandb
                 if self.use_wandb:
+                    last_lrs = self.scheduler.get_last_lr()
                     log_dict = {
                         'train/loss': avg_accum_loss,
                         'train/grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
-                        'train/offset_grad_norm': offset_grad_norm.item() if hasattr(offset_grad_norm, 'item') else offset_grad_norm,
-                        'train/lr_base': self.scheduler.get_last_lr()[1],
-                        'train/lr_offset': self.scheduler.get_last_lr()[0],
+                        'train/lr_base': last_lrs[0],         # group[0]: other (base_lr)
                         'train/epoch': self.epoch,
                         'system/gpu_memory_gb': torch.cuda.max_memory_allocated(self.device) / 1024**3,
                     }
@@ -437,7 +452,7 @@ class Trainer:
                 # Update progress bar
                 pbar.set_postfix({
                     'loss': f'{avg_accum_loss:.4f}',
-                    'lr': f'{self.scheduler.get_last_lr()[1]:.2e}',
+                    'lr': f'{self.scheduler.get_last_lr()[0]:.2e}',
                     'grad': f'{grad_norm:.2f}' if hasattr(grad_norm, '__float__') else 'N/A',
                 })
 
@@ -475,7 +490,17 @@ class Trainer:
         type_loss_counts = {'loss_pitch': 0, 'loss_duration': 0, 'loss_struct': 0, 'loss_schema': 0}
 
         for batch_idx, batch in enumerate(self.valid_loader):
-            if batch is None:
+            # DDP-safe skip (same as train_epoch)
+            if isinstance(self.model, DDP):
+                has_data = torch.tensor(
+                    [batch is not None], device=self.device, dtype=torch.int32
+                )
+                dist.all_reduce(has_data, op=dist.ReduceOp.MIN)
+                if has_data.item() == 0:
+                    if self.rank == 0:
+                        logger.warning(f'Validation: skipping batch {batch_idx} (filtered on some rank)')
+                    continue
+            elif batch is None:
                 if self.rank == 0:
                     logger.warning(f'Validation: skipping batch {batch_idx} (all samples filtered)')
                 continue
@@ -554,7 +579,13 @@ class Trainer:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         model = self.model.module if isinstance(self.model, DDP) else self.model
-        model.load_state_dict(checkpoint['model_state_dict'])
+        missing, unexpected = model.load_state_dict(
+            checkpoint['model_state_dict'], strict=False
+        )
+        if missing:
+            logger.info(f'New params (not in checkpoint): {missing}')
+        if unexpected:
+            logger.warning(f'Unexpected params in checkpoint: {unexpected}')
 
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -690,7 +721,40 @@ def sanity_check(model: ClefPianoBase, train_loader: DataLoader, device: torch.d
         if step % 10 == 0:
             logger.info(f'Step {step}: loss={loss.item():.4f}')
 
-    logger.info(f'Final loss: {loss.item():.4f}')
+    import math
+    logger.info(f'Final loss: {loss.item():.4f}  (perplexity={math.exp(loss.item()):.2f})')
+
+    # Loss breakdown: pitch / duration / structure
+    from src.clef.piano.tokenizer import KernTokenizer
+    tokenizer = KernTokenizer()
+    tok = tokenizer
+
+    def _mask(fn):
+        ids = [i for i in range(model.config.vocab_size) if fn(tok.id_to_token.get(i, ''))]
+        m = torch.zeros(model.config.vocab_size, dtype=torch.bool)
+        m[ids] = True
+        return m.to(device)
+
+    dur_chars = set('0123456789')
+    pitch_chars = set('abcdefgrABCDEFGR')
+    dur_mask   = _mask(lambda t: bool(t) and t[0] in dur_chars and t not in ('<sos>','<eos>','<pad>','<bar>','<nl>','<coc>','<continue>'))
+    pitch_mask = _mask(lambda t: bool(t) and t[0] in pitch_chars)
+    struct_mask= _mask(lambda t: t in ('<bar>','<nl>','<coc>','<split>','<merge>','<*>','<sos>','<eos>'))
+
+    model.eval()
+    with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        logits_eval, _ = model(mel=mel, input_ids=input_ids,
+                                labels=labels, mel_valid_ratios=mel_valid_ratios)
+    ce = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=0)
+    per_tok = ce(logits_eval.view(-1, logits_eval.size(-1)), labels.view(-1))  # [B*S]
+    lab_flat = labels.view(-1)
+
+    def _group_loss(mask):
+        sel = mask[lab_flat] & (lab_flat != 0)
+        return per_tok[sel].mean().item() if sel.any() else float('nan')
+
+    logger.info(f'  pitch  loss: {_group_loss(pitch_mask):.4f}  dur loss: {_group_loss(dur_mask):.4f}  struct loss: {_group_loss(struct_mask):.4f}')
+
     if loss.item() < 0.1:
         logger.info('Sanity check PASSED: model can overfit one batch')
     else:
@@ -804,6 +868,9 @@ def main():
                 chunk_frames=config.chunk_frames,
                 overlap_frames=config.overlap_frames,
                 min_chunk_ratio=config.min_chunk_ratio,
+                max_seq_len=config.max_seq_len,
+                fallback_chunk_frames=config.fallback_chunk_frames,
+                fallback_overlap_frames=config.fallback_overlap_frames,
             )
 
         valid_dataset = None
@@ -824,6 +891,9 @@ def main():
                     chunk_frames=config.chunk_frames,
                     overlap_frames=0,
                     min_chunk_ratio=config.min_chunk_ratio,
+                    max_seq_len=config.max_seq_len,
+                    fallback_chunk_frames=config.fallback_chunk_frames,
+                    fallback_overlap_frames=0,
                 )
 
         # Create collator

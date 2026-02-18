@@ -17,16 +17,19 @@ class ClefPianoConfig(ClefConfig):
     """Configuration for clef-piano-base model.
 
     ISMIR 2026 target: Single-instrument (piano) transcription
-    using Swin V2 encoder + FluxAttention decoder.
+    using Swin V2 encoder + WindowCrossAttention decoder.
     """
 
     # Piano-specific defaults
     vocab_size: int = 512   # ~220 factorized tokens + padding
 
     # Chunking for long pieces
-    chunk_frames: int = 24000      # 4 min @ 100 fps
-    overlap_frames: int = 12000    # 2 min overlap
-    min_chunk_ratio: float = 0.5   # Last chunk at least 2 min
+    chunk_frames: int = 24000           # 4 min @ 100 fps (primary)
+    overlap_frames: int = 12000         # 2 min overlap (primary)
+    min_chunk_ratio: float = 0.5        # Last chunk at least 2 min
+    # Fallback chunking: used when full-piece token count > max_seq_len
+    fallback_chunk_frames: int = 12000  # 2 min fallback chunk
+    fallback_overlap_frames: int = 6000 # 1 min fallback overlap
 
     # Piano-specific: often right-hand (high freq) + left-hand (low freq)
     # freq_prior learns to focus on relevant register
@@ -63,6 +66,8 @@ class ClefPianoConfig(ClefConfig):
             swin_model=model_cfg.get("swin_model", defaults.swin_model),
             swin_dims=model_cfg.get("swin_dims", defaults.swin_dims),
             freeze_encoder=model_cfg.get("freeze_encoder", defaults.freeze_encoder),
+            swin_unfreeze=model_cfg.get("swin_unfreeze", defaults.swin_unfreeze),
+            swin_lr_scale=model_cfg.get("swin_lr_scale", defaults.swin_lr_scale),
 
             # HarmonizingFlow
             use_flow=model_cfg.get("use_flow", defaults.use_flow),
@@ -102,17 +107,21 @@ class ClefPianoConfig(ClefConfig):
             use_freq_prior=model_cfg.get("use_freq_prior", defaults.use_freq_prior),
             n_freq_groups=model_cfg.get("n_freq_groups", defaults.n_freq_groups),
             refine_range=model_cfg.get("refine_range", defaults.refine_range),
+            rope_base=model_cfg.get("rope_base", defaults.rope_base),
 
             # Architecture
             bridge_layers=model_cfg.get("bridge_layers", defaults.bridge_layers),
             decoder_layers=model_cfg.get("decoder_layers", defaults.decoder_layers),
             decoder_layer_types=model_cfg.get("decoder_layer_types", defaults.decoder_layer_types),
+            decoder_layer_ca_levels=model_cfg.get("decoder_layer_ca_levels", defaults.decoder_layer_ca_levels),
             mamba_d_state=model_cfg.get("mamba_d_state", defaults.mamba_d_state),
             mamba_d_conv=model_cfg.get("mamba_d_conv", defaults.mamba_d_conv),
             mamba_expand=model_cfg.get("mamba_expand", defaults.mamba_expand),
             max_seq_len=model_cfg.get("max_seq_len", defaults.max_seq_len),
             vocab_size=model_cfg.get("vocab_size", defaults.vocab_size),
             use_rope=model_cfg.get("use_rope", defaults.use_rope),
+            window_time_frames=model_cfg.get("window_time_frames", defaults.window_time_frames),
+            window_freq_bins=model_cfg.get("window_freq_bins", defaults.window_freq_bins),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),
@@ -126,6 +135,8 @@ class ClefPianoConfig(ClefConfig):
             chunk_frames=chunk_cfg.get("chunk_frames", defaults.chunk_frames),
             overlap_frames=chunk_cfg.get("overlap_frames", defaults.overlap_frames),
             min_chunk_ratio=chunk_cfg.get("min_chunk_ratio", defaults.min_chunk_ratio),
+            fallback_chunk_frames=chunk_cfg.get("fallback_chunk_frames", defaults.fallback_chunk_frames),
+            fallback_overlap_frames=chunk_cfg.get("fallback_overlap_frames", defaults.fallback_overlap_frames),
 
             # Training
             learning_rate=training_cfg.get("learning_rate", 1e-4),

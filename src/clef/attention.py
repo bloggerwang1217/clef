@@ -1,497 +1,468 @@
 """
-CLEF Attention: Content-aware Learned-prior Event Focusing Attention
-====================================================================
+Clef Attention
+==============
 
-The core innovation of Clef architecture for audio-to-score transcription.
+WindowCrossAttention: dense window cross-attention for audio-to-score decoding.
 
-Naming origin:
-- Content-aware: Predict attention region from decoder hidden state
-- Learned-prior: freq_prior / time_prior learn "where to look"
-- Event: Focus on musical events (notes, chords)
-- Focusing: Sparse sampling, only look at important positions
-
-Design rationale (based on cognitive science):
-- Human brain's stream segregation (Bregman, 1990) is content-dependent
-- freq_prior + time_prior do "coarse localization"
-- offset only needs small-range "local detail"
-- Square sampling (2x2) is sufficient since prior already selected the region
-
-Relationship with Stripe-Transformer / hFT-Transformer:
-- They use full attention to separate freq/time processing
-- We use learned spatial priors + sparse sampling
-- Lower complexity, comparable effectiveness (for piano/solo tasks)
-
-Generality:
-- Music: Time x Frequency
-- Image: X x Y x Scale
-- Extensible to any multi-dimensional focusing problem
-
-Design:
-- Separate n_points_freq / n_points_time for flexibility (but typically equal)
-- Separate freq_offset_scale / time_offset_scale (but typically equal for square)
-- Decoupled level-point attention: level selection (softmax over L) and point
-  selection (softmax over K per level) use separate gradient paths, with
-  level bias initialization for scale-axis specialization (analogous to
-  freq_group for frequency-axis specialization)
+For each decoder query, attends to all encoder tokens within a local
+time × freq window centered at (time_center, freq_center) — a free
+byproduct of SAFullCALayer's attention weights, requiring no extra parameters.
 """
 
-from typing import List, Optional, Tuple
+import math
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
-class FluxAttention(nn.Module):
-    """CLEF Attention with content-aware spatial priors and square sampling.
+class WindowCrossAttention(nn.Module):
+    """Dense window cross-attention as replacement for FluxAttention.
 
-    Key design choices:
-    - freq_prior: Predict "high or low frequency" from hidden state
-    - time_prior: Predict "which time point" from position embedding
-    - Square sampling 2x2: prior locates, offset refines locally
-    - Both offset_scale params default to same value (true square)
+    For each decoder query, attends to all encoder tokens within a local
+    time × freq window centered at (time_center, freq_center).
 
-    Piano application:
-    - Predicting right-hand melody -> freq_prior outputs high value
-    - Predicting left-hand harmony -> freq_prior outputs low value
+    time_center and freq_center are the center-of-mass of SAFullCALayer's
+    attention weights over S2+S3 — a free byproduct that directly encodes
+    where in the audio each decoder token aligned.
+
+    Compared to deformable FluxAttention:
+    - Dense within window: all window tokens contribute gradient
+    - Robust: center error < window_half still succeeds
+    - No learned reference points, no time_prior/freq_prior needed
+    - Standard QK attention weights (not factored level/point weights)
+
+    Memory design: K/V are never pre-projected for the full level.
+    Instead, for each seq_chunk, window token indices are computed from
+    (time_center, freq_center), raw encoder tokens are gathered, then
+    key_proj/value_proj are applied only on those K_l tokens.
+
+    Peak memory per level per chunk: O(seq_chunk_size × K_l × D)
+    e.g. chunk=128, K_l=128, D=512 → 32 MiB  vs  750 MiB for Octopus full level.
     """
 
     def __init__(
         self,
         d_model: int = 512,
-        n_levels: int = 4,
+        n_levels: int = 6,
         n_heads: int = 8,
-        n_points_freq: int = 2,        # Frequency direction: local detail
-        n_points_time: int = 2,        # Time direction: local detail
-        freq_offset_scale: float = 1.0,  # ±1 pixel in feature map space
-        time_offset_scale: float = 1.0,  # ±1 pixel in feature map space
+        window_time: Union[int, List[int]] = 16,   # int (all levels) or List[int] (per level)
+        window_freq: Union[int, List[int]] = 8,    # int (all levels) or List[int] (per level)
+        seq_chunk_size: int = 512,  # process N_q in chunks to bound peak memory
     ):
         super().__init__()
 
         self.d_model = d_model
         self.n_levels = n_levels
         self.n_heads = n_heads
-        self.n_points_freq = n_points_freq
-        self.n_points_time = n_points_time
-        self.n_points = n_points_freq * n_points_time  # Total sampling points
-        self.freq_offset_scale = freq_offset_scale
-        self.time_offset_scale = time_offset_scale
-
         self.head_dim = d_model // n_heads
+        self.seq_chunk_size = seq_chunk_size
 
-        # Separate prediction of time and freq offsets
-        self.time_offset_proj = nn.Linear(
-            d_model,
-            n_heads * n_levels * n_points_time
-        )
-        self.freq_offset_proj = nn.Linear(
-            d_model,
-            n_heads * n_levels * n_points_freq
-        )
+        # Normalize to per-level lists
+        if isinstance(window_time, int):
+            self.window_time_per_level = [window_time] * n_levels
+        else:
+            self.window_time_per_level = list(window_time)
+        if isinstance(window_freq, int):
+            self.window_freq_per_level = [window_freq] * n_levels
+        else:
+            self.window_freq_per_level = list(window_freq)
 
-        # Decoupled level-point attention (inspired by auditory cortex):
-        # Level selection and point selection use separate softmax, so level
-        # specialization gets its own gradient path independent of point weights.
-        # Analogous to freq_group for frequency axis — this provides inductive
-        # bias for scale (resolution) axis.
-        self.level_weights = nn.Linear(d_model, n_heads * n_levels)
-        self.point_weights = nn.Linear(d_model, n_heads * n_levels * self.n_points)
+        # Legacy scalar aliases (for any code that reads .window_time / .window_freq)
+        self.window_time = self.window_time_per_level[0]
+        self.window_freq = self.window_freq_per_level[0]
 
-        # Value projection
+        self.query_proj = nn.Linear(d_model, d_model)
+        self.key_proj = nn.Linear(d_model, d_model)
         self.value_proj = nn.Linear(d_model, d_model)
         self.output_proj = nn.Linear(d_model, d_model)
 
         self._reset_parameters()
 
     def _reset_parameters(self):
-        """Initialize with square grid and level-specialization bias.
+        for proj in [self.query_proj, self.key_proj, self.value_proj, self.output_proj]:
+            nn.init.xavier_uniform_(proj.weight)
+            nn.init.constant_(proj.bias, 0.)
 
-        Offset initialization (offset_scale=1.0, Deformable DETR style):
-        - Bias = ±0.5 pixel in feature map space (within tanh linear region)
-        - After spatial normalization: Level 0 (H=32) -> ±0.5/32 = ±0.016
-          Level 3 (H=4) -> ±0.5/4 = ±0.125. Actual 2x2 grid, not degenerate.
-
-        Level bias initialization (inspired by freq_group success):
-        - Each pair of heads has a soft preference for one level
-        - Analogous to auditory cortex: different regions handle different
-          temporal integration windows (fine detail vs structure)
-        - Head 0,1 -> Level 0 (+1.0 bias), Head 2,3 -> Level 1, etc.
-        - softmax(+1.0, 0, 0, 0) ≈ (0.45, 0.18, 0.18, 0.18): soft, learnable
-        """
-        # === Time offset initialization ===
-        nn.init.constant_(self.time_offset_proj.weight, 0.)
-
-        # Bias: ±0.5 pixel spread (atanh(0.5/scale) puts it in tanh linear region)
-        time_init = torch.linspace(-0.5, 0.5, self.n_points_time)
-
-        time_bias = time_init.view(1, 1, self.n_points_time)
-        time_bias = time_bias.expand(self.n_heads, self.n_levels, -1)
-
-        with torch.no_grad():
-            self.time_offset_proj.bias.copy_(time_bias.flatten())
-
-        # === Freq offset initialization ===
-        nn.init.constant_(self.freq_offset_proj.weight, 0.)
-
-        freq_init = torch.linspace(-0.5, 0.5, self.n_points_freq)
-
-        freq_bias = freq_init.view(1, 1, self.n_points_freq)
-        freq_bias = freq_bias.expand(self.n_heads, self.n_levels, -1)
-
-        with torch.no_grad():
-            self.freq_offset_proj.bias.copy_(freq_bias.flatten())
-
-        # === Level weights: soft level-specialization bias ===
-        # Each pair of heads prefers a different level (independent of freq_group).
-        # Frequency axis (bass/soprano) and scale axis (detail/structure) are
-        # orthogonal — a bass head may need fine detail (Level 0) or broad
-        # context (Level 3) depending on the musical content.
-        nn.init.constant_(self.level_weights.weight, 0.)
-
-        level_bias = torch.zeros(self.n_heads, self.n_levels)
-        heads_per_level = max(1, self.n_heads // self.n_levels)
-        for lvl in range(self.n_levels):
-            start_head = lvl * heads_per_level
-            end_head = min(start_head + heads_per_level, self.n_heads)
-            level_bias[start_head:end_head, lvl] = 1.0
-
-        with torch.no_grad():
-            self.level_weights.bias.copy_(level_bias.flatten())
-
-        # === Point weights: uniform initialization ===
-        nn.init.constant_(self.point_weights.weight, 0.)
-        nn.init.constant_(self.point_weights.bias, 0.)
-
-        # === Projection layers: Xavier ===
-        nn.init.xavier_uniform_(self.value_proj.weight)
-        nn.init.constant_(self.value_proj.bias, 0.)
-        nn.init.xavier_uniform_(self.output_proj.weight)
-        nn.init.constant_(self.output_proj.bias, 0.)
-
-    def compute_value_cache(
+    def _gather_window_tokens(
         self,
-        value: torch.Tensor,              # [B, N_v, D]
-        spatial_shapes: torch.Tensor,     # [L, 2]
+        value: torch.Tensor,         # [B, N_v, D]
         level_start_index: torch.Tensor,  # [L]
-    ) -> List[torch.Tensor]:
-        """Pre-compute projected and reshaped values per level for caching.
+        tc_chunk: torch.Tensor,      # [B, C]  in [0, 1]
+        fc_chunk: torch.Tensor,      # [B, C]  in [0, 1]
+        lid: int,
+        H_l: int,
+        W_l: int,
+    ) -> Tuple[torch.Tensor, int]:
+        """Gather window tokens for one level using nearest-neighbour integer indexing.
 
-        Call once per chunk, reuse across all decoding steps.
+        Single gather call (vs. 4 bilinear-corner calls). For a dense window
+        (wt × wf tokens), rounding the centre to the nearest pixel shifts the
+        window by ≤ 0.5 frames — negligible compared to window size.
+        OOB positions (outside the feature map) are zeroed out.
 
         Returns:
-            List of [B*H, D_head, H_l, W_l] tensors, one per level.
+            tokens:  [B, C, K_l, D]
+            K_l:     int
         """
-        B, N_v, _ = value.shape
-        value = self.value_proj(value)  # [B, N_v, D]
-        value = value.view(B, N_v, self.n_heads, self.head_dim)  # [B, N_v, H, D_head]
+        B, C = tc_chunk.shape
+        device = value.device
 
-        level_values = []
-        for lid in range(self.n_levels):
-            H_l, W_l = spatial_shapes[lid].tolist()
-            start = level_start_index[lid].item()
-            end = start + H_l * W_l
-            value_l = value[:, start:end, :, :]  # [B, H_l*W_l, H, D_head]
-            value_l = value_l.permute(0, 2, 3, 1)  # [B, H, D_head, H_l*W_l]
-            value_l = value_l.reshape(B * self.n_heads, self.head_dim, H_l, W_l)
-            level_values.append(value_l)
+        wt = min(self.window_time_per_level[lid], W_l)
+        wf = min(self.window_freq_per_level[lid], H_l) if H_l > 1 else 1
+        K_l = wt * wf
 
-        return level_values
+        # Nearest-pixel centre (align_corners=False: px = x*W - 0.5, then round)
+        tc_px = (tc_chunk * W_l - 0.5).round().long()   # [B, C]
+        fc_px = (fc_chunk * H_l - 0.5).round().long()   # [B, C]
+
+        # Window offsets centred around 0 (integer)
+        t_offsets = torch.arange(wt, device=device) - wt // 2   # [wt]
+        f_offsets = torch.arange(wf, device=device) - wf // 2   # [wf]
+
+        # Grid positions: [B, C, wt] and [B, C, wf]
+        tc_grid = tc_px.unsqueeze(-1) + t_offsets   # [B, C, wt]
+        fc_grid = fc_px.unsqueeze(-1) + f_offsets   # [B, C, wf]
+
+        # Outer product → [B, C, wf, wt] → flatten to [B, C, K_l]
+        tc_flat = tc_grid[:, :, None, :].expand(B, C, wf, wt).reshape(B, C, K_l)
+        fc_flat = fc_grid[:, :, :, None].expand(B, C, wf, wt).reshape(B, C, K_l)
+
+        # OOB detection, then clamp for safe indexing
+        oob = (tc_flat < 0) | (tc_flat >= W_l) | (fc_flat < 0) | (fc_flat >= H_l)
+        tc_c = tc_flat.clamp(0, W_l - 1)
+        fc_c = fc_flat.clamp(0, H_l - 1)
+
+        level_offset = level_start_index[lid].item()
+        flat_idx = level_offset + fc_c * W_l + tc_c           # [B, C, K_l]
+
+        # Single gather: [B, C*K_l, D] → reshape [B, C, K_l, D]
+        idx_exp = flat_idx.reshape(B, C * K_l).unsqueeze(-1).expand(B, C * K_l, self.d_model)
+        tokens = value.gather(1, idx_exp).reshape(B, C, K_l, self.d_model)
+
+        # Zero out OOB positions so they don't contribute to attention
+        if oob.any():
+            tokens = tokens.masked_fill(oob.unsqueeze(-1), 0.0)
+
+        return tokens, K_l
+
+    def _forward_chunk(
+        self,
+        q_chunk: torch.Tensor,           # [B, C, H, D_head]
+        tc_chunk: torch.Tensor,          # [B, C]  in [0, 1]
+        fc_chunk: torch.Tensor,          # [B, C]  in [0, 1]
+        value: torch.Tensor,             # [B, N_v, D]
+        levels: list,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+        B: int,
+        C: int,
+    ) -> torch.Tensor:
+        """Process one chunk of C decoder queries. Returns [B, C, D].
+
+        For each level, gathers only the window tokens from the raw encoder
+        sequence, projects them to K/V, then accumulates with online softmax.
+
+        Peak memory per level: O(C × K_l × D) for the gathered tokens +
+        O(C × K_l × H × D_head) for K/V after projection.
+        """
+        scale = math.sqrt(self.head_dim)
+        q_exp = q_chunk.unsqueeze(-2)   # [B, C, H, 1, D_head]
+
+        # Online softmax state
+        out_acc = None
+        lse_acc = None
+
+        for lid in levels:
+            H_l = int(spatial_shapes[lid][0])
+            W_l = int(spatial_shapes[lid][1])
+
+            # Gather bilinear-interpolated window tokens: [B, C, K_l, D]
+            tokens, K_l = self._gather_window_tokens(
+                value, level_start_index, tc_chunk, fc_chunk, lid, H_l, W_l
+            )
+
+            # Project gathered tokens to K/V: [B, C, K_l, D]
+            k_gathered = self.key_proj(tokens)
+            v_gathered = self.value_proj(tokens)
+
+            # [B, C, K_l, H, D_head] → [B, C, H, K_l, D_head]
+            k_s = k_gathered.view(B, C, K_l, self.n_heads, self.head_dim).permute(0, 1, 3, 2, 4)
+            v_s = v_gathered.view(B, C, K_l, self.n_heads, self.head_dim).permute(0, 1, 3, 2, 4)
+
+            # scores: [B, C, H, 1, K_l]
+            scores_l = torch.matmul(q_exp, k_s.transpose(-1, -2)) / scale
+
+            # Online softmax accumulation
+            lse_l = torch.logsumexp(scores_l, dim=-1, keepdim=True)  # [B, C, H, 1, 1]
+            w_l = torch.exp(scores_l - lse_l)                        # [B, C, H, 1, K_l]
+            out_l = torch.matmul(w_l, v_s).squeeze(-2)               # [B, C, H, D_head]
+
+            if lse_acc is None:
+                out_acc = out_l
+                lse_acc = lse_l.squeeze(-1)                           # [B, C, H, 1]
+            else:
+                lse_l_sq = lse_l.squeeze(-1)
+                lse_new = torch.logaddexp(lse_acc, lse_l_sq)
+                alpha_prev = torch.exp(lse_acc - lse_new)
+                alpha_curr = torch.exp(lse_l_sq - lse_new)
+                out_acc = alpha_prev * out_acc + alpha_curr * out_l
+                lse_acc = lse_new
+
+        return out_acc.reshape(B, C, -1)  # [B, C, D]
 
     def forward(
         self,
-        query: torch.Tensor,              # [B, N_q, D]
-        reference_points: torch.Tensor,   # [B, N_q, H, L, 2] or [B, N_q, L, 2]
-        value: torch.Tensor,              # [B, N_v, D]
-        spatial_shapes: torch.Tensor,     # [L, 2] each level's (H, W)
-        level_start_index: torch.Tensor,  # [L] start index in value for each level
-        valid_ratios: Optional[torch.Tensor] = None,  # [B, L, 2] padding valid ratios
-        value_cache: Optional[List[torch.Tensor]] = None,  # from compute_value_cache
+        query: torch.Tensor,               # [B, N_q, D]
+        time_center: torch.Tensor,         # [B, N_q, 1] in [0, 1]
+        freq_center: torch.Tensor,         # [B, N_q, 1] in [0, 1]
+        value: torch.Tensor,               # [B, N_v, D]
+        spatial_shapes: torch.Tensor,      # [L, 2]
+        level_start_index: torch.Tensor,   # [L]
+        active_levels: Optional[List[int]] = None,
+        kv_cache: Optional[list] = None,
     ) -> torch.Tensor:
-        """Forward pass with content-aware deformable attention.
+        """Dense window cross-attention with chunked sequence processing.
 
-        Args:
-            query: Decoder query embeddings [B, N_q, D]
-            reference_points: Normalized reference coordinates, either:
-                - [B, N_q, H, L, 2] per-head (from decoder with n_freq_groups > 1)
-                - [B, N_q, L, 2] shared across heads (from encoder self-attention)
-                where 2 = (time, freq) in [0, 1]
-            value: Multi-scale encoder features [B, N_v, D]
-            spatial_shapes: Spatial shape (H, W) for each level [L, 2]
-            level_start_index: Start index in value for each level [L]
-            valid_ratios: Valid ratio for padding handling [B, L, 2]
-            value_cache: Pre-computed per-level value maps (skips value_proj)
-
-        Returns:
-            Output features [B, N_q, D]
+        kv_cache: if provided (inference), list of (k_seq, v_seq, H_l, W_l)
+        per level (None for inactive).  During training, kv_cache=None and
+        K/V are computed on-the-fly per seq_chunk from the raw value sequence.
         """
         B, N_q, _ = query.shape
-        Kt = self.n_points_time
-        Kf = self.n_points_freq
 
-        # === 1. Predict offsets ===
+        q = self.query_proj(query)  # [B, N_q, D]
+        q = q.view(B, N_q, self.n_heads, self.head_dim)
 
-        # Time offset: [B, N_q, H, L, Kt]
-        time_offset = self.time_offset_proj(query)  # [B, N_q, H*L*Kt]
-        time_offset = time_offset.view(B, N_q, self.n_heads, self.n_levels, Kt)
-        time_offset = time_offset.tanh() * self.time_offset_scale
+        levels = active_levels if active_levels is not None else list(range(self.n_levels))
 
-        # Freq offset: [B, N_q, H, L, Kf]
-        freq_offset = self.freq_offset_proj(query)  # [B, N_q, H*L*Kf]
-        freq_offset = freq_offset.view(B, N_q, self.n_heads, self.n_levels, Kf)
-        freq_offset = freq_offset.tanh() * self.freq_offset_scale
+        tc = time_center.squeeze(-1)   # [B, N_q]  in [0, 1]
+        fc = freq_center.squeeze(-1)   # [B, N_q]  in [0, 1]
 
-        # === 2. Compose into 2D sampling grid ===
-
-        # Expand for outer product
-        time_grid = time_offset.unsqueeze(-1)  # [B, N_q, H, L, Kt, 1]
-        freq_grid = freq_offset.unsqueeze(-2)  # [B, N_q, H, L, 1, Kf]
-
-        # Create sampling grid [B, N_q, H, L, Kt, Kf, 2]
-        # Coordinate order: (time, freq) corresponds to (x, y)
-        sampling_offsets = torch.stack([
-            time_grid.expand(-1, -1, -1, -1, -1, Kf),
-            freq_grid.expand(-1, -1, -1, -1, Kt, -1),
-        ], dim=-1)
-
-        # Flatten to [B, N_q, H, L, n_points, 2]
-        sampling_offsets = sampling_offsets.flatten(-3, -2)
-
-        # === 3. Compute sampling locations ===
-
-        # Offset normalization: divide by each level's spatial size
-        offset_normalizer = torch.stack([
-            spatial_shapes[..., 1].float(),  # W (time)
-            spatial_shapes[..., 0].float(),  # H (freq)
-        ], dim=-1)  # [L, 2]
-
-        # Handle both per-head [B, N_q, H, L, 2] and shared [B, N_q, L, 2] reference_points
-        if reference_points.dim() == 4:
-            # Shared: [B, N_q, L, 2] -> [B, N_q, 1, L, 1, 2]
-            ref_expanded = reference_points[:, :, None, :, None, :]
+        if kv_cache is not None:
+            # Inference path: use pre-projected K/V sequences (no checkpointing needed)
+            out = self._forward_with_cache(q, tc, fc, kv_cache, levels, spatial_shapes, B, N_q)
+        elif N_q <= self.seq_chunk_size:
+            out = self._run_chunk(q, tc, fc, value, levels, spatial_shapes, level_start_index, B, N_q)
         else:
-            # Per-head: [B, N_q, H, L, 2] -> [B, N_q, H, L, 1, 2]
-            ref_expanded = reference_points.unsqueeze(-2)
+            chunks = []
+            for start in range(0, N_q, self.seq_chunk_size):
+                end = min(start + self.seq_chunk_size, N_q)
+                C = end - start
+                out_c = self._run_chunk(
+                    q[:, start:end],
+                    tc[:, start:end],
+                    fc[:, start:end],
+                    value, levels, spatial_shapes, level_start_index, B, C,
+                )
+                chunks.append(out_c)
+            out = torch.cat(chunks, dim=1)
 
-        # sampling_offsets: [B, N_q, H, L, K, 2]
-        # offset_normalizer: [L, 2] -> [1, 1, 1, L, 1, 2]
-        normalized_offsets = sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+        return self.output_proj(out)
 
-        sampling_locations = ref_expanded + normalized_offsets  # [B, N_q, H, L, K, 2]
-
-        # Constrain within valid range
-        if valid_ratios is not None:
-            # valid_ratios: [B, L, 2] -> [B, 1, 1, L, 1, 2]
-            vr = valid_ratios[:, None, None, :, None, :]
-            sampling_locations = sampling_locations * vr
-
-        # Clamp to [0, 1]
-        sampling_locations = sampling_locations.clamp(0, 1)
-
-        # === 4. Decoupled level-point attention weights ===
-        # Level selection: softmax over L (which resolution?)
-        # Point selection: softmax over K per level (where within that level?)
-        # Final weight = level_weight[l] * point_weight[l,k]
-        # This gives level selection its own gradient path.
-
-        lw = self.level_weights(query)  # [B, N_q, H*L]
-        lw = lw.view(B, N_q, self.n_heads, self.n_levels)
-        lw = F.softmax(lw, dim=-1)  # [B, N_q, H, L]
-
-        pw = self.point_weights(query)  # [B, N_q, H*L*K]
-        pw = pw.view(B, N_q, self.n_heads, self.n_levels, self.n_points)
-        pw = F.softmax(pw, dim=-1)  # [B, N_q, H, L, K]
-
-        # Combine: [B, N_q, H, L, K]
-        attention_weights = lw.unsqueeze(-1) * pw
-
-        # === 5. Deformable Attention computation ===
-
-        if value_cache is not None:
-            # Use pre-computed per-level value maps (skip value_proj + reshape)
-            output = self._deformable_attention_core_cached(
-                value_cache, sampling_locations, attention_weights
-            )
-        else:
-            _, N_v, _ = value.shape
-            value = self.value_proj(value)
-            value = value.view(B, N_v, self.n_heads, self.head_dim)
-            output = self._deformable_attention_core(
-                value, spatial_shapes, level_start_index,
-                sampling_locations, attention_weights
-            )
-
-        output = self.output_proj(output)
-
-        return output
-
-    def _deformable_attention_core(
+    def _run_chunk(
         self,
-        value: torch.Tensor,              # [B, N_v, H, D_head]
+        q_chunk: torch.Tensor,
+        tc_chunk: torch.Tensor,
+        fc_chunk: torch.Tensor,
+        value: torch.Tensor,
+        levels: list,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+        B: int,
+        C: int,
+    ) -> torch.Tensor:
+        if not self.training:
+            return self._forward_chunk(
+                q_chunk, tc_chunk, fc_chunk,
+                value, levels, spatial_shapes, level_start_index, B, C,
+            )
+        # Gradient checkpointing: recompute _forward_chunk on backward instead of
+        # storing all intermediate activations (K/V projections, gathered tokens).
+        # Non-tensor args (levels, B, C) captured by closure.
+        def fn(q_chunk, tc_chunk, fc_chunk, value, spatial_shapes, level_start_index):
+            return self._forward_chunk(
+                q_chunk, tc_chunk, fc_chunk,
+                value, levels, spatial_shapes, level_start_index, B, C,
+            )
+        return grad_checkpoint(
+            fn,
+            q_chunk, tc_chunk, fc_chunk, value, spatial_shapes, level_start_index,
+            use_reentrant=False,
+        )
+
+    def _forward_with_cache(
+        self,
+        q: torch.Tensor,              # [B, N_q, H, D_head]
+        tc: torch.Tensor,             # [B, N_q]  in [0, 1]
+        fc: torch.Tensor,             # [B, N_q]  in [0, 1]
+        kv_cache: list,
+        levels: list,
+        spatial_shapes: torch.Tensor,
+        B: int,
+        N_q: int,
+    ) -> torch.Tensor:
+        """Inference path: K/V already projected, use bilinear gather from cache seqs."""
+        scale = math.sqrt(self.head_dim)
+
+        if N_q <= self.seq_chunk_size:
+            return self._cache_chunk(q, tc, fc, kv_cache, levels, spatial_shapes, B, N_q)
+
+        chunks = []
+        for start in range(0, N_q, self.seq_chunk_size):
+            end = min(start + self.seq_chunk_size, N_q)
+            C = end - start
+            chunks.append(self._cache_chunk(
+                q[:, start:end], tc[:, start:end], fc[:, start:end],
+                kv_cache, levels, spatial_shapes, B, C,
+            ))
+        return torch.cat(chunks, dim=1)
+
+    def _cache_chunk(
+        self,
+        q_chunk: torch.Tensor,    # [B, C, H, D_head]
+        tc_chunk: torch.Tensor,   # [B, C]
+        fc_chunk: torch.Tensor,   # [B, C]
+        kv_cache: list,
+        levels: list,
+        spatial_shapes: torch.Tensor,
+        B: int,
+        C: int,
+    ) -> torch.Tensor:
+        """One chunk of inference forward using cached K/V sequences."""
+        scale = math.sqrt(self.head_dim)
+        q_exp = q_chunk.unsqueeze(-2)
+
+        out_acc = None
+        lse_acc = None
+
+        for lid in levels:
+            k_seq, v_seq, H_l, W_l = kv_cache[lid]  # [B, N_l, D] each
+
+            wt = min(self.window_time_per_level[lid], W_l)
+            wf = min(self.window_freq_per_level[lid], H_l) if H_l > 1 else 1
+            K_l = wt * wf
+
+            # Gather bilinear-interpolated K/V from projected sequences
+            # Reuse _gather_window_tokens logic but on projected seqs
+
+            t_offsets = torch.arange(wt, device=q_chunk.device, dtype=q_chunk.dtype) - wt / 2.0 + 0.5
+            f_offsets = torch.arange(wf, device=q_chunk.device, dtype=q_chunk.dtype) - wf / 2.0 + 0.5
+
+            tc_px = tc_chunk * W_l - 0.5
+            fc_px = fc_chunk * H_l - 0.5
+
+            tc_grid = tc_px.unsqueeze(-1) + t_offsets
+            fc_grid = fc_px.unsqueeze(-1) + f_offsets
+
+            tc_flat = tc_grid[:, :, None, :].expand(B, C, wf, wt).reshape(B, C, K_l)
+            fc_flat = fc_grid[:, :, :, None].expand(B, C, wf, wt).reshape(B, C, K_l)
+
+            x0 = tc_flat.floor().long()
+            y0 = fc_flat.floor().long()
+            x1 = x0 + 1
+            y1 = y0 + 1
+            wa = tc_flat - x0.float()
+            wb = fc_flat - y0.float()
+
+            w00 = (1 - wa) * (1 - wb)
+            w10 = wa       * (1 - wb)
+            w01 = (1 - wa) * wb
+            w11 = wa       * wb
+
+            def gather_seq(seq, xi, yi, weight):
+                # seq: [B, N_l, D], N_l = H_l * W_l
+                valid = ((xi >= 0) & (xi < W_l) & (yi >= 0) & (yi < H_l)).float()
+                xi_c = xi.clamp(0, W_l - 1)
+                yi_c = yi.clamp(0, H_l - 1)
+                flat_idx = yi_c * W_l + xi_c   # [B, C, K_l]
+                tok = seq.gather(
+                    1,
+                    flat_idx.reshape(B, C * K_l).unsqueeze(-1).expand(B, C * K_l, seq.shape[-1])
+                ).reshape(B, C, K_l, seq.shape[-1])
+                w = (weight * valid).unsqueeze(-1)
+                return tok * w
+
+            def gather_kv(seq, xi, yi, weight):
+                # seq: [B, N_l, D]
+                D = seq.shape[-1]
+                tok = gather_seq(seq, xi, yi, weight)   # [B, C, K_l, D]
+                return tok.view(B, C, K_l, self.n_heads, self.head_dim)
+
+            k_raw = (gather_kv(k_seq, x0, y0, w00)
+                   + gather_kv(k_seq, x1, y0, w10)
+                   + gather_kv(k_seq, x0, y1, w01)
+                   + gather_kv(k_seq, x1, y1, w11))   # [B, C, K_l, H, D_head]
+            v_raw = (gather_kv(v_seq, x0, y0, w00)
+                   + gather_kv(v_seq, x1, y0, w10)
+                   + gather_kv(v_seq, x0, y1, w01)
+                   + gather_kv(v_seq, x1, y1, w11))
+
+            k_s = k_raw.permute(0, 1, 3, 2, 4)   # [B, C, H, K_l, D_head]
+            v_s = v_raw.permute(0, 1, 3, 2, 4)
+
+            scores_l = torch.matmul(q_exp, k_s.transpose(-1, -2)) / scale
+            lse_l = torch.logsumexp(scores_l, dim=-1, keepdim=True)
+            w_l = torch.exp(scores_l - lse_l)
+            out_l = torch.matmul(w_l, v_s).squeeze(-2)
+
+            if lse_acc is None:
+                out_acc = out_l
+                lse_acc = lse_l.squeeze(-1)
+            else:
+                lse_l_sq = lse_l.squeeze(-1)
+                lse_new = torch.logaddexp(lse_acc, lse_l_sq)
+                alpha_prev = torch.exp(lse_acc - lse_new)
+                alpha_curr = torch.exp(lse_l_sq - lse_new)
+                out_acc = alpha_prev * out_acc + alpha_curr * out_l
+                lse_acc = lse_new
+
+        return out_acc.reshape(B, C, -1)
+
+    def compute_kv_cache(
+        self,
+        value: torch.Tensor,              # [B, N_v, D]
         spatial_shapes: torch.Tensor,     # [L, 2]
         level_start_index: torch.Tensor,  # [L]
-        sampling_locations: torch.Tensor,  # [B, N_q, H, L, K, 2]
-        attention_weights: torch.Tensor,  # [B, N_q, H, L, K]
-    ) -> torch.Tensor:
-        """Pure PyTorch implementation (can be replaced with CUDA kernel).
+        active_levels: Optional[List[int]] = None,
+    ) -> List[Optional[Tuple[torch.Tensor, torch.Tensor, int, int]]]:
+        """Pre-compute projected K/V sequences for inference.
 
-        Uses F.grid_sample for bilinear interpolation at sampling locations.
+        Returns list of length n_levels: inactive entries are None,
+        active entries are (k_seq, v_seq, H_l, W_l) with k_seq/v_seq [B, N_l, D].
+
+        Only called during inference (prepare_value_cache). During training,
+        K/V are computed on-the-fly in _forward_chunk to avoid storing full-level
+        projections (e.g. Octopus L0 at 384k tokens = 750 MiB K+V for 4-min chunks).
         """
-        B, N_q, H, L, K, _ = sampling_locations.shape
-        D_head = value.shape[-1]
+        B = value.shape[0]
+        levels_to_compute = active_levels if active_levels is not None else list(range(self.n_levels))
 
-        # Convert sampling_locations to grid_sample format [-1, 1]
-        sampling_grids = 2 * sampling_locations - 1
+        active_starts = [level_start_index[lid].item() for lid in levels_to_compute]
+        active_ends = [
+            active_starts[i] + int(spatial_shapes[lid][0]) * int(spatial_shapes[lid][1])
+            for i, lid in enumerate(levels_to_compute)
+        ]
 
-        # Accumulate weighted sum directly (no stack, saves 768 MB peak memory)
-        # Old: stack 6 levels -> [B, H, D_head, N_q, K, L] -> weighted sum
-        # New: for each level, compute weighted contribution and accumulate
-        output = torch.zeros(B, N_q, H, D_head, device=value.device, dtype=value.dtype)
+        index_tensors = [torch.arange(s, e, device=value.device) for s, e in zip(active_starts, active_ends)]
+        active_indices = torch.cat(index_tensors)
+        value_active = value[:, active_indices, :]
 
-        for lid in range(L):
-            H_l, W_l = spatial_shapes[lid].tolist()
-            start = level_start_index[lid].item()
-            end = start + H_l * W_l
+        k_active = self.key_proj(value_active)
+        v_active = self.value_proj(value_active)
 
-            # Extract this level's values
-            value_l = value[:, start:end, :, :]  # [B, H_l*W_l, H, D_head]
-            value_l = value_l.permute(0, 2, 3, 1)  # [B, H, D_head, H_l*W_l]
-            value_l = value_l.reshape(B * H, D_head, H_l, W_l)
+        kv_cache: List[Optional[Tuple[torch.Tensor, torch.Tensor, int, int]]] = [None] * self.n_levels
+        offset = 0
+        for lid in levels_to_compute:
+            H_l = int(spatial_shapes[lid][0])
+            W_l = int(spatial_shapes[lid][1])
+            n_tokens = H_l * W_l
+            kv_cache[lid] = (
+                k_active[:, offset:offset + n_tokens, :],
+                v_active[:, offset:offset + n_tokens, :],
+                H_l, W_l,
+            )
+            offset += n_tokens
 
-            # Extract this level's sampling grid
-            # grid_sample expects (x, y) where x is width (time), y is height (freq)
-            grid_l = sampling_grids[:, :, :, lid, :, :]  # [B, N_q, H, K, 2]
-            grid_l = grid_l.permute(0, 2, 1, 3, 4)  # [B, H, N_q, K, 2]
-            grid_l = grid_l.reshape(B * H, N_q, K, 2)
-
-            # Bilinear sampling
-            sampled = F.grid_sample(
-                value_l,
-                grid_l,
-                mode='bilinear',
-                padding_mode='zeros',
-                align_corners=False
-            )  # [B*H, D_head, N_q, K]
-
-            sampled = sampled.view(B, H, D_head, N_q, K)  # [B, H, D_head, N_q, K]
-
-            # Get this level's attention weights: [B, N_q, H, K]
-            attn_l = attention_weights[:, :, :, lid, :]  # [B, N_q, H, K]
-
-            # Weighted sum over K points for this level
-            # sampled: [B, H, D_head, N_q, K] -> permute to [B, N_q, H, D_head, K]
-            # attn_l: [B, N_q, H, K] -> [B, N_q, H, 1, K]
-            sampled = sampled.permute(0, 3, 1, 2, 4)  # [B, N_q, H, D_head, K]
-            attn_l = attn_l.unsqueeze(3)  # [B, N_q, H, 1, K]
-
-            # Accumulate: [B, N_q, H, D_head]
-            output = output + (sampled * attn_l).sum(dim=-1)
-
-        # Reshape: [B, N_q, D]
-        output = output.reshape(B, N_q, -1)
-
-        return output
-
-    def _deformable_attention_core_cached(
-        self,
-        level_values: List[torch.Tensor],  # pre-computed [B*H, D_head, H_l, W_l] per level
-        sampling_locations: torch.Tensor,   # [B, N_q, H, L, K, 2]
-        attention_weights: torch.Tensor,    # [B, N_q, H, L, K]
-    ) -> torch.Tensor:
-        """Deformable attention using pre-computed value cache.
-
-        Skips value_proj and per-level reshape (already done in compute_value_cache).
-        Uses accumulation instead of stack to save memory.
-        """
-        B, N_q, H, L, K, _ = sampling_locations.shape
-        D_head = level_values[0].shape[1]
-
-        # Convert to grid_sample format [-1, 1]
-        sampling_grids = 2 * sampling_locations - 1
-
-        # Accumulate weighted sum directly (no stack, saves memory)
-        output = torch.zeros(B, N_q, H, D_head, device=sampling_locations.device, dtype=level_values[0].dtype)
-
-        for lid in range(L):
-            value_l = level_values[lid]  # [B*H, D_head, H_l, W_l]
-
-            grid_l = sampling_grids[:, :, :, lid, :, :]  # [B, N_q, H, K, 2]
-            grid_l = grid_l.permute(0, 2, 1, 3, 4)  # [B, H, N_q, K, 2]
-            grid_l = grid_l.reshape(B * H, N_q, K, 2)
-
-            sampled = F.grid_sample(
-                value_l, grid_l,
-                mode='bilinear', padding_mode='zeros', align_corners=False,
-            )  # [B*H, D_head, N_q, K]
-
-            sampled = sampled.view(B, H, D_head, N_q, K)  # [B, H, D_head, N_q, K]
-
-            # Get this level's attention weights and accumulate
-            attn_l = attention_weights[:, :, :, lid, :]  # [B, N_q, H, K]
-            sampled = sampled.permute(0, 3, 1, 2, 4)  # [B, N_q, H, D_head, K]
-            attn_l = attn_l.unsqueeze(3)  # [B, N_q, H, 1, K]
-            output = output + (sampled * attn_l).sum(dim=-1)
-
-        output = output.reshape(B, N_q, -1)
-
-        return output
-
-
-class DeformableEncoderLayer(nn.Module):
-    """Encoder layer with deformable self-attention for multi-scale feature fusion."""
-
-    def __init__(
-        self,
-        d_model: int = 512,
-        n_heads: int = 8,
-        n_levels: int = 4,
-        n_points_freq: int = 2,
-        n_points_time: int = 2,
-        freq_offset_scale: float = 1.0,
-        time_offset_scale: float = 1.0,
-        ff_dim: int = 2048,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-
-        self.self_attn = FluxAttention(
-            d_model=d_model,
-            n_levels=n_levels,
-            n_heads=n_heads,
-            n_points_freq=n_points_freq,
-            n_points_time=n_points_time,
-            freq_offset_scale=freq_offset_scale,
-            time_offset_scale=time_offset_scale,
-        )
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ff_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, d_model),
-            nn.Dropout(dropout),
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-
-    def forward(
-        self,
-        src: torch.Tensor,               # [B, N, D]
-        reference_points: torch.Tensor,  # [B, N, L, 2]
-        spatial_shapes: torch.Tensor,    # [L, 2]
-        level_start_index: torch.Tensor,  # [L]
-        valid_ratios: torch.Tensor,      # [B, L, 2]
-    ) -> torch.Tensor:
-        # Self-attention
-        src2 = self.self_attn(
-            src, reference_points, src,
-            spatial_shapes, level_start_index, valid_ratios
-        )
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
-
-        # FFN
-        src = src + self.ffn(src)
-        src = self.norm2(src)
-
-        return src
+        return kv_cache

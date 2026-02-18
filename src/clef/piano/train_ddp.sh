@@ -125,9 +125,10 @@ fi
 # =============================================================================
 
 echo "Running command:"
-echo "CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$GPUS $CMD"
+echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$GPUS $CMD"
 echo ""
 
 cd "$(dirname "$0")/../../.."
 # CUDA_DEVICE_ORDER ensures consistent GPU numbering by PCI bus ID
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$GPUS $CMD
+# PYTORCH_CUDA_ALLOC_CONF prevents memory fragmentation (5GB reserved but unallocated)
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$GPUS $CMD
