@@ -357,6 +357,9 @@ class ClefCollator:
         mel_lengths = []
         input_ids_list = []
         labels_list = []
+        chunk_audio_measures_list = []
+        chunk_start_frames_list = []
+        chunk_end_frames_list = []
 
         for mel, tokens, meta in batch:
             # Ensure mel is [1, n_mels, T]
@@ -374,6 +377,11 @@ class ClefCollator:
             # Labels: everything except first token
             input_ids_list.append(tokens[:-1])
             labels_list.append(tokens[1:])
+
+            # Alignment info for guided attention (may be absent for unchunked samples)
+            chunk_audio_measures_list.append(meta.get('chunk_audio_measures', None))
+            chunk_start_frames_list.append(meta.get('chunk_start_frame', 0))
+            chunk_end_frames_list.append(meta.get('chunk_end_frame', mel.shape[-1]))
 
         # === Pad mels ===
         max_mel_len = max(mel_lengths)
@@ -411,6 +419,10 @@ class ClefCollator:
             'input_ids': torch.tensor(padded_input_ids, dtype=torch.long),
             'labels': torch.tensor(padded_labels, dtype=torch.long),
             'label_lengths': torch.tensor(seq_lengths, dtype=torch.long),
+            # Alignment info for guided attention loss (Python lists, not tensors)
+            'chunk_audio_measures': chunk_audio_measures_list,
+            'chunk_start_frames': chunk_start_frames_list,
+            'chunk_end_frames': chunk_end_frames_list,
         }
 
 

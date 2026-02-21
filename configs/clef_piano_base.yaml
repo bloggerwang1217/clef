@@ -72,21 +72,39 @@ model:
 
   bridge_layers: 2
 
-  # Decoder (2026-02-19: window_ca replaces deformable — robust to imprecise centers)
-  # Layer 0: Perceiver (S2+S3 → audio_latent, global harmony context)
-  # Layer 1: full_ca (SA + Full MHA on S2+S3: bootstrap temporal/freq grounding via attn CoM)
-  # Layer 2, 4, 6: Mamba-only (sequential writing)
-  # Layer 3: SA + Window CA (S0+S1: beat position, pitch register — center from L1 CoM)
-  # Layer 5: SA + Window CA (L0+L1: onset timing, precise pitch — center from L1 CoM)
-  decoder_layer_types: ["perceiver", "full_ca", "mamba_only", "window_ca", "mamba_only", "window_ca", "mamba_only"]
+  # Decoder (2026-02-20 v7: bar-token-aware full attention, no Perceiver)
+  # Layer 0: window_ca (SA + Bar Full-Attn on onset_1d + Window CA on S2+S3)
+  #   L1: window_ca — bar full-attn on onset_1d → bar_center; Window CA on S2+S3 (full freq)
+  #   L2: mamba_only — sequential writing
+  #   L3: window_ca — S1 full_freq → CoM → S0 windowed (cascade_com, t from L1 DSNT)
+  #   L4: mamba_only — sequential writing
+  #   L5: window_ca — Window CA on L0+L1 (windowed t+f, from L3 DSNT cascade)
+  #   L6: mamba_only — sequential writing
+  bar_token_id: 4   # <bar> token ID in the Zeng extended vocabulary
+  note_gru_hidden_size: 256
+  gradient_checkpointing: true  # recompute activations on backward to save memory
+  decoder_layer_types: ["window_ca", "mamba_only", "window_ca", "mamba_only", "window_ca", "mamba_only"]
   decoder_layer_ca_levels:
-    - null        # perceiver: no CA
-    - [4, 5]      # full_ca L1: S2+S3 (full attention, provides CoM for downstream window_ca)
-    - null        # mamba_only
-    - [2, 3]      # window_ca L3: S0+S1 (dense window, note level — beat, pitch register)
-    - null        # mamba_only
-    - [0, 1]      # window_ca L5: L0+L1 (dense window, onset+pitch precision)
-    - null        # mamba_only
+    - [4, 5]      # L1 window_ca: S2+S3 (coarse context, bar full-attn → bar_center)
+    - null        # L2 mamba_only
+    - [3, 2]      # L3 window_ca: S1 first (full_freq), then S0 windowed at S1's CoM
+    - null        # L4 mamba_only
+    - [0, 1]      # L5 window_ca: onset+pitch (fine, t+f from L3 DSNT cascade)
+    - null        # L6 mamba_only
+  decoder_layer_full_freq:
+    - true        # L1: full freq (S2+S3 only 8+4 freq bins, fine)
+    - null        # L2 mamba_only (ignored)
+    - [3]         # L3: only S1 (level 3) full_freq; S0 uses windowed at S1's CoM
+    - null        # L4 mamba_only (ignored)
+    - false       # L5: windowed t+f (fine-grained, L3 cascade already precise)
+    - null        # L6 mamba_only (ignored)
+  decoder_layer_cascade_com:
+    - false       # L1: both full_freq, no cascade needed
+    - null        # L2 mamba_only (ignored)
+    - true        # L3: S1 CoM → S0 window center
+    - null        # L4 mamba_only (ignored)
+    - false       # L5: windowed, no cascade
+    - null        # L6 mamba_only (ignored)
 
   # Window cross-attention parameters
   # Per-level window sizes (levels 0-3 used by window_ca; levels 4-5 S2/S3 by full_ca only)
@@ -98,11 +116,18 @@ model:
   mamba_d_state: 128
   mamba_d_conv: 4
   mamba_expand: 2
-  decoder_layers: 7
-  max_seq_len: 10000
+  decoder_layers: 6
+  max_seq_len: 8192
   vocab_size: 271
 
   label_smoothing: 0.0
+
+  # Guided attention loss — supervises L1 Full CA to align with audio measures.
+  # Weight cosine-decays from start → end, held constant during LR warmup.
+  # Start high to force temporal alignment early; end low to let CE dominate.
+  guidance_loss_weight: 10.0        # Enable to verify BarGRU com_t accuracy
+  guidance_loss_weight_end: 0.1    # Decay to small weight
+  guidance_decay_steps: 2500       # Match LR warmup
 
 # =============================================================================
 # Data
@@ -157,10 +182,10 @@ training:
   gradient_accumulation_steps: 2
   effective_batch_size: 4
 
-  learning_rate: 2.0e-5
+  learning_rate: 2.0e-4
   weight_decay: 0.01
   max_epochs: 50
-  warmup_steps: 5000
+  warmup_steps: 2500
   gradient_clip: 1.0
 
   save_every_n_epochs: 10

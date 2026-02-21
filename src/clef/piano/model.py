@@ -20,6 +20,8 @@ import torch.nn.functional as F
 from transformers import Swinv2Model
 
 from .config import ClefPianoConfig
+from .guided_attn import build_guidance_bounds
+from ..bar_tracker import BarTracker
 from ..bridge import DeformableBridge
 from ..decoder import ClefDecoder, MambaOnlyLayer
 from ..flow import HarmonizingFlow, Octopus2D
@@ -77,6 +79,19 @@ class ClefPianoBase(nn.Module):
             # Small weight init: onset starts with minimal influence, grows if useful
             nn.init.normal_(self.onset_to_pitch.weight, mean=0, std=0.01)
             nn.init.zeros_(self.onset_to_pitch.bias)
+
+            # Bar Tracker: symmetric to Flow, extracts temporal structure from Octopus
+            if getattr(config, 'use_bar_tracker', False):
+                freq_pool = getattr(config, 'octopus_freq_pool_stride', 4)
+                self.bar_tracker = BarTracker(
+                    in_channels=octopus_channels,
+                    freq_bins=128 // freq_pool,
+                    d_model=getattr(config, 'bar_tracker_d_model', 256),
+                    n_layers=getattr(config, 'bar_tracker_n_layers', 2),
+                    d_state=getattr(config, 'bar_tracker_d_state', 64),
+                )
+            else:
+                self.bar_tracker = None
 
         # === HarmonizingFlow (optional, pitch space transform) ===
         self.use_flow = getattr(config, 'use_flow', False)
@@ -169,10 +184,17 @@ class ClefPianoBase(nn.Module):
             window_seq_chunk_size=config.window_seq_chunk_size,
             decoder_layer_types=config.decoder_layer_types,
             decoder_layer_ca_levels=getattr(config, 'decoder_layer_ca_levels', None),
+            decoder_layer_full_freq=getattr(config, 'decoder_layer_full_freq', None),
+            decoder_layer_cascade_com=getattr(config, 'decoder_layer_cascade_com', None),
+            window_ca_use_checkpoint=getattr(config, 'window_ca_use_checkpoint', True),
             d_state=config.mamba_d_state,
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
             use_rope=self.use_rope,
+            bar_token_id=getattr(config, 'bar_token_id', 4),  # default 4 for backward compat
+            onset_1d_channels=getattr(config, 'octopus_channels', 32),
+            note_gru_hidden_size=getattr(config, 'note_gru_hidden_size', 256),
+            note_gru_input_dropout=getattr(config, 'note_gru_input_dropout', 0.1),
         )
 
         # === Output ===
@@ -198,6 +220,13 @@ class ClefPianoBase(nn.Module):
         self.decoder.norm.apply(self._init_weights)
         self._init_weights(self.token_embed)
         self._init_weights(self.output_head)
+
+        # Gradient checkpointing
+        if getattr(config, 'gradient_checkpointing', False):
+            self.decoder.gradient_checkpointing = True
+            if hasattr(self.swin, 'gradient_checkpointing_enable'):
+                self.swin.gradient_checkpointing_enable()
+
         if self.use_octopus:
             self.octopus.apply(self._init_weights)
         # NOTE: Flow.transform is NOT re-initialized here — it uses physics init
@@ -337,6 +366,11 @@ class ClefPianoBase(nn.Module):
             features, spatial_shapes_list, level_valid_ratios
         )
 
+        # Ensure _cached_onset_1d is accessible after encode() (set by _encode_serial).
+        # If not serial mode, onset_1d is None (bar attention is a no-op).
+        if not hasattr(self, '_cached_onset_1d'):
+            self._cached_onset_1d = None
+
         return memory, spatial_shapes, level_start_index, valid_ratios
 
     def _encode_serial(
@@ -362,11 +396,30 @@ class ClefPianoBase(nn.Module):
         # Calculate spatial shape from pooling strides
         freq_pool = getattr(self.config, 'octopus_freq_pool_stride', 4)
         time_pool = getattr(self.config, 'octopus_time_pool_stride', 2)
+
+        # Compute onset_1d: F-pooled Octopus for bar attention in L0 decoder layer.
+        # onset_raw: [B, C, F=128, T] → mean over F → [B, C, T] → permute → [B, T_octopus, C]
+        # Symmetric to Flow's pitch projection: Flow projects along F, onset_1d pools along F.
+        onset_1d = onset_raw.mean(dim=2).permute(0, 2, 1)  # [B, T_octopus, C]
+        self._cached_onset_1d = onset_1d
         H_onset = 128 // freq_pool  # 128 mels / 4 = 32
         W_onset = T // time_pool
         features.append(onset_level)
         spatial_shapes_list.append((H_onset, W_onset))
         valid_ratios_list.append([1.0, 1.0])
+
+        # Step 1.5: Bar Tracker — extracts temporal structure from onset_raw
+        # Symmetric to Flow: Flow extracts pitch (along F), BarTracker extracts time (along T)
+        # onset_raw: [B, C, 128, T] (pre-pooling, full frequency resolution)
+        if self.bar_tracker is not None:
+            # bar_times and audio_duration_frames are injected by forward() before calling _encode_serial
+            bar_times = getattr(self, '_bar_tracker_bar_times', None)
+            audio_duration_frames = getattr(self, '_bar_tracker_audio_duration', None)
+            bar_phase, bar_tracker_loss = self.bar_tracker(
+                onset_raw, bar_times=bar_times, audio_duration_frames=audio_duration_frames
+            )
+            self._cached_bar_phase = bar_phase              # [B, T_octopus, 1]
+            self._cached_bar_tracker_loss = bar_tracker_loss  # scalar or None
 
         # Step 2: Flow — harmonic template matching on raw mel (IC eats stellate, not octopus)
         # use_temporal_cnn=False in serial mode, so flow returns tensor directly
@@ -630,6 +683,9 @@ class ClefPianoBase(nn.Module):
         past_states: Optional[list] = None,
         use_cache: bool = False,
         value_cache: Optional[list] = None,
+        guidance_bounds: Optional[torch.Tensor] = None,  # [B, S, 2] or None
+        onset_1d: Optional[torch.Tensor] = None,         # [B, T_octopus, C] or None
+        tf_ratio: float = 1.0,                            # scheduled sampling ratio for BarGRU
     ):
         """Decode with Jamba hybrid decoder.
 
@@ -642,6 +698,7 @@ class ClefPianoBase(nn.Module):
             past_states: List of per-layer state (KV tuple for SA, InferenceParams for Mamba)
             use_cache: Whether to return updated states
             value_cache: Pre-computed cross-attn value maps (from prepare_value_cache)
+            onset_1d: [B, T_octopus, C] Octopus F-pooled features for bar attention in L0.
 
         Returns:
             Without use_cache: logits [B, S, vocab_size]
@@ -676,6 +733,10 @@ class ClefPianoBase(nn.Module):
                 past_states=past_states,
                 use_cache=True,
                 value_cache_list=value_cache,
+                guidance_bounds=guidance_bounds,
+                onset_1d=onset_1d,
+                input_ids=input_ids,
+                tf_ratio=tf_ratio,
             )
             # Increment Mamba InferenceParams.seqlen_offset after each step.
             # mamba-ssm does NOT auto-increment; the caller must do it.
@@ -704,6 +765,10 @@ class ClefPianoBase(nn.Module):
                 tgt, memory,
                 spatial_shapes, level_start_index, valid_ratios,
                 tgt_pos=tgt_pos,
+                guidance_bounds=guidance_bounds,
+                onset_1d=onset_1d,
+                input_ids=input_ids,
+                tf_ratio=tf_ratio,
             )
             logits = self.output_head(tgt)
             return logits
@@ -714,6 +779,11 @@ class ClefPianoBase(nn.Module):
         input_ids: torch.Tensor,        # [B, S]
         labels: Optional[torch.Tensor] = None,  # [B, S]
         mel_valid_ratios: Optional[torch.Tensor] = None,
+        chunk_audio_measures: Optional[list] = None,  # per-sample List[dict] or None
+        chunk_start_frames: Optional[list] = None,    # per-sample int or None
+        chunk_end_frames: Optional[list] = None,      # per-sample int or None
+        guidance_loss_weight: Optional[float] = None, # overrides config (for schedule)
+        tf_ratio: float = 1.0,                        # scheduled sampling ratio for BarGRU
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Full forward pass.
 
@@ -722,34 +792,111 @@ class ClefPianoBase(nn.Module):
             input_ids: Input token IDs (shifted right) [B, S]
             labels: Target labels (original sequence) [B, S]
             mel_valid_ratios: Time-axis valid ratio [B]
+            chunk_audio_measures: Per-sample list of measure timing dicts
+                [{'start_sec': float, 'end_sec': float}, ...] or None.
+                Used to build the guided attention target G for L1 Full CA.
+            chunk_start_frames: Per-sample chunk start frame in mel spectrogram.
+                Required when chunk_audio_measures is provided.
+            chunk_end_frames: Per-sample chunk end frame in mel spectrogram.
+                Required when chunk_audio_measures is provided.
 
         Returns:
             logits: Output logits [B, S, vocab_size]
-            loss: CE loss (if labels provided)
+            loss: CE loss + guidance_loss_weight * guidance_loss (if labels provided)
         """
+        # Prepare Bar Tracker inputs (injected before encode, consumed in _encode_serial)
+        if self.bar_tracker is not None and chunk_audio_measures is not None:
+            fps = self.config.sample_rate / self.config.hop_length  # typically 100
+            time_pool = getattr(self.config, 'octopus_time_pool_stride', 2)
+            bar_times_list = []
+            for b, (measures, start_f) in enumerate(
+                zip(chunk_audio_measures, chunk_start_frames or [0] * len(chunk_audio_measures))
+            ):
+                if measures is None:
+                    bar_times_list.append(None)
+                    continue
+                # Convert bar start_sec → Octopus-resolution frame index (relative to chunk)
+                onsets = torch.tensor(
+                    [(m['start_sec'] * fps - start_f) / time_pool for m in measures],
+                    dtype=torch.float32,
+                )
+                # Clamp to valid range
+                T_octopus = mel.shape[-1] // time_pool
+                onsets = onsets.clamp(0, T_octopus - 1)
+                bar_times_list.append(onsets)
+            T_octopus = mel.shape[-1] // time_pool
+            audio_duration = torch.full(
+                (mel.shape[0],), T_octopus, dtype=torch.float32, device=mel.device
+            )
+            self._bar_tracker_bar_times = bar_times_list
+            self._bar_tracker_audio_duration = audio_duration
+        else:
+            self._bar_tracker_bar_times = None
+            self._bar_tracker_audio_duration = None
+
         # Encode
         memory, spatial_shapes, level_start_index, valid_ratios = self.encode(
             mel, mel_valid_ratios
         )
 
-        # Decode
+        # Resolve effective guidance weight (runtime override > config)
+        eff_guidance_weight = (guidance_loss_weight
+                               if guidance_loss_weight is not None
+                               else self.config.guidance_loss_weight)
+
+        # Build per-token guidance bounds [B, S, 2] (training only)
+        guidance_bounds = None
+        if (self.training
+                and eff_guidance_weight > 0.0
+                and chunk_audio_measures is not None
+                and chunk_start_frames is not None
+                and chunk_end_frames is not None
+                and labels is not None):
+            guidance_bounds = build_guidance_bounds(
+                input_ids=input_ids,
+                chunk_audio_measures_list=chunk_audio_measures,
+                chunk_start_frames=chunk_start_frames,
+                chunk_end_frames=chunk_end_frames,
+            )
+
+        # Decode (pass onset_1d for bar full-attention in L0)
+        onset_1d = getattr(self, '_cached_onset_1d', None)
         logits = self.decode(
             input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
+            guidance_bounds=guidance_bounds,
+            onset_1d=onset_1d,
+            tf_ratio=tf_ratio,
         )
 
-        # Compute loss (CE only)
+        # Compute loss
         loss = None
         if labels is not None:
             loss_fn = nn.CrossEntropyLoss(
                 ignore_index=0,  # <pad> token
                 label_smoothing=self.config.label_smoothing,
             )
-            loss = loss_fn(
+            ce_loss = loss_fn(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1)
             )
+            loss = ce_loss
 
-        return logits, loss
+            # Add guidance loss if available
+            if eff_guidance_weight > 0.0:
+                guidance_loss = getattr(self.decoder, '_cached_guidance_loss', None)
+                if guidance_loss is not None:
+                    total_loss = ce_loss + eff_guidance_weight * guidance_loss
+                    return logits, ce_loss, total_loss
+
+            # Add bar tracker guidance loss if available
+            bar_tracker_weight = getattr(self.config, 'bar_tracker_loss_weight', 0.0)
+            if bar_tracker_weight > 0.0:
+                bt_loss = getattr(self, '_cached_bar_tracker_loss', None)
+                if bt_loss is not None:
+                    total_loss = ce_loss + bar_tracker_weight * bt_loss
+                    return logits, ce_loss, total_loss
+
+        return logits, loss, loss
 
     def _init_inference_states(self, batch_size: int, max_length: int, device: torch.device) -> list:
         """Initialize per-layer inference states.
@@ -827,6 +974,9 @@ class ClefPianoBase(nn.Module):
         # Encode once
         memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
 
+        # Capture onset_1d produced by _encode_serial for bar attention
+        onset_1d = getattr(self, '_cached_onset_1d', None)
+
         # Pre-compute cross-attention value projections (avoid recomputing each step)
         value_cache = self.prepare_value_cache(memory, spatial_shapes, level_start_index)
 
@@ -844,6 +994,7 @@ class ClefPianoBase(nn.Module):
                 input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
                 past_states=past_states, use_cache=True,
                 value_cache=value_cache,
+                onset_1d=onset_1d,
             )
 
             # Get last token logits
@@ -1122,12 +1273,18 @@ class ClefPianoBase(nn.Module):
         # Encode once
         memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
 
+        # Capture onset_1d produced by _encode_serial for bar attention
+        onset_1d = getattr(self, '_cached_onset_1d', None)
+
         # Pre-compute cross-attention value projections before beam expansion
         value_cache = self.prepare_value_cache(memory, spatial_shapes, level_start_index)
 
         # Expand encoder outputs for beams: B -> B * num_beams
         memory = memory.repeat_interleave(num_beams, dim=0)
         valid_ratios = valid_ratios.repeat_interleave(num_beams, dim=0)
+        # Expand onset_1d for beams: [B, T, C] -> [B*num_beams, T, C]
+        if onset_1d is not None:
+            onset_1d = onset_1d.repeat_interleave(num_beams, dim=0)
         # spatial_shapes and level_start_index are shared (no batch dim)
         # Expand value_cache for beams: [B, N_l, D] -> [B*num_beams, N_l, D]
 
@@ -1177,6 +1334,7 @@ class ClefPianoBase(nn.Module):
                 input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
                 past_states=past_states, use_cache=True,
                 value_cache=value_cache,
+                onset_1d=onset_1d,
             )
 
             # Get vocab logits: [B * num_beams, vocab_size]

@@ -7,7 +7,7 @@ Extends base ClefConfig with piano-specific settings.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 from ..config import ClefConfig
 
@@ -22,6 +22,45 @@ class ClefPianoConfig(ClefConfig):
 
     # Piano-specific defaults
     vocab_size: int = 512   # ~220 factorized tokens + padding
+
+    # Guided attention loss weight schedule.
+    # weight held at guidance_loss_weight during warmup, then cosine-decays to
+    # guidance_loss_weight_end by guidance_decay_steps (independent of max_epochs).
+    # Supervises L1 Full CA to attend to the correct audio measure.
+    guidance_loss_weight: float = 0.0        # starting weight (high → forces CA alignment)
+    guidance_loss_weight_end: float = 0.0    # final weight after decay (lower → CE dominates)
+    guidance_decay_steps: int = 0            # step at which decay reaches end (0 = use total_steps)
+
+    # Bar token ID for L1 bar full-attention (Zeng extended vocabulary).
+    # <bar> tokens attend to onset_1d to compute bar_center (temporal authority).
+    bar_token_id: int = 4
+
+    # Global NoteGRU redesign (global-notegru-plan.md)
+    # bar_gru: cross-bar time tracking; note_gru: token-level shared time prior
+    bar_gru_hidden_size: int = 256
+    bar_gru_input_dropout: float = 0.1   # dropout on note_gru output before bar_gru input
+    note_gru_hidden_size: int = 256
+    note_gru_input_dropout: float = 0.1  # dropout on note_gru input projection
+    tf_anneal_steps: int = 5000          # step at which tf_ratio reaches 0.0 (linear from warmup_steps)
+
+    # Per-layer full_freq config for window_ca layers.
+    # Each entry: True (all levels), False (none), or List[int] (specific level IDs).
+    decoder_layer_full_freq: Optional[List] = None
+    # Per-layer cascade_com flag: after each level, use its CoM as next level's window center.
+    decoder_layer_cascade_com: Optional[List] = None
+
+    # Bar Tracker (symmetric to Flow: extracts temporal structure from Octopus)
+    # Toggle: set bar_tracker_loss_weight > 0 to enable supervised bar phase guidance.
+    # Requires use_octopus=True.
+    use_bar_tracker: bool = False
+    bar_tracker_d_model: int = 256
+    bar_tracker_n_layers: int = 2
+    bar_tracker_d_state: int = 64
+    bar_tracker_loss_weight: float = 0.0     # 0 = disabled (no GT supervision)
+
+    # Gradient checkpointing (trades compute for memory)
+    gradient_checkpointing: bool = False
+    window_ca_use_checkpoint: bool = True  # checkpoint per seq-chunk inside WindowCrossAttention
 
     # Chunking for long pieces
     chunk_frames: int = 24000           # 4 min @ 100 fps (primary)
@@ -109,11 +148,39 @@ class ClefPianoConfig(ClefConfig):
             refine_range=model_cfg.get("refine_range", defaults.refine_range),
             rope_base=model_cfg.get("rope_base", defaults.rope_base),
 
+            # Bar attention
+            bar_token_id=model_cfg.get("bar_token_id", defaults.bar_token_id),
+
+            # Global NoteGRU redesign
+            bar_gru_hidden_size=model_cfg.get("bar_gru_hidden_size", defaults.bar_gru_hidden_size),
+            bar_gru_input_dropout=model_cfg.get("bar_gru_input_dropout", defaults.bar_gru_input_dropout),
+            note_gru_hidden_size=model_cfg.get("note_gru_hidden_size", defaults.note_gru_hidden_size),
+            note_gru_input_dropout=model_cfg.get("note_gru_input_dropout", defaults.note_gru_input_dropout),
+            tf_anneal_steps=training_cfg.get("tf_anneal_steps", defaults.tf_anneal_steps),
+
+            # Bar Tracker
+            use_bar_tracker=model_cfg.get("use_bar_tracker", defaults.use_bar_tracker),
+            bar_tracker_d_model=model_cfg.get("bar_tracker_d_model", defaults.bar_tracker_d_model),
+            bar_tracker_n_layers=model_cfg.get("bar_tracker_n_layers", defaults.bar_tracker_n_layers),
+            bar_tracker_d_state=model_cfg.get("bar_tracker_d_state", defaults.bar_tracker_d_state),
+            bar_tracker_loss_weight=model_cfg.get("bar_tracker_loss_weight", defaults.bar_tracker_loss_weight),
+
+            # Guided attention loss
+            guidance_loss_weight=model_cfg.get("guidance_loss_weight", defaults.guidance_loss_weight),
+            guidance_loss_weight_end=model_cfg.get("guidance_loss_weight_end",
+                                                   model_cfg.get("guidance_loss_weight",  # fallback = same as start
+                                                                  defaults.guidance_loss_weight_end)),
+            guidance_decay_steps=model_cfg.get("guidance_decay_steps", defaults.guidance_decay_steps),
+
             # Architecture
             bridge_layers=model_cfg.get("bridge_layers", defaults.bridge_layers),
             decoder_layers=model_cfg.get("decoder_layers", defaults.decoder_layers),
             decoder_layer_types=model_cfg.get("decoder_layer_types", defaults.decoder_layer_types),
             decoder_layer_ca_levels=model_cfg.get("decoder_layer_ca_levels", defaults.decoder_layer_ca_levels),
+            decoder_layer_full_freq=model_cfg.get("decoder_layer_full_freq", defaults.decoder_layer_full_freq),
+            decoder_layer_cascade_com=model_cfg.get("decoder_layer_cascade_com", defaults.decoder_layer_cascade_com),
+            gradient_checkpointing=model_cfg.get("gradient_checkpointing", defaults.gradient_checkpointing),
+            window_ca_use_checkpoint=model_cfg.get("window_ca_use_checkpoint", defaults.window_ca_use_checkpoint),
             mamba_d_state=model_cfg.get("mamba_d_state", defaults.mamba_d_state),
             mamba_d_conv=model_cfg.get("mamba_d_conv", defaults.mamba_d_conv),
             mamba_expand=model_cfg.get("mamba_expand", defaults.mamba_expand),

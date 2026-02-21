@@ -51,6 +51,10 @@ class WindowCrossAttention(nn.Module):
         window_time: Union[int, List[int]] = 16,   # int (all levels) or List[int] (per level)
         window_freq: Union[int, List[int]] = 8,    # int (all levels) or List[int] (per level)
         seq_chunk_size: int = 512,  # process N_q in chunks to bound peak memory
+        full_freq: bool = False,    # if True, attend to all freq bins (ignore window_freq)
+        full_freq_levels: Optional[List[int]] = None,  # per-level full_freq override (overrides full_freq)
+        cascade_com: bool = False,  # after each level, use its CoM as center for the next level
+        use_checkpoint: bool = True,  # gradient checkpoint per seq-chunk during training
     ):
         super().__init__()
 
@@ -73,6 +77,10 @@ class WindowCrossAttention(nn.Module):
         # Legacy scalar aliases (for any code that reads .window_time / .window_freq)
         self.window_time = self.window_time_per_level[0]
         self.window_freq = self.window_freq_per_level[0]
+        self.full_freq = full_freq
+        self.full_freq_levels = set(full_freq_levels) if full_freq_levels is not None else None
+        self.cascade_com = cascade_com
+        self.use_checkpoint = use_checkpoint
 
         self.query_proj = nn.Linear(d_model, d_model)
         self.key_proj = nn.Linear(d_model, d_model)
@@ -95,7 +103,8 @@ class WindowCrossAttention(nn.Module):
         lid: int,
         H_l: int,
         W_l: int,
-    ) -> Tuple[torch.Tensor, int]:
+        force_full_freq: bool = False,
+    ) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]:
         """Gather window tokens for one level using nearest-neighbour integer indexing.
 
         Single gather call (vs. 4 bilinear-corner calls). For a dense window
@@ -106,12 +115,15 @@ class WindowCrossAttention(nn.Module):
         Returns:
             tokens:  [B, C, K_l, D]
             K_l:     int
+            t_norm:  [B, C, K_l]  normalized time positions of window tokens in [0, 1]
+            f_norm:  [B, C, K_l]  normalized freq positions of window tokens in [0, 1]
         """
         B, C = tc_chunk.shape
         device = value.device
 
         wt = min(self.window_time_per_level[lid], W_l)
-        wf = min(self.window_freq_per_level[lid], H_l) if H_l > 1 else 1
+        is_full = force_full_freq or self.full_freq or H_l == 1
+        wf = H_l if is_full else min(self.window_freq_per_level[lid], H_l)
         K_l = wt * wf
 
         # Nearest-pixel centre (align_corners=False: px = x*W - 0.5, then round)
@@ -139,14 +151,22 @@ class WindowCrossAttention(nn.Module):
         flat_idx = level_offset + fc_c * W_l + tc_c           # [B, C, K_l]
 
         # Single gather: [B, C*K_l, D] → reshape [B, C, K_l, D]
+        # Cast to tc_chunk dtype (bf16 under autocast) so gathered tokens don't
+        # inherit fp32 from LayerNorm in bridge — [1,N_q,256,512] fp32 = 4.88 GiB → OOM.
         idx_exp = flat_idx.reshape(B, C * K_l).unsqueeze(-1).expand(B, C * K_l, self.d_model)
-        tokens = value.gather(1, idx_exp).reshape(B, C, K_l, self.d_model)
+        tokens = value.to(tc_chunk.dtype).gather(1, idx_exp).reshape(B, C, K_l, self.d_model)
 
         # Zero out OOB positions so they don't contribute to attention
         if oob.any():
-            tokens = tokens.masked_fill(oob.unsqueeze(-1), 0.0)
+            tokens.masked_fill_(oob.unsqueeze(-1), 0.0)
 
-        return tokens, K_l
+        # Normalized spatial positions of window tokens (pixel centre → [0, 1]).
+        # Used for DSNT-style CoM: CoM = Σ_j softmax(score_j) * t_norm_j.
+        # Clamped positions are used (same as actual gathered tokens).
+        t_norm = (tc_c.float() + 0.5) / W_l   # [B, C, K_l]
+        f_norm = (fc_c.float() + 0.5) / H_l   # [B, C, K_l]
+
+        return tokens, K_l, t_norm, f_norm
 
     def _forward_chunk(
         self,
@@ -159,8 +179,14 @@ class WindowCrossAttention(nn.Module):
         level_start_index: torch.Tensor,
         B: int,
         C: int,
-    ) -> torch.Tensor:
-        """Process one chunk of C decoder queries. Returns [B, C, D].
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Process one chunk of C decoder queries.
+
+        Returns (output [B,C,D], com_t [B,C], com_f [B,C]).
+
+        com_t / com_f: DSNT-style center-of-mass (Nibali et al. 2018) — the
+        attention-weighted expected time/freq position of the window tokens.
+        Used by the next window_ca layer as a refined window center.
 
         For each level, gathers only the window tokens from the raw encoder
         sequence, projects them to K/V, then accumulates with online softmax.
@@ -174,44 +200,93 @@ class WindowCrossAttention(nn.Module):
         # Online softmax state
         out_acc = None
         lse_acc = None
+        # DSNT CoM accumulators [B, C, H]
+        com_t_acc = None
+        com_f_acc = None
+
+        # Window center (updated per level when cascade_com=True)
+        tc_curr = tc_chunk
+        fc_curr = fc_chunk
 
         for lid in levels:
             H_l = int(spatial_shapes[lid][0])
             W_l = int(spatial_shapes[lid][1])
 
-            # Gather bilinear-interpolated window tokens: [B, C, K_l, D]
-            tokens, K_l = self._gather_window_tokens(
-                value, level_start_index, tc_chunk, fc_chunk, lid, H_l, W_l
+            # Per-level full_freq: either the global flag or an explicit level set
+            force_full = (
+                self.full_freq_levels is not None and lid in self.full_freq_levels
             )
 
-            # Project gathered tokens to K/V: [B, C, K_l, D]
+            # --- K pass: gather tokens, project to K, free tokens before V pass ---
+            # Peak: tokens [B,C,K_l,D] + k_gathered [B,C,K_l,D] = 2× token size
+            # (avoids the previous 3× peak of tokens+k_gathered+v_gathered)
+            tokens, K_l, t_norm_l, f_norm_l = self._gather_window_tokens(
+                value, level_start_index, tc_curr, fc_curr, lid, H_l, W_l,
+                force_full_freq=force_full,
+            )
             k_gathered = self.key_proj(tokens)
-            v_gathered = self.value_proj(tokens)
+            del tokens  # free before v pass
+            k_s = k_gathered.view(B, C, K_l, self.n_heads, self.head_dim).permute(0, 1, 3, 2, 4).contiguous()
+            del k_gathered
 
-            # [B, C, K_l, H, D_head] → [B, C, H, K_l, D_head]
-            k_s = k_gathered.view(B, C, K_l, self.n_heads, self.head_dim).permute(0, 1, 3, 2, 4)
-            v_s = v_gathered.view(B, C, K_l, self.n_heads, self.head_dim).permute(0, 1, 3, 2, 4)
-
-            # scores: [B, C, H, 1, K_l]
+            # Compute scores and softmax weights, then free K
+            # scores: [B, C, H, 1, K_l]  (tiny: N_q×H×K_l × 2 bytes)
             scores_l = torch.matmul(q_exp, k_s.transpose(-1, -2)) / scale
-
-            # Online softmax accumulation
+            del k_s  # free K before V gather
             lse_l = torch.logsumexp(scores_l, dim=-1, keepdim=True)  # [B, C, H, 1, 1]
             w_l = torch.exp(scores_l - lse_l)                        # [B, C, H, 1, K_l]
+            del scores_l
+
+            # --- V pass: re-gather tokens (cheap), project to V ---
+            # Peak now: w_l (tiny) + tokens_v + v_gathered = 2× token size
+            tokens_v, _, _, _ = self._gather_window_tokens(
+                value, level_start_index, tc_curr, fc_curr, lid, H_l, W_l,
+                force_full_freq=force_full,
+            )
+            v_gathered = self.value_proj(tokens_v)
+            del tokens_v
+            v_s = v_gathered.view(B, C, K_l, self.n_heads, self.head_dim).permute(0, 1, 3, 2, 4).contiguous()
+            del v_gathered
+
             out_l = torch.matmul(w_l, v_s).squeeze(-2)               # [B, C, H, D_head]
+            del v_s
+
+            # DSNT CoM for this level (per head, then average across heads later):
+            # CoM_l = Σ_j softmax_within_l(score_j) * pos_j   [B, C, H]
+            t_l = t_norm_l.to(w_l.dtype).unsqueeze(2).unsqueeze(2)  # [B, C, 1, 1, K_l]
+            f_l = f_norm_l.to(w_l.dtype).unsqueeze(2).unsqueeze(2)
+            com_t_l = (w_l * t_l).sum(-1).squeeze(-1)  # [B, C, H]
+            com_f_l = (w_l * f_l).sum(-1).squeeze(-1)
 
             if lse_acc is None:
                 out_acc = out_l
                 lse_acc = lse_l.squeeze(-1)                           # [B, C, H, 1]
+                com_t_acc = com_t_l
+                com_f_acc = com_f_l
             else:
                 lse_l_sq = lse_l.squeeze(-1)
                 lse_new = torch.logaddexp(lse_acc, lse_l_sq)
-                alpha_prev = torch.exp(lse_acc - lse_new)
+                alpha_prev = torch.exp(lse_acc - lse_new)             # [B, C, H, 1]
                 alpha_curr = torch.exp(lse_l_sq - lse_new)
                 out_acc = alpha_prev * out_acc + alpha_curr * out_l
+                # CoM: use same cross-level weighting as output accumulation
+                a_prev = alpha_prev.squeeze(-1)                        # [B, C, H]
+                a_curr = alpha_curr.squeeze(-1)
+                com_t_acc = a_prev * com_t_acc + a_curr * com_t_l
+                com_f_acc = a_prev * com_f_acc + a_curr * com_f_l
                 lse_acc = lse_new
 
-        return out_acc.reshape(B, C, -1)  # [B, C, D]
+            # Cascade: use this level's CoM as window center for the next level.
+            # Enables coarse-to-fine refinement within a single WindowCrossAttention.
+            # E.g. L3: S1 (full_freq) → CoM → S0 (windowed at CoM).
+            if self.cascade_com:
+                tc_curr = com_t_l.mean(2).detach()  # [B, C], head-averaged, no grad through center
+                fc_curr = com_f_l.mean(2).detach()
+
+        # Head-average CoM: [B, C, H] → [B, C]
+        com_t = com_t_acc.mean(2)
+        com_f = com_f_acc.mean(2)
+        return out_acc.reshape(B, C, -1), com_t, com_f
 
     def forward(
         self,
@@ -223,8 +298,17 @@ class WindowCrossAttention(nn.Module):
         level_start_index: torch.Tensor,   # [L]
         active_levels: Optional[List[int]] = None,
         kv_cache: Optional[list] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Dense window cross-attention with chunked sequence processing.
+
+        Returns:
+            output:  [B, N_q, D]   — projected attention output
+            com_t:   [B, N_q, 1]  — DSNT attention CoM in time  (refined window center)
+            com_f:   [B, N_q, 1]  — DSNT attention CoM in freq  (refined window center)
+
+        com_t / com_f are the attention-weighted expected positions of the window
+        tokens: CoM = Σ_j softmax(score_j) * pos_j.  Passed to the next window_ca
+        layer (L3 → L5) for cascaded coarse-to-fine window center refinement.
 
         kv_cache: if provided (inference), list of (k_seq, v_seq, H_l, W_l)
         per level (None for inactive).  During training, kv_cache=None and
@@ -242,24 +326,28 @@ class WindowCrossAttention(nn.Module):
 
         if kv_cache is not None:
             # Inference path: use pre-projected K/V sequences (no checkpointing needed)
-            out = self._forward_with_cache(q, tc, fc, kv_cache, levels, spatial_shapes, B, N_q)
+            out, com_t, com_f = self._forward_with_cache(q, tc, fc, kv_cache, levels, spatial_shapes, B, N_q)
         elif N_q <= self.seq_chunk_size:
-            out = self._run_chunk(q, tc, fc, value, levels, spatial_shapes, level_start_index, B, N_q)
+            out, com_t, com_f = self._run_chunk(q, tc, fc, value, levels, spatial_shapes, level_start_index, B, N_q)
         else:
-            chunks = []
+            out_chunks, com_t_chunks, com_f_chunks = [], [], []
             for start in range(0, N_q, self.seq_chunk_size):
                 end = min(start + self.seq_chunk_size, N_q)
                 C = end - start
-                out_c = self._run_chunk(
+                out_c, com_t_c, com_f_c = self._run_chunk(
                     q[:, start:end],
                     tc[:, start:end],
                     fc[:, start:end],
                     value, levels, spatial_shapes, level_start_index, B, C,
                 )
-                chunks.append(out_c)
-            out = torch.cat(chunks, dim=1)
+                out_chunks.append(out_c)
+                com_t_chunks.append(com_t_c)
+                com_f_chunks.append(com_f_c)
+            out = torch.cat(out_chunks, dim=1)
+            com_t = torch.cat(com_t_chunks, dim=1)
+            com_f = torch.cat(com_f_chunks, dim=1)
 
-        return self.output_proj(out)
+        return self.output_proj(out), com_t.unsqueeze(-1), com_f.unsqueeze(-1)
 
     def _run_chunk(
         self,
@@ -272,15 +360,15 @@ class WindowCrossAttention(nn.Module):
         level_start_index: torch.Tensor,
         B: int,
         C: int,
-    ) -> torch.Tensor:
-        if not self.training:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (output [B,C,D], com_t [B,C], com_f [B,C])."""
+        if not self.training or not self.use_checkpoint:
             return self._forward_chunk(
                 q_chunk, tc_chunk, fc_chunk,
                 value, levels, spatial_shapes, level_start_index, B, C,
             )
         # Gradient checkpointing: recompute _forward_chunk on backward instead of
         # storing all intermediate activations (K/V projections, gathered tokens).
-        # Non-tensor args (levels, B, C) captured by closure.
         def fn(q_chunk, tc_chunk, fc_chunk, value, spatial_shapes, level_start_index):
             return self._forward_chunk(
                 q_chunk, tc_chunk, fc_chunk,
@@ -302,22 +390,26 @@ class WindowCrossAttention(nn.Module):
         spatial_shapes: torch.Tensor,
         B: int,
         N_q: int,
-    ) -> torch.Tensor:
-        """Inference path: K/V already projected, use bilinear gather from cache seqs."""
-        scale = math.sqrt(self.head_dim)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Inference path: K/V already projected, use bilinear gather from cache seqs.
 
+        Returns (output [B,N_q,D], com_t [B,N_q], com_f [B,N_q]).
+        """
         if N_q <= self.seq_chunk_size:
             return self._cache_chunk(q, tc, fc, kv_cache, levels, spatial_shapes, B, N_q)
 
-        chunks = []
+        out_chunks, com_t_chunks, com_f_chunks = [], [], []
         for start in range(0, N_q, self.seq_chunk_size):
             end = min(start + self.seq_chunk_size, N_q)
             C = end - start
-            chunks.append(self._cache_chunk(
+            out_c, com_t_c, com_f_c = self._cache_chunk(
                 q[:, start:end], tc[:, start:end], fc[:, start:end],
                 kv_cache, levels, spatial_shapes, B, C,
-            ))
-        return torch.cat(chunks, dim=1)
+            )
+            out_chunks.append(out_c)
+            com_t_chunks.append(com_t_c)
+            com_f_chunks.append(com_f_c)
+        return torch.cat(out_chunks, dim=1), torch.cat(com_t_chunks, dim=1), torch.cat(com_f_chunks, dim=1)
 
     def _cache_chunk(
         self,
@@ -329,13 +421,18 @@ class WindowCrossAttention(nn.Module):
         spatial_shapes: torch.Tensor,
         B: int,
         C: int,
-    ) -> torch.Tensor:
-        """One chunk of inference forward using cached K/V sequences."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One chunk of inference forward using cached K/V sequences.
+
+        Returns (output [B,C,D], com_t [B,C], com_f [B,C]).
+        """
         scale = math.sqrt(self.head_dim)
         q_exp = q_chunk.unsqueeze(-2)
 
         out_acc = None
         lse_acc = None
+        com_t_acc = None
+        com_f_acc = None
 
         for lid in levels:
             k_seq, v_seq, H_l, W_l = kv_cache[lid]  # [B, N_l, D] each
@@ -407,18 +504,34 @@ class WindowCrossAttention(nn.Module):
             w_l = torch.exp(scores_l - lse_l)
             out_l = torch.matmul(w_l, v_s).squeeze(-2)
 
+            # DSNT CoM for this level (bilinear sample positions)
+            t_norm_l = (tc_flat / W_l).clamp(0, 1).to(w_l.dtype)  # [B, C, K_l]
+            f_norm_l = (fc_flat / H_l).clamp(0, 1).to(w_l.dtype)
+            t_l = t_norm_l.unsqueeze(2).unsqueeze(2)  # [B, C, 1, 1, K_l]
+            f_l = f_norm_l.unsqueeze(2).unsqueeze(2)
+            com_t_l = (w_l * t_l).sum(-1).squeeze(-1)  # [B, C, H]
+            com_f_l = (w_l * f_l).sum(-1).squeeze(-1)
+
             if lse_acc is None:
                 out_acc = out_l
                 lse_acc = lse_l.squeeze(-1)
+                com_t_acc = com_t_l
+                com_f_acc = com_f_l
             else:
                 lse_l_sq = lse_l.squeeze(-1)
                 lse_new = torch.logaddexp(lse_acc, lse_l_sq)
-                alpha_prev = torch.exp(lse_acc - lse_new)
+                alpha_prev = torch.exp(lse_acc - lse_new)   # [B, C, H, 1]
                 alpha_curr = torch.exp(lse_l_sq - lse_new)
                 out_acc = alpha_prev * out_acc + alpha_curr * out_l
+                a_prev = alpha_prev.squeeze(-1)              # [B, C, H]
+                a_curr = alpha_curr.squeeze(-1)
+                com_t_acc = a_prev * com_t_acc + a_curr * com_t_l
+                com_f_acc = a_prev * com_f_acc + a_curr * com_f_l
                 lse_acc = lse_new
 
-        return out_acc.reshape(B, C, -1)
+        com_t = com_t_acc.mean(2)   # [B, C] head-averaged
+        com_f = com_f_acc.mean(2)
+        return out_acc.reshape(B, C, -1), com_t, com_f
 
     def compute_kv_cache(
         self,

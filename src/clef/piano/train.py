@@ -210,6 +210,46 @@ class Trainer:
         # Build pitch token mask for loss breakdown (pitch vs structure vs duration)
         self._build_token_type_masks()
 
+    def _get_guidance_weight(self) -> float:
+        """Cosine-decay guidance_loss_weight, held constant during warmup.
+
+        Schedule:
+          Steps 0 → warmup_steps         : weight = guidance_loss_weight  (constant)
+          Steps warmup_steps → decay_end : cosine decay → guidance_loss_weight_end
+          Steps > decay_end              : weight = guidance_loss_weight_end (constant)
+
+        guidance_decay_steps sets the absolute step at which decay reaches the
+        end value. If 0 or unset, falls back to total_steps (old behaviour).
+        """
+        import math
+        start = self.config.guidance_loss_weight
+        end = getattr(self.config, 'guidance_loss_weight_end', start)
+        if start == end or self.global_step <= self.warmup_steps:
+            return start
+        decay_end = getattr(self.config, 'guidance_decay_steps', 0) or self.total_steps
+        decay_steps = max(decay_end - self.warmup_steps, 1)
+        t = min((self.global_step - self.warmup_steps) / decay_steps, 1.0)
+        return end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * t))
+
+    def _get_tf_ratio(self) -> float:
+        """Linear decay of teacher-forcing ratio for BarGRU scheduled sampling.
+
+        Schedule (per bar-gru-redesign.md §TF Ratio Schedule):
+          step 0 → warmup_steps         : 1.0   (full GT, model still unstable)
+          warmup_steps → tf_anneal_steps: 1.0 → 0.0  (linear decay)
+          tf_anneal_steps and beyond    : 0.0   (inference-equivalent, no exposure bias)
+
+        tf_anneal_steps is read from config (default 5000 if not set).
+        """
+        tf_anneal_steps = getattr(self.config, 'tf_anneal_steps', 5000)
+        if self.global_step <= self.warmup_steps:
+            return 1.0
+        if self.global_step >= tf_anneal_steps:
+            return 0.0
+        decay_steps = max(tf_anneal_steps - self.warmup_steps, 1)
+        t = (self.global_step - self.warmup_steps) / decay_steps
+        return max(0.0, 1.0 - t)
+
     def _build_token_type_masks(self):
         """Build boolean masks over vocab to classify token types.
 
@@ -339,6 +379,7 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
         accumulated_loss = 0.0
+        epoch_ce_loss_accum = 0.0  # running sum of avg_accum_loss for epoch-level reporting
         micro_batch_count = 0  # count successful micro-batches (not raw batch_idx)
 
         pbar = tqdm(
@@ -381,23 +422,30 @@ class Trainer:
 
             with maybe_no_sync:
                 # Forward pass with mixed precision
+                current_guidance_weight = self._get_guidance_weight()
+                current_tf_ratio = self._get_tf_ratio()
                 with torch.amp.autocast('cuda', dtype=self.autocast_dtype):
-                    logits, loss = self.model(
+                    logits, ce_loss, total_loss = self.model(
                         mel=mel,
                         input_ids=input_ids,
                         labels=labels,
                         mel_valid_ratios=mel_valid_ratios,
+                        chunk_audio_measures=batch.get('chunk_audio_measures'),
+                        chunk_start_frames=batch.get('chunk_start_frames'),
+                        chunk_end_frames=batch.get('chunk_end_frames'),
+                        guidance_loss_weight=current_guidance_weight,
+                        tf_ratio=current_tf_ratio,
                     )
                     # Scale loss for gradient accumulation
-                    loss = loss / self.gradient_accumulation_steps
+                    total_loss = total_loss / self.gradient_accumulation_steps
 
                 # Backward pass
                 if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
+                    self.scaler.scale(total_loss).backward()
                 else:
-                    loss.backward()
+                    total_loss.backward()
 
-            accumulated_loss += loss.item() * self.gradient_accumulation_steps
+            accumulated_loss += ce_loss.item()
 
             # Update weights every gradient_accumulation_steps
             if is_update_step:
@@ -427,7 +475,7 @@ class Trainer:
 
                 # Update metrics (average over accumulation steps)
                 avg_accum_loss = accumulated_loss / self.gradient_accumulation_steps
-                total_loss += avg_accum_loss
+                epoch_ce_loss_accum += avg_accum_loss
                 num_batches += 1
                 self.global_step += 1
 
@@ -441,6 +489,18 @@ class Trainer:
                         'train/epoch': self.epoch,
                         'system/gpu_memory_gb': torch.cuda.max_memory_allocated(self.device) / 1024**3,
                     }
+
+                    # Guidance loss breakdown (last micro-batch)
+                    decoder = getattr(self.model.module if hasattr(self.model, 'module')
+                                      else self.model, 'decoder', None)
+                    guidance_loss_cached = getattr(decoder, '_cached_guidance_loss', None)
+                    if guidance_loss_cached is not None:
+                        log_dict['train/guidance_loss'] = guidance_loss_cached.item()
+                        log_dict['train/guidance_weight'] = current_guidance_weight
+                    log_dict['train/tf_ratio'] = current_tf_ratio
+
+                    if len(last_lrs) > 1:
+                        log_dict['train/lr_swin'] = last_lrs[1]  # group[1]: swin (swin_lr)
 
                     # Per-token-type loss breakdown (last micro-batch only)
                     breakdown = self._compute_loss_breakdown(logits.detach(), labels)
@@ -471,7 +531,7 @@ class Trainer:
                             wandb.log(valid_log, step=self.global_step)
                     self.model.train()
 
-        avg_loss = total_loss / max(num_batches, 1)
+        avg_loss = epoch_ce_loss_accum / max(num_batches, 1)
 
         return {'train_loss': avg_loss}
 
@@ -510,14 +570,14 @@ class Trainer:
             mel_valid_ratios = batch['mel_valid_ratios'].to(self.device)
 
             with torch.amp.autocast('cuda', dtype=self.autocast_dtype):
-                logits, loss = self.model(
+                logits, ce_loss, _ = self.model(
                     mel=mel,
                     input_ids=input_ids,
                     labels=labels,
                     mel_valid_ratios=mel_valid_ratios,
                 )
 
-            total_loss += loss.item()
+            total_loss += ce_loss.item()
             num_batches += 1
 
             # Accumulate per-type losses
@@ -698,8 +758,13 @@ def sanity_check(model: ClefPianoBase, train_loader: DataLoader, device: torch.d
     input_ids = batch['input_ids'].to(device)
     labels = batch['labels'].to(device)
     mel_valid_ratios = batch['mel_valid_ratios'].to(device)
+    chunk_audio_measures = batch.get('chunk_audio_measures')
+    chunk_start_frames = batch.get('chunk_start_frames')
+    chunk_end_frames = batch.get('chunk_end_frames')
 
     logger.info(f'Batch shapes: mel={mel.shape}, input_ids={input_ids.shape}, labels={labels.shape}')
+    has_guidance = chunk_audio_measures is not None and any(m is not None for m in chunk_audio_measures)
+    logger.info(f'Guided attention: {"enabled" if has_guidance else "disabled (no alignment info)"}')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
@@ -707,22 +772,27 @@ def sanity_check(model: ClefPianoBase, train_loader: DataLoader, device: torch.d
         optimizer.zero_grad()
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            logits, loss = model(
+            logits, ce_loss, total_loss = model(
                 mel=mel,
                 input_ids=input_ids,
                 labels=labels,
                 mel_valid_ratios=mel_valid_ratios,
+                chunk_audio_measures=chunk_audio_measures,
+                chunk_start_frames=chunk_start_frames,
+                chunk_end_frames=chunk_end_frames,
             )
 
-        loss.backward()
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         if step % 10 == 0:
-            logger.info(f'Step {step}: loss={loss.item():.4f}')
+            g_loss = getattr(model.decoder, '_cached_guidance_loss', None)
+            g_str = f'  guidance={g_loss.item():.4f}' if g_loss is not None else ''
+            logger.info(f'Step {step}: ce={ce_loss.item():.4f}{g_str}')
 
     import math
-    logger.info(f'Final loss: {loss.item():.4f}  (perplexity={math.exp(loss.item()):.2f})')
+    logger.info(f'Final loss: {ce_loss.item():.4f}  (perplexity={math.exp(ce_loss.item()):.2f})')
 
     # Loss breakdown: pitch / duration / structure
     from src.clef.piano.tokenizer import KernTokenizer
@@ -743,8 +813,8 @@ def sanity_check(model: ClefPianoBase, train_loader: DataLoader, device: torch.d
 
     model.eval()
     with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        logits_eval, _ = model(mel=mel, input_ids=input_ids,
-                                labels=labels, mel_valid_ratios=mel_valid_ratios)
+        logits_eval, _, _ = model(mel=mel, input_ids=input_ids,
+                                  labels=labels, mel_valid_ratios=mel_valid_ratios)
     ce = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=0)
     per_tok = ce(logits_eval.view(-1, logits_eval.size(-1)), labels.view(-1))  # [B*S]
     lab_flat = labels.view(-1)
@@ -755,7 +825,7 @@ def sanity_check(model: ClefPianoBase, train_loader: DataLoader, device: torch.d
 
     logger.info(f'  pitch  loss: {_group_loss(pitch_mask):.4f}  dur loss: {_group_loss(dur_mask):.4f}  struct loss: {_group_loss(struct_mask):.4f}')
 
-    if loss.item() < 0.1:
+    if ce_loss.item() < 0.1:
         logger.info('Sanity check PASSED: model can overfit one batch')
     else:
         logger.warning('Sanity check: loss still high, may need more steps')
