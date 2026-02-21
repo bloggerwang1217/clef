@@ -1,0 +1,180 @@
+# clef-piano-tiny Training Configuration
+# =======================================
+#
+# Minimal PoC: Octopus + Flow + Swin S0 only + 2-layer decoder
+# Goal: Beat SOTA with minimal architecture on short clips (30s)
+
+# =============================================================================
+# Seeds
+# =============================================================================
+seed:
+  data_augmentation: 0
+  training: 1234
+
+# =============================================================================
+# Model Architecture
+# =============================================================================
+model:
+  name: "clef-piano-tiny"
+
+  # Encoder: Swin V2 (frozen core, selective fine-tune)
+  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"
+  swin_dims: [96]  # Only S0 - simplified for tiny model
+  freeze_encoder: true
+  swin_unfreeze: ["patch_embed", "position_bias", "downsample"]  # Minimal unfreeze
+  swin_lr_scale: 0.1
+
+  # Serial encoder: Swin eats Flow output (pitch space)
+  swin_on_pitch_space: true
+  swin_start_stage: 0  # Start from S0
+  swin_pool_strides: [1]
+
+  # Octopus2D (onset detection)
+  use_octopus: true
+  octopus_freq_kernel: 31
+  octopus_time_kernel: 3
+  octopus_channels: 32
+  octopus_time_pool_stride: 2
+  octopus_freq_pool_stride: 4
+
+  # HarmonizingFlow (pitch space transform)
+  use_flow: true
+  n_harmonics: 6
+  flow_pool_stride: 4
+  use_temporal_cnn: false
+
+  # Attention config
+  d_model: 512
+  n_heads: 8
+  n_levels: 3                  # Octopus (L0) + Flow (L1) + S0 (L2) only
+  ff_dim: 2048
+  dropout: 0.1
+
+  n_points_freq: 2
+  n_points_time: 2
+  freq_offset_scale: 1.0
+  time_offset_scale: 1.0
+
+  use_time_prior: true
+  use_freq_prior: true
+  n_freq_groups: 4
+  refine_range: 0.1
+  rope_base: 10000.0
+
+  bridge_layers: 1  # Minimal bridge
+
+  # Decoder: 2 layers only (Full CA → Mamba)
+  # L0: SA + Full CA to S0 (level 2) + FFN
+  # L1: Mamba only
+  decoder_layers: 2
+  decoder_layer_types: ["full_ca", "mamba_only"]
+  decoder_layer_ca_levels:
+    - [2]       # L0: Full CA to S0 (level 2)
+    - null      # L1: Mamba only
+  decoder_layer_full_freq:
+    - true      # L0: Full freq (S0 only has 32 freq bins after Flow pool)
+    - null
+  decoder_layer_cascade_com:
+    - false
+    - null
+
+  # Window parameters (not used in full CA, but required by config)
+  window_time_frames: [32, 16, 8]
+  window_freq_bins: [4, 4, 4]
+  window_seq_chunk_size: 10000
+
+  # Mamba config
+  mamba_d_state: 128
+  mamba_d_conv: 4
+  mamba_expand: 2
+
+  # Sequence config
+  max_seq_len: 1024  # 30s should fit easily
+  vocab_size: 271
+
+  label_smoothing: 0.0
+
+  # Gradient checkpointing (trades compute for memory)
+  gradient_checkpointing: true
+  window_ca_use_checkpoint: true
+
+  # No guided attention for tiny version (keep it simple)
+  guidance_loss_weight: 0.0
+  guidance_loss_weight_end: 0.0
+  guidance_decay_steps: 0
+
+# =============================================================================
+# Data
+# =============================================================================
+data:
+  datasets:
+    - musesyn
+    - humsyn
+
+  vocabulary: "zeng_extended"
+
+  audio:
+    sample_rate: 16000
+    feature: "log_mel"
+    n_mels: 128
+    n_fft: 2048
+    hop_length: 160             # 100 fps
+    f_min: 27.5
+    f_max: 7040.0
+
+  chunking:
+    enabled: true
+    chunk_frames: 3000          # 30 seconds @ 100 fps
+    overlap_frames: 1500        # 15 seconds overlap
+    min_chunk_ratio: 0.5
+    fallback_chunk_frames: 1500  # 15s fallback
+    fallback_overlap_frames: 750 # 7.5s overlap
+
+  augmentation:
+    transpose:
+      enabled: true
+    soundfonts:
+      - "TimGM6mb.sf2"
+      - "FluidR3_GM.sf2"
+      - "UprightPianoKW-20220221.sf2"
+      - "SalamanderGrandPiano-V3+20200602.sf2"
+    loudness_norm:
+      target_lufs: -15
+
+# =============================================================================
+# Training
+# =============================================================================
+training:
+  distributed:
+    enabled: true
+    backend: "nccl"
+    num_gpus: 2
+
+  precision: "bf16"
+  batch_size: 2              # Smaller sequence → larger batch
+  gradient_accumulation_steps: 2
+  effective_batch_size: 8
+
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  max_epochs: 100            # More epochs for smaller model
+  warmup_steps: 1000
+  gradient_clip: 1.0
+
+  save_every_n_epochs: 10
+  save_best: true
+  save_last: true
+  early_stopping_patience: 10
+
+  wandb:
+    enabled: true
+    project: "clef-piano-base"
+    tags: ["piano", "a2s", "tiny", "30s", "poc"]
+
+# =============================================================================
+# Paths
+# =============================================================================
+paths:
+  data_dir: "data/datasets"
+  output_dir: "data/experiments/clef_piano_tiny"
+  checkpoint_dir: "checkpoints/clef_piano_tiny"

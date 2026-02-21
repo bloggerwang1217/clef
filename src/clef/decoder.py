@@ -1141,6 +1141,14 @@ class SAFullCALayer(nn.Module):
         guidance_bounds=None,     # [B, S, 2] (norm_start, norm_end) per token, or None
         onset_1d=None,            # unused
         input_ids=None,           # unused
+        time_center_in=None,      # ignored (for compatibility with decoder calling convention)
+        freq_center_in=None,      # ignored
+        bar_mask=None,            # ignored
+        com_t_all=None,           # ignored
+        h_bar_final=None,         # ignored
+        h_bar_carried=None,       # ignored
+        tf_ratio=None,            # ignored
+        pred_embs=None,           # ignored
     ):
         """SA + Full MHA on active encoder levels + FFN.
 

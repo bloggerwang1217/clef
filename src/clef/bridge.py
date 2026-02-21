@@ -1,6 +1,6 @@
 """
-Deformable Bridge (Lightweight)
-================================
+MultiScaleBridge
+================
 
 Multi-scale feature projection module.
 Connects Swin V2 encoder stages to the autoregressive decoder.
@@ -8,11 +8,11 @@ Connects Swin V2 encoder stages to the autoregressive decoder.
 Responsibilities:
 - Project each Swin stage to unified d_model dimension
 - Add learnable level embeddings to distinguish scales
-- Add spatial positional embeddings (freq: learned, time: sinusoidal)
+- Add spatial positional embeddings (freq: sinusoidal, time: sinusoidal)
 - Compute valid_ratios for padding handling
 
-NOTE: NO self-attention here! The decoder's FluxAttention handles
-cross-scale attention via deformable sampling across all levels.
+NOTE: NO self-attention here! The decoder handles cross-attention
+across all concatenated multi-scale levels.
 """
 
 import math
@@ -43,10 +43,10 @@ def _sinusoidal_encoding(length: int, d_model: int, device: torch.device) -> tor
     return pe
 
 
-class DeformableBridge(nn.Module):
-    """Multi-scale Deformable Bridge (Lightweight).
+class MultiScaleBridge(nn.Module):
+    """Multi-scale Bridge.
 
-    Simply projects and concatenates multi-scale features.
+    Projects and concatenates multi-scale features from Swin stages.
     No self-attention - that's handled by the decoder.
 
     Input: List of features from different sources (Flow, Swin stages)

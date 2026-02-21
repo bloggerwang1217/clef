@@ -20,6 +20,9 @@ class ClefPianoConfig(ClefConfig):
     using Swin V2 encoder + WindowCrossAttention decoder.
     """
 
+    # Model name (for model selection in train.py)
+    name: str = "clef-piano-base"
+
     # Piano-specific defaults
     vocab_size: int = 512   # ~220 factorized tokens + padding
 
@@ -101,6 +104,9 @@ class ClefPianoConfig(ClefConfig):
         defaults = cls()
 
         return cls(
+            # Model name
+            name=model_cfg.get("name", defaults.name),
+
             # Swin
             swin_model=model_cfg.get("swin_model", defaults.swin_model),
             swin_dims=model_cfg.get("swin_dims", defaults.swin_dims),

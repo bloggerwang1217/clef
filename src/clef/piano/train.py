@@ -62,6 +62,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.clef.piano.config import ClefPianoConfig
 from src.clef.piano.model import ClefPianoBase
+from src.clef.piano.clef_piano_tiny import ClefPianoTiny
 from src.clef import ChunkedDataset, ManifestDataset, ClefCollator, BucketSampler, DistributedBucketSampler
 from src.clef.piano.tokenizer import KernTokenizer
 from src.utils.seed import set_seed
@@ -907,9 +908,13 @@ def main():
         config.vocab_size = tokenizer.vocab_size
         logger.info(f'Vocab size: {config.vocab_size}')
 
-        # Create model
-        model = ClefPianoBase(config)
-        logger.info(f'Model created: {model.get_num_params():,} trainable params')
+        # Create model based on model name in config
+        model_name = getattr(config, 'name', 'clef-piano-base')
+        if model_name == 'clef-piano-tiny':
+            model = ClefPianoTiny(config)
+        else:
+            model = ClefPianoBase(config)
+        logger.info(f'Model created ({model_name}): {model.get_num_params():,} trainable params')
 
         # Create datasets
         manifest_dir = Path(args.manifest_dir)

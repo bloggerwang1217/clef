@@ -6,7 +6,7 @@ ISMIR 2026 version: Swin V2 + WindowCrossAttention
 
 Architecture highlights:
 - Swin V2 (frozen) extracts F1/F2/F3/F4 four-scale features
-- Deformable Bridge: Sparse self-attention fuses multi-scale features
+- Multi-scale Bridge: Projects and concatenates multi-scale features
 - WindowCrossAttention Decoder: Dense window cross-attention for audio-to-score decoding
 - Solves grace note problem: Can directly access F1 (10ms resolution, 100 fps)
 """
@@ -22,7 +22,7 @@ from transformers import Swinv2Model
 from .config import ClefPianoConfig
 from .guided_attn import build_guidance_bounds
 from ..bar_tracker import BarTracker
-from ..bridge import DeformableBridge
+from ..bridge import MultiScaleBridge
 from ..decoder import ClefDecoder, MambaOnlyLayer
 from ..flow import HarmonizingFlow, Octopus2D
 
@@ -32,7 +32,7 @@ class ClefPianoBase(nn.Module):
 
     Model flow:
     1. Mel spectrogram -> Swin V2 (frozen) -> F1, F2, F3, F4
-    2. DeformableBridge fuses multi-scale features
+    2. MultiScaleBridge projects multi-scale features to unified dimension
     3. ClefDecoder generates **kern tokens autoregressively
 
     Memory estimation (RTX 3090, 24GB):
@@ -112,7 +112,7 @@ class ClefPianoBase(nn.Module):
                 temporal_pool_stride=getattr(config, 'temporal_pool_stride', 8),
             )
 
-        # === Deformable Bridge ===
+        # === MultiScaleBridge ===
         # Build bridge input dims based on active levels
         self.swin_start_stage = getattr(config, 'swin_start_stage', 0)
         swin_dims_used = config.swin_dims[self.swin_start_stage:]
@@ -130,7 +130,7 @@ class ClefPianoBase(nn.Module):
         elif self.swin_start_stage > 0:
             bridge_input_dims = swin_dims_used
 
-        self.bridge = DeformableBridge(
+        self.bridge = MultiScaleBridge(
             swin_dims=config.swin_dims,
             d_model=config.d_model,
             n_heads=config.n_heads,

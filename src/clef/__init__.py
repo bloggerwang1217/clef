@@ -5,7 +5,7 @@
 
 from .config import ClefConfig
 from .attention import WindowCrossAttention
-from .bridge import DeformableBridge
+from .bridge import MultiScaleBridge
 from .decoder import ClefDecoder
 from .flow import HarmonizingFlow
 from .data import ChunkedDataset, ManifestDataset
@@ -14,7 +14,7 @@ from .collate import BucketSampler, DistributedBucketSampler, ClefCollator, crea
 __all__ = [
     "ClefConfig",
     "WindowCrossAttention",
-    "DeformableBridge",
+    "MultiScaleBridge",
     "ClefDecoder",
     "HarmonizingFlow",
     "ChunkedDataset",
