@@ -124,7 +124,7 @@ class ClefPianoTiny(nn.Module):
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
             # Position encoding
-            use_rope=config.use_rope,
+            use_rope=True,
             # Bar/Note GRU config
             bar_token_id=getattr(config, 'bar_token_id', None),
             onset_1d_channels=getattr(config, 'octopus_channels', 32),

@@ -32,8 +32,6 @@ model:
   swin_unfreeze: ["patch_embed", "position_bias", "downsample"]
   swin_lr_scale: 0.1  # 0.1x base_lr for pretrained params
 
-  # Serial encoder: Swin eats Flow output (pitch space)
-  swin_on_pitch_space: true
   swin_pool_strides: [1, 1, 1, 1]  # Flow already reduced T, no extra pool needed
 
   # Octopus2D (CN octopus cells: cross-frequency onset detection)
@@ -48,7 +46,6 @@ model:
   use_flow: true
   n_harmonics: 6
   flow_pool_stride: 4          # T → T/4
-  use_temporal_cnn: false      # Serial mode: no CNN, Octopus provides onset
 
   # Deformable Attention (CLEF)
   d_model: 512
@@ -127,7 +124,7 @@ model:
   # Start high to force temporal alignment early; end low to let CE dominate.
   guidance_loss_weight: 10.0        # Enable to verify BarGRU com_t accuracy
   guidance_loss_weight_end: 0.1    # Decay to small weight
-  guidance_decay_steps: 2500       # Match LR warmup
+  guidance_decay_steps: 5000       # Steps AFTER warmup for decay (5K steps from warmup end)
 
 # =============================================================================
 # Data
@@ -185,7 +182,9 @@ training:
   learning_rate: 2.0e-4
   weight_decay: 0.01
   max_epochs: 50
-  warmup_steps: 2500
+  warmup_steps: 5000
+  lr_min_ratio: 0.1  # min_lr = learning_rate * lr_min_ratio (cosine decay endpoint)
+  tf_anneal_steps: 10000  # TF ratio: 1.0 (0-5K warmup) → 0.0 (5K-10K linear decay)
   gradient_clip: 1.0
 
   save_every_n_epochs: 10

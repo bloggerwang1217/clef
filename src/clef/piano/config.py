@@ -27,12 +27,13 @@ class ClefPianoConfig(ClefConfig):
     vocab_size: int = 512   # ~220 factorized tokens + padding
 
     # Guided attention loss weight schedule.
-    # weight held at guidance_loss_weight during warmup, then cosine-decays to
-    # guidance_loss_weight_end by guidance_decay_steps (independent of max_epochs).
+    # Weight held constant at guidance_loss_weight during warmup, then cosine-decays
+    # to guidance_loss_weight_end over guidance_decay_steps (relative to warmup end).
+    # Example: guidance_decay_steps=2500 means decay from warmup_steps to warmup_steps+2500.
     # Supervises L1 Full CA to attend to the correct audio measure.
     guidance_loss_weight: float = 0.0        # starting weight (high → forces CA alignment)
     guidance_loss_weight_end: float = 0.0    # final weight after decay (lower → CE dominates)
-    guidance_decay_steps: int = 0            # step at which decay reaches end (0 = use total_steps)
+    guidance_decay_steps: int = 0            # steps AFTER warmup for decay (0 = use total_steps - warmup_steps)
 
     # Bar token ID for L1 bar full-attention (Zeng extended vocabulary).
     # <bar> tokens attend to onset_1d to compute bar_center (temporal authority).
@@ -52,14 +53,6 @@ class ClefPianoConfig(ClefConfig):
     # Per-layer cascade_com flag: after each level, use its CoM as next level's window center.
     decoder_layer_cascade_com: Optional[List] = None
 
-    # Bar Tracker (symmetric to Flow: extracts temporal structure from Octopus)
-    # Toggle: set bar_tracker_loss_weight > 0 to enable supervised bar phase guidance.
-    # Requires use_octopus=True.
-    use_bar_tracker: bool = False
-    bar_tracker_d_model: int = 256
-    bar_tracker_n_layers: int = 2
-    bar_tracker_d_state: int = 64
-    bar_tracker_loss_weight: float = 0.0     # 0 = disabled (no GT supervision)
 
     # Gradient checkpointing (trades compute for memory)
     gradient_checkpointing: bool = False
@@ -81,6 +74,7 @@ class ClefPianoConfig(ClefConfig):
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 1000
+    lr_min_ratio: float = 0.1  # min_lr = learning_rate * lr_min_ratio (cosine decay endpoint)
     max_epochs: int = 100
     training_seed: int = 1234
 
@@ -119,8 +113,6 @@ class ClefPianoConfig(ClefConfig):
             n_harmonics=model_cfg.get("n_harmonics", defaults.n_harmonics),
             flow_init=model_cfg.get("flow_init", defaults.flow_init),
             flow_pool_stride=model_cfg.get("flow_pool_stride", defaults.flow_pool_stride),
-            use_temporal_cnn=model_cfg.get("use_temporal_cnn", defaults.use_temporal_cnn),
-            temporal_pool_stride=model_cfg.get("temporal_pool_stride", defaults.temporal_pool_stride),
 
             # Octopus2D
             use_octopus=model_cfg.get("use_octopus", defaults.use_octopus),
@@ -132,7 +124,6 @@ class ClefPianoConfig(ClefConfig):
             # Swin input mode
             swin_start_stage=model_cfg.get("swin_start_stage", defaults.swin_start_stage),
             swin_pool_strides=model_cfg.get("swin_pool_strides", defaults.swin_pool_strides),
-            swin_on_pitch_space=model_cfg.get("swin_on_pitch_space", defaults.swin_on_pitch_space),
 
             # Attention
             d_model=model_cfg.get("d_model", defaults.d_model),
@@ -164,12 +155,6 @@ class ClefPianoConfig(ClefConfig):
             note_gru_input_dropout=model_cfg.get("note_gru_input_dropout", defaults.note_gru_input_dropout),
             tf_anneal_steps=training_cfg.get("tf_anneal_steps", defaults.tf_anneal_steps),
 
-            # Bar Tracker
-            use_bar_tracker=model_cfg.get("use_bar_tracker", defaults.use_bar_tracker),
-            bar_tracker_d_model=model_cfg.get("bar_tracker_d_model", defaults.bar_tracker_d_model),
-            bar_tracker_n_layers=model_cfg.get("bar_tracker_n_layers", defaults.bar_tracker_n_layers),
-            bar_tracker_d_state=model_cfg.get("bar_tracker_d_state", defaults.bar_tracker_d_state),
-            bar_tracker_loss_weight=model_cfg.get("bar_tracker_loss_weight", defaults.bar_tracker_loss_weight),
 
             # Guided attention loss
             guidance_loss_weight=model_cfg.get("guidance_loss_weight", defaults.guidance_loss_weight),
@@ -192,7 +177,6 @@ class ClefPianoConfig(ClefConfig):
             mamba_expand=model_cfg.get("mamba_expand", defaults.mamba_expand),
             max_seq_len=model_cfg.get("max_seq_len", defaults.max_seq_len),
             vocab_size=model_cfg.get("vocab_size", defaults.vocab_size),
-            use_rope=model_cfg.get("use_rope", defaults.use_rope),
             window_time_frames=model_cfg.get("window_time_frames", defaults.window_time_frames),
             window_freq_bins=model_cfg.get("window_freq_bins", defaults.window_freq_bins),
 
@@ -215,6 +199,7 @@ class ClefPianoConfig(ClefConfig):
             learning_rate=training_cfg.get("learning_rate", 1e-4),
             weight_decay=training_cfg.get("weight_decay", 0.01),
             warmup_steps=training_cfg.get("warmup_steps", 1000),
+            lr_min_ratio=training_cfg.get("lr_min_ratio", 0.1),
             max_epochs=training_cfg.get("max_epochs", 100),
             training_seed=seed_cfg.get("training", 1234),
         )

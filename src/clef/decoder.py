@@ -19,8 +19,9 @@ Key design:
   Positional bias (-scale * time_pos) ensures initial CoM near 0 (not 0.5), respecting BarGRU causality.
 - Coarse-to-fine cascade (both t and f): L1 DSNT → L3 center → L3 DSNT → L5 center.
   L1 is the only layer that uses bar_center directly; L3/L5 use the refined DSNT com_t.
-- guidance_bounds supervises time_center (note tokens + <bar> tokens) to fall within measure range.
-  For <bar> tokens, this directly supervises BarGRU com_t after the override in NoteGRU.
+ - guidance_bounds supervises time_center (note tokens + <bar> tokens) to fall within measure range.
+   For <bar> tokens, NoteGRU time_center is overridden to BarGRU com_t, so hinge loss
+   still anchors bar timing while also supervising note-level time_center.
 """
 
 from typing import List, Optional, Tuple, Union
@@ -105,30 +106,11 @@ class BarGRU(nn.Module):
         # onset_1d projection: C → d_bar (K only; attention output is com_t, not V-aggregated)
         self.onset_k_proj = nn.Linear(onset_1d_channels, d_bar)
 
-        # Positional bias: encourage attention toward earlier positions (causal prior)
-        # Initial CoM should be near 0 (not 0.5) since BarGRU is sequential
-        # scale=2.5 gives a mild early bias; learnable so model can adjust if needed
-        self.pos_bias_scale = nn.Parameter(torch.tensor(2.5))
-
         self.input_dropout = nn.Dropout(input_dropout)
 
         # Cached state (set during training forward; updated incrementally during inference)
         self._cached_com_t: Optional[torch.Tensor] = None
         self._cached_h_bar: Optional[torch.Tensor] = None
-
-    @staticmethod
-    def _sinusoidal_pe(T: int, C: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Sinusoidal positional encoding for onset_1d tokens [T, C]."""
-        half = C // 2
-        pos = torch.arange(T, device=device, dtype=dtype)
-        div = torch.exp(
-            torch.arange(0, half, device=device, dtype=dtype)
-            * (-math.log(10000.0) / half)
-        )
-        pe = torch.zeros(T, C, device=device, dtype=dtype)
-        pe[:, 0::2] = torch.sin(pos.unsqueeze(1) * div.unsqueeze(0))
-        pe[:, 1::2] = torch.cos(pos.unsqueeze(1) * div.unsqueeze(0))[:, :C - half]
-        return pe
 
     def forward(
         self,
@@ -161,19 +143,14 @@ class BarGRU(nn.Module):
         T_oct = onset_pooled.shape[1]
         C_onset = onset_pooled.shape[2]
 
-        # Add sinusoidal PE to onset_pooled (as K input)
-        pe = self._sinusoidal_pe(T_oct, C_onset, device, dtype)
-        onset_pooled_pe = onset_pooled + pe.unsqueeze(0)  # [B, T_oct, C_onset]
-
         # Project K for FullAttn (attention output is com_t, not V-aggregated)
-        K = self.onset_k_proj(onset_pooled_pe)  # [B, T_oct, D_bar]
+        K = self.onset_k_proj(onset_pooled)  # [B, T_oct, D_bar]
 
         bar_positions = bar_mask.nonzero(as_tuple=False)  # [N_bars_total, 2]
 
         com_t_all = torch.zeros(B, S, 1, device=device, dtype=dtype)
         h_bar_final = torch.zeros(1, B, self.d_bar, device=device, dtype=dtype)
         h_bar_scatter = torch.zeros(B, S, self.d_bar, device=device, dtype=dtype)
-
         if bar_positions.shape[0] == 0:
             self._cached_com_t = com_t_all
             self._cached_h_bar = h_bar_final
@@ -204,7 +181,7 @@ class BarGRU(nn.Module):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _compute_com_t_batched(
+    def _compute_attn_batched(
         self,
         queries: torch.Tensor,   # [N, D_bar] — one query per bar
         K: torch.Tensor,         # [B, T_oct, D_bar]
@@ -213,9 +190,10 @@ class BarGRU(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Compute com_t for N bars in parallel using batched multi-head attention.
+        """Compute com_t for N bars in parallel.
 
-        Returns com_t: [N, 1]
+        Returns:
+            com_t:  [N, 1]        — DSNT center-of-mass
         """
         N = queries.shape[0]
         H = self.n_heads
@@ -226,20 +204,18 @@ class BarGRU(nn.Module):
         Q = Q_proj.view(N, H, d_h)         # [N, H, d_h]
 
         # Gather K for each bar's batch: [N, T_oct, D_bar]
-        K_N = K[bar_b_idx]                         # [N, T_oct, D_bar]
-        K_N = K_N.view(N, T_oct, H, d_h).permute(0, 2, 1, 3)  # [N, H, T_oct, d_h]
+        K_N = K[bar_b_idx]                                              # [N, T_oct, D_bar]
+        K_N = K_N.view(N, T_oct, H, d_h).permute(0, 2, 1, 3)          # [N, H, T_oct, d_h]
 
         # Scaled dot-product: [N, H, T_oct]
         scores = torch.einsum('nhd,nhtd->nht', Q, K_N) / math.sqrt(d_h)
 
-        # Positional bias: encourage earlier positions
-        time_pos = torch.linspace(0, 1, T_oct, device=device, dtype=dtype)
-        pos_bias = -self.pos_bias_scale * time_pos  # [T_oct]
-        scores = scores + pos_bias.unsqueeze(0).unsqueeze(0)  # broadcast [N, H, T_oct]
+        attn_w_heads = F.softmax(scores, dim=-1)  # [N, H, T_oct]
+        attn_w = attn_w_heads.mean(1)             # [N, T_oct] head-averaged
 
-        attn_w = F.softmax(scores, dim=-1)  # [N, H, T_oct]
-        # com_t: weighted mean of time positions
-        com_t = (attn_w.mean(1) * time_pos).sum(-1, keepdim=True)  # [N, 1]
+        # com_t: DSNT weighted mean of time positions
+        time_pos = torch.linspace(0, 1, T_oct, device=device, dtype=dtype)
+        com_t = (attn_w * time_pos).sum(-1, keepdim=True)  # [N, 1]
         return com_t
 
     def _forward_fast(
@@ -413,7 +389,7 @@ class BarGRU(nn.Module):
             s_idx_all = all_bar_pos[:, 1]
             queries = h_bar_scatter[b_idx_all, s_idx_all]  # [N_total, D_bar]
 
-            com_t_vals = self._compute_com_t_batched(
+            com_t_vals = self._compute_attn_batched(
                 queries, K, b_idx_all, T_oct, device, dtype,
             )  # [N_total, 1]
 
@@ -469,22 +445,24 @@ class BarGRU(nn.Module):
                 bar_summary_dropped = self.input_dropout(bar_summary)
                 _, h_b = self.bar_gru(bar_summary_dropped.unsqueeze(0), h_b)
 
-                # Attention
+                # Attention: compute com_t for this bar
                 query = self.query_proj(h_b.squeeze(0))  # [1, D_bar]
-                Q = query.view(1, self.n_heads, 1, self.head_dim)
+                Q = query.view(1, self.n_heads, self.head_dim)     # [1, H, d_h]
                 K_b = K[b].view(T_oct, self.n_heads, self.head_dim).permute(1, 0, 2).unsqueeze(0)
-                scores = torch.einsum('nhqd,nhtd->nhqt', Q, K_b) / math.sqrt(self.head_dim)
+                # K_b: [1, H, T_oct, d_h]
+                scores = torch.einsum('nhd,nhtd->nht',
+                                      Q, K_b.squeeze(0).unsqueeze(0).view(1, self.n_heads, T_oct, self.head_dim)
+                                      ) / math.sqrt(self.head_dim)  # [1, H, T_oct]
+                attn_w_heads = F.softmax(scores, dim=-1)            # [1, H, T_oct]
+                attn_w_b = attn_w_heads.mean(1)                     # [1, T_oct]
                 time_pos = torch.linspace(0, 1, T_oct, device=device, dtype=dtype)
-                pos_bias = -self.pos_bias_scale * time_pos
-                scores = scores + pos_bias.view(1, 1, -1)
-                attn_w = F.softmax(scores.squeeze(2), dim=-1)
-                com_t_b = (attn_w.mean(1) * time_pos).sum(-1, keepdim=True)
+                com_t_b = (attn_w_b * time_pos).sum(-1, keepdim=True)  # [1, 1]
 
                 bar_pos = int(batch_bar_positions[bar_i].item())
                 com_t_all[b, bar_pos] = com_t_b.to(dtype)
                 h_bar_scatter[b, bar_pos] = h_b[0, 0]
 
-            h_bar_final[0, b] = h_b[0, 0]
+        h_bar_final[0, b] = h_b[0, 0]
 
 
 class NoteGRU(nn.Module):
@@ -1425,7 +1403,7 @@ class SAWindowCALayer(nn.Module):
         input_ids=None,         # [B, S] int — required for L1 to detect <bar> tokens
         time_center_in=None,    # [B, S, 1] from ClefDecoder (NoteGRU read + cascade)
         freq_center_in=None,    # [B, S, 1] com_f from previous layer's WindowCA (L3/L5 only)
-        guidance_bounds=None,   # [B, S, 2] optional hinge supervision at <bar> positions
+        guidance_bounds=None,   # [B, S, 2] optional CoM hinge supervision
         tf_ratio: float = 1.0,  # teacher-forcing ratio for note_gru scheduled sampling
         pred_embs: Optional[torch.Tensor] = None,  # [B, S, D] for TF (optional)
         bar_mask: Optional[torch.Tensor] = None,   # [B, S] bool, precomputed in ClefDecoder
@@ -1519,18 +1497,25 @@ class SAWindowCALayer(nn.Module):
             time_center = time_center_in
         self._cached_window_center = (time_center, freq_center)
 
-        # Time center guidance loss: hinge loss on note tokens AND <bar> tokens
-        # Supervises time_center to fall within correct measure range
-        # <bar> tokens now receive guidance bounds → supervises BarGRU com_t (after override)
-        # MUST come AFTER time_center is defined above
+        # Time center guidance loss: CoM hinge on bar + note tokens.
+        # For each supervised token (bar or note), the time_center should land within
+        # the correct measure range [lo, hi] (normalized 0-1).
+        # loss = relu(lo - time_center) + relu(time_center - hi)  →  0 inside interval, linear outside.
+        # Structural tokens (sentinel -1) are excluded via lo >= 0.
         if self.training and guidance_bounds is not None:
-            lo = guidance_bounds[:, :, 0]  # [B, S] measure start
-            hi = guidance_bounds[:, :, 1]  # [B, S] measure end
-            valid = (lo >= 0)  # Supervise note tokens AND <bar> tokens (structural tokens get -1)
+            lo = guidance_bounds[:, :, 0]  # [B, S] measure start (normalized)
+            hi = guidance_bounds[:, :, 1]  # [B, S] measure end (normalized)
+            # Supervise all tokens with valid bounds (bar + note tokens)
+            valid = lo >= 0  # [B, S]
             if valid.any():
-                tc = time_center.squeeze(-1)  # [B, S] time_center (NoteGRU base + BarGRU override at bars)
-                loss_hinge = F.relu(lo - tc) + F.relu(tc - hi)
-                self._cached_guidance_loss = loss_hinge[valid].mean()
+                time_center_flat = time_center[:, :, 0]  # [B, S] scalar time_center per token
+                loss_hinge = (
+                    F.relu(lo[valid] - time_center_flat[valid]) +
+                    F.relu(time_center_flat[valid] - hi[valid])
+                )  # [N_valid]
+                self._cached_guidance_loss = loss_hinge.mean()
+            else:
+                self._cached_guidance_loss = None
         else:
             self._cached_guidance_loss = None
         self._cached_com_f = None
@@ -1576,7 +1561,8 @@ class ClefDecoder(nn.Module):
     Temporal responsibility (Global NoteGRU):
       L1 BarGRU computes h_bar + com_t (audio-grounded).
       NoteGRU provides shared time_center (read-before / write-after).
-      Time cascade: L1 com_t_wca → L3, L3 com_t_wca → L5 (blend with base time_center).
+      Time cascade: L1 uses time_center_base; L3 uses L1.com_t_wca; L5 uses L3.com_t_wca.
+      (Direct cascade without blending: each layer refines the previous layer's output.)
     """
 
     def __init__(
@@ -1870,10 +1856,11 @@ class ClefDecoder(nn.Module):
                     # L3, L5: use cascaded time/freq centers from previous window_ca layers.
                     layer_freq_center_in = last_com_f
 
-                # Time cascade: base NoteGRU time_center, then blend with com_t_wca from prior layers
+                # Time cascade: L1 uses base NoteGRU time_center;
+                # L3/L5 directly use previous layer's com_t_wca (audio-grounded refinement).
                 if time_center_base is not None:
                     if last_com_t is not None:
-                        layer_window_center = 0.5 * last_com_t + 0.5 * time_center_base
+                        layer_window_center = last_com_t
                     else:
                         layer_window_center = time_center_base
 

@@ -21,7 +21,6 @@ from transformers import Swinv2Model
 
 from .config import ClefPianoConfig
 from .guided_attn import build_guidance_bounds
-from ..bar_tracker import BarTracker
 from ..bridge import MultiScaleBridge
 from ..decoder import ClefDecoder, MambaOnlyLayer
 from ..flow import HarmonizingFlow, Octopus2D
@@ -80,23 +79,9 @@ class ClefPianoBase(nn.Module):
             nn.init.normal_(self.onset_to_pitch.weight, mean=0, std=0.01)
             nn.init.zeros_(self.onset_to_pitch.bias)
 
-            # Bar Tracker: symmetric to Flow, extracts temporal structure from Octopus
-            if getattr(config, 'use_bar_tracker', False):
-                freq_pool = getattr(config, 'octopus_freq_pool_stride', 4)
-                self.bar_tracker = BarTracker(
-                    in_channels=octopus_channels,
-                    freq_bins=128 // freq_pool,
-                    d_model=getattr(config, 'bar_tracker_d_model', 256),
-                    n_layers=getattr(config, 'bar_tracker_n_layers', 2),
-                    d_state=getattr(config, 'bar_tracker_d_state', 64),
-                )
-            else:
-                self.bar_tracker = None
 
         # === HarmonizingFlow (optional, pitch space transform) ===
         self.use_flow = getattr(config, 'use_flow', False)
-        self.use_temporal_cnn = getattr(config, 'use_temporal_cnn', False)
-        self.swin_on_pitch_space = getattr(config, 'swin_on_pitch_space', False)
 
         if self.use_flow:
             self.flow = HarmonizingFlow(
@@ -108,8 +93,8 @@ class ClefPianoBase(nn.Module):
                 sample_rate=config.sample_rate,
                 n_fft=config.n_fft,
                 init=getattr(config, 'flow_init', 'harmonic'),
-                use_temporal_cnn=self.use_temporal_cnn,
-                temporal_pool_stride=getattr(config, 'temporal_pool_stride', 8),
+                use_temporal_cnn=False,
+                temporal_pool_stride=8,
             )
 
         # === MultiScaleBridge ===
@@ -119,14 +104,11 @@ class ClefPianoBase(nn.Module):
 
         bridge_input_dims = None
         # Serial encoder: Octopus + Flow + Swin stages
-        if self.use_octopus and self.swin_on_pitch_space:
+        if self.use_octopus:
             octopus_dim = getattr(config, 'octopus_channels', 32)
             bridge_input_dims = [octopus_dim, config.n_mels] + swin_dims_used
         elif self.use_flow:
-            flow_dims = [config.n_mels]
-            if self.use_temporal_cnn:
-                flow_dims = [config.n_mels, config.n_mels]
-            bridge_input_dims = flow_dims + swin_dims_used
+            bridge_input_dims = [config.n_mels] + swin_dims_used
         elif self.swin_start_stage > 0:
             bridge_input_dims = swin_dims_used
 
@@ -149,17 +131,9 @@ class ClefPianoBase(nn.Module):
         # === Decoder ===
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
 
-        # Position embedding: RoPE (default) or learned absolute
-        self.use_rope = getattr(config, 'use_rope', True)
-        if not self.use_rope:
-            # Legacy: learned absolute position embedding
-            self.decoder_pos_embed = nn.Parameter(
-                torch.zeros(1, config.max_seq_len, config.d_model)
-            )
-            nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
-        else:
-            # RoPE: no position embedding parameter needed
-            self.decoder_pos_embed = None
+        # Position embedding: RoPE only
+        self.use_rope = True
+        self.decoder_pos_embed = None
 
         self.decoder = ClefDecoder(
             d_model=config.d_model,
@@ -344,16 +318,10 @@ class ClefPianoBase(nn.Module):
         spatial_shapes_list = []
         valid_ratios_list = []
 
-        if self.use_octopus and self.swin_on_pitch_space:
-            # === Serial encoder: mel → Octopus → Flow → Swin (pitch space) ===
-            self._encode_serial(
-                mel, B, T, features, spatial_shapes_list, valid_ratios_list
-            )
-        else:
-            # === Legacy parallel encoder: Flow || Swin (both on mel) ===
-            self._encode_parallel(
-                mel, B, features, spatial_shapes_list, valid_ratios_list
-            )
+        # === Serial encoder: mel → Octopus → Flow → Swin (pitch space) ===
+        self._encode_serial(
+            mel, B, T, features, spatial_shapes_list, valid_ratios_list
+        )
 
         # Compute per-level valid ratios [B, L, 2]
         level_valid_ratios = torch.tensor(
@@ -367,7 +335,6 @@ class ClefPianoBase(nn.Module):
         )
 
         # Ensure _cached_onset_1d is accessible after encode() (set by _encode_serial).
-        # If not serial mode, onset_1d is None (bar attention is a no-op).
         if not hasattr(self, '_cached_onset_1d'):
             self._cached_onset_1d = None
 
@@ -408,18 +375,6 @@ class ClefPianoBase(nn.Module):
         spatial_shapes_list.append((H_onset, W_onset))
         valid_ratios_list.append([1.0, 1.0])
 
-        # Step 1.5: Bar Tracker — extracts temporal structure from onset_raw
-        # Symmetric to Flow: Flow extracts pitch (along F), BarTracker extracts time (along T)
-        # onset_raw: [B, C, 128, T] (pre-pooling, full frequency resolution)
-        if self.bar_tracker is not None:
-            # bar_times and audio_duration_frames are injected by forward() before calling _encode_serial
-            bar_times = getattr(self, '_bar_tracker_bar_times', None)
-            audio_duration_frames = getattr(self, '_bar_tracker_audio_duration', None)
-            bar_phase, bar_tracker_loss = self.bar_tracker(
-                onset_raw, bar_times=bar_times, audio_duration_frames=audio_duration_frames
-            )
-            self._cached_bar_phase = bar_phase              # [B, T_octopus, 1]
-            self._cached_bar_tracker_loss = bar_tracker_loss  # scalar or None
 
         # Step 2: Flow — harmonic template matching on raw mel (IC eats stellate, not octopus)
         # use_temporal_cnn=False in serial mode, so flow returns tensor directly
@@ -499,81 +454,6 @@ class ClefPianoBase(nn.Module):
             features.append(feat)
             spatial_shapes_list.append((H_s, W_s))
             valid_ratios_list.append([valid_ratio_w_s, valid_ratio_h_s])
-
-    def _encode_parallel(
-        self,
-        mel: torch.Tensor,
-        B: int,
-        features: list,
-        spatial_shapes_list: list,
-        valid_ratios_list: list,
-    ) -> None:
-        """Legacy parallel encoder: Flow and Swin both read raw mel independently."""
-        # Pad to multiple of 32 (Swin V2 window size constraint)
-        padded_mel, (orig_H, orig_W) = self._pad_to_multiple(mel, multiple=32)
-        _, _, H_pad, T_pad = padded_mel.shape
-
-        valid_ratio_h = orig_H / H_pad
-        valid_ratio_w = orig_W / T_pad
-
-        # Expand to 3 channels for Swin
-        x = padded_mel.repeat(1, 3, 1, 1)  # [B, 3, H_pad, T_pad]
-
-        # Run Swin encoder
-        swin_fully_frozen = (self.config.freeze_encoder
-                             and not getattr(self.config, 'swin_unfreeze', []))
-        ctx = torch.no_grad() if swin_fully_frozen else nullcontext()
-        with ctx:
-            swin_out = self.swin(x, output_hidden_states=True)
-
-        # Level 0 (+Level 1 if TemporalCNN): HarmonizingFlow
-        if self.use_flow:
-            flow_out = self.flow(mel)  # tuple or tensor
-
-            if self.use_temporal_cnn:
-                flow_feat, temporal_feat = flow_out
-            else:
-                flow_feat = flow_out
-
-            pool_stride = getattr(self.config, 'flow_pool_stride', 4)
-            if pool_stride > 1:
-                flow_feat = flow_feat.permute(0, 2, 1)
-                flow_feat = F.avg_pool1d(flow_feat, kernel_size=pool_stride,
-                                         stride=pool_stride)
-                flow_feat = flow_feat.permute(0, 2, 1)
-
-            T_flow = flow_feat.shape[1]
-            features.append(flow_feat)
-            spatial_shapes_list.append((1, T_flow))
-            valid_ratios_list.append([1.0, 1.0])
-
-            if self.use_temporal_cnn:
-                T_temporal = temporal_feat.shape[1]
-                features.append(temporal_feat)
-                spatial_shapes_list.append((1, T_temporal))
-                valid_ratios_list.append([1.0, 1.0])
-
-        # Swin stages
-        n_swin_stages = len(self.config.swin_dims)
-        all_swin_shapes = self._compute_spatial_shapes(H_pad, T_pad)
-        swin_pools = getattr(self.config, 'swin_pool_strides', [1] * n_swin_stages)
-
-        for i in range(self.swin_start_stage, n_swin_stages):
-            feat = swin_out.hidden_states[i]
-            H_s, W_s = all_swin_shapes[i]
-            pool_s = swin_pools[i] if i < len(swin_pools) else 1
-
-            if pool_s > 1:
-                feat = feat.view(B, H_s, W_s, -1).permute(0, 3, 1, 2)
-                feat = F.avg_pool2d(feat, kernel_size=(1, pool_s),
-                                    stride=(1, pool_s))
-                feat = feat.permute(0, 2, 3, 1)
-                W_s = feat.shape[2]
-                feat = feat.reshape(B, H_s * W_s, -1)
-
-            features.append(feat)
-            spatial_shapes_list.append((H_s, W_s))
-            valid_ratios_list.append([valid_ratio_w, valid_ratio_h])
 
     def _pad_to_multiple(
         self, mel: torch.Tensor, multiple: int = 32
@@ -709,20 +589,11 @@ class ClefPianoBase(nn.Module):
         # Token embedding
         tgt = self.token_embed(input_ids)  # [B, S, D]
 
-        # Position info: RoPE uses offset (int), legacy uses embedding tensor
-        if self.use_rope:
-            # RoPE: pass position offset as int (SA layers handle internally)
-            if past_states is not None:
-                tgt_pos = self._get_cached_len(past_states)  # int offset
-            else:
-                tgt_pos = 0
+        # Position info: RoPE uses offset (int)
+        if past_states is not None:
+            tgt_pos = self._get_cached_len(past_states)  # int offset
         else:
-            # Legacy: learned absolute position embedding
-            if past_states is not None:
-                cached_len = self._get_cached_len(past_states)
-                tgt_pos = self.decoder_pos_embed[:, cached_len:cached_len + S, :]
-            else:
-                tgt_pos = self.decoder_pos_embed[:, :S, :]
+            tgt_pos = 0
 
         # Run decoder
         if use_cache:
@@ -804,36 +675,6 @@ class ClefPianoBase(nn.Module):
             logits: Output logits [B, S, vocab_size]
             loss: CE loss + guidance_loss_weight * guidance_loss (if labels provided)
         """
-        # Prepare Bar Tracker inputs (injected before encode, consumed in _encode_serial)
-        if self.bar_tracker is not None and chunk_audio_measures is not None:
-            fps = self.config.sample_rate / self.config.hop_length  # typically 100
-            time_pool = getattr(self.config, 'octopus_time_pool_stride', 2)
-            bar_times_list = []
-            for b, (measures, start_f) in enumerate(
-                zip(chunk_audio_measures, chunk_start_frames or [0] * len(chunk_audio_measures))
-            ):
-                if measures is None:
-                    bar_times_list.append(None)
-                    continue
-                # Convert bar start_sec → Octopus-resolution frame index (relative to chunk)
-                onsets = torch.tensor(
-                    [(m['start_sec'] * fps - start_f) / time_pool for m in measures],
-                    dtype=torch.float32,
-                )
-                # Clamp to valid range
-                T_octopus = mel.shape[-1] // time_pool
-                onsets = onsets.clamp(0, T_octopus - 1)
-                bar_times_list.append(onsets)
-            T_octopus = mel.shape[-1] // time_pool
-            audio_duration = torch.full(
-                (mel.shape[0],), T_octopus, dtype=torch.float32, device=mel.device
-            )
-            self._bar_tracker_bar_times = bar_times_list
-            self._bar_tracker_audio_duration = audio_duration
-        else:
-            self._bar_tracker_bar_times = None
-            self._bar_tracker_audio_duration = None
-
         # Encode
         memory, spatial_shapes, level_start_index, valid_ratios = self.encode(
             mel, mel_valid_ratios
@@ -888,13 +729,6 @@ class ClefPianoBase(nn.Module):
                     total_loss = ce_loss + eff_guidance_weight * guidance_loss
                     return logits, ce_loss, total_loss
 
-            # Add bar tracker guidance loss if available
-            bar_tracker_weight = getattr(self.config, 'bar_tracker_loss_weight', 0.0)
-            if bar_tracker_weight > 0.0:
-                bt_loss = getattr(self, '_cached_bar_tracker_loss', None)
-                if bt_loss is not None:
-                    total_loss = ce_loss + bar_tracker_weight * bt_loss
-                    return logits, ce_loss, total_loss
 
         return logits, loss, loss
 

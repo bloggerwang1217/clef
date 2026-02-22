@@ -32,8 +32,6 @@ class ClefConfig:
     n_harmonics: int = 6
     flow_init: str = 'harmonic'  # 'harmonic' (physics) or 'orthogonal' (random)
     flow_pool_stride: int = 4    # Temporal pooling to match Swin S0 resolution
-    use_temporal_cnn: bool = False  # Causal 1D CNN on Flow output for onset/duration
-    temporal_pool_stride: int = 4   # Pool stride for temporal CNN output (T -> T/4)
 
     # === Octopus2D (cross-frequency onset detection) ===
     use_octopus: bool = False          # Enable Octopus2D onset detector
@@ -44,7 +42,6 @@ class ClefConfig:
 
     # === Swin Stage Selection ===
     swin_start_stage: int = 0  # Skip Swin stages before this index (0=use all, 1=skip S0)
-    swin_on_pitch_space: bool = False  # True = serial (Swin eats Flow output, not raw mel)
     # Time-axis pool per Swin stage (remove overlapping-window redundancy)
     # Swin0: RF~320ms, grid 40ms → pool 8x (Nyquist, chord is discrete)
     # Swin1: RF~640ms, grid 80ms → pool 4x (50% overlap, melody needs continuity)
@@ -88,7 +85,6 @@ class ClefConfig:
     mamba_expand: int = 2
     max_seq_len: int = 4096
     vocab_size: int = 512   # Will be set from tokenizer
-    use_rope: bool = True   # RoPE for SA layers (no max_seq_len limit, saves memory)
     # Window cross-attention (for 'window_ca' layer type)
     window_time_frames: Union[int, List[int]] = 16   # int (all levels) or List[int] (per level)
     window_freq_bins: Union[int, List[int]] = 8      # int (all levels) or List[int] (per level)
@@ -115,13 +111,11 @@ class ClefConfig:
         n_swin_used = len(self.swin_dims) - self.swin_start_stage
         expected_levels = (n_swin_used
                           + (1 if self.use_flow else 0)
-                          + (1 if self.use_octopus else 0)
-                          + (1 if self.use_temporal_cnn else 0))
+                          + (1 if self.use_octopus else 0))
         assert self.n_levels == expected_levels, (
             f"n_levels({self.n_levels}) must be "
             f"swin({n_swin_used}) + flow({1 if self.use_flow else 0}) "
-            f"+ octopus({1 if self.use_octopus else 0}) "
-            f"+ cnn({1 if self.use_temporal_cnn else 0}) = {expected_levels}"
+            f"+ octopus({1 if self.use_octopus else 0}) = {expected_levels}"
         )
         assert self.n_points_freq > 0, "n_points_freq must be positive"
         assert self.n_points_time > 0, "n_points_time must be positive"

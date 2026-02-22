@@ -56,7 +56,7 @@ models/
 .pytest_cache/
 .coverage
 htmlcov/
-tests/*/output/
+tests/sanity/*
 
 # Logs
 *.log

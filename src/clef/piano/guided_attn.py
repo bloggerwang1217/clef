@@ -1,6 +1,6 @@
 """Guided Attention Loss Utilities
 
-Computes per-token measure bounds for supervising L1 SAFullCALayer
+Computes per-token measure bounds for supervising L1 SAWindowCALayer
 to attend to the correct audio time region via a CoM hinge loss.
 
 Design:
@@ -10,19 +10,16 @@ Design:
   the normalized time range [0,1] of the measure in the chunk.
 - Other structural tokens (IDs 0-3, 5-9) receive sentinel (-1, -1) and are skipped.
 
-Loss (CoM hinge, applied in SAFullCALayer):
-  CoM[s] = Σ_j A[s,j] * time_norm[j]           # weighted mean of attention positions
+Loss (CoM hinge, applied in SAWindowCALayer):
+  CoM[s] = com_t_all[s]  # scalar bar attention center-of-mass (from BarGRU)
   loss[s] = relu(norm_start - CoM) + relu(CoM - norm_end)
            = 0  when CoM is within the correct measure  (zero gradient inside interval)
            = linear penalty otherwise
 
-This is strictly less demanding than CE-form (Liu et al. 2016):
-- CE forces a specific distribution over N_kv positions (3760 positions at
-  0.64s+1.28s resolution — far more precision than bar-level L1 can provide)
-- CoM hinge only constrains the first moment (scalar center), zero gradient
-  when the attention center is already in the right measure.
+Applied to both bar tokens and note tokens (all tokens with valid bounds lo >= 0).
+Structural tokens (IDs 0-3, 5-9) receive sentinel (-1, -1) and are excluded.
 
-Memory: O(B·S) vs O(B·S·N_kv) for CE-form — massive reduction.
+Memory: O(B·S) — one scalar CoM per token, no distribution overhead.
 """
 
 import torch
@@ -43,12 +40,13 @@ def build_guidance_bounds(
     chunk_end_frames: List[int],                          # per-sample chunk end (mel frames)
     mel_fps: float = 100.0,
 ) -> Optional[torch.Tensor]:                              # [B, S, 2] or None
-    """Build per-token guidance bounds for CoM hinge loss in L1 Full CA.
+    """Build per-token guidance bounds for CoM hinge loss in L1 SAWindowCALayer.
 
-    For each note token AND <bar> token at position s, returns the normalized
+    For each <bar> token AND note token at position s, returns the normalized
     time range (norm_start, norm_end) of its containing audio measure.
     Other structural tokens (IDs 0-3, 5-9) receive sentinel (-1, -1) and are
-    excluded from the loss by the ``valid = lo >= 0`` mask in SAFullCALayer.
+    excluded from the loss by the ``valid = lo >= 0`` mask in
+    SAWindowCALayer (bar and note tokens are both supervised).
 
     Measure assignment: token at position s is in measure m where m equals
     the number of <bar> tokens seen before position s in input_ids.

@@ -136,7 +136,7 @@ class Trainer:
         if world_size > 1:
             self.model = DDP(
                 self.model, device_ids=[local_rank],
-                find_unused_parameters=False,
+                find_unused_parameters=True,
             )
 
         # Data loaders
@@ -181,18 +181,27 @@ class Trainer:
         total_steps = total_steps // gradient_accumulation_steps
         self.total_steps = total_steps
         warmup_steps = config.warmup_steps if hasattr(config, 'warmup_steps') else 1000
-
-        # max_lrs must match param_groups: [other, (swin)]
-        max_lrs = [base_lr]
+        
+        # LR schedule: Cosine with warmup + min LR
+        # - Steps 0 → warmup_steps: linear warmup from 0 to max_lr
+        # - Steps warmup_steps → total_steps: cosine decay from max_lr to min_lr (not 0)
+        # - min_lr = max_lr / 10 (default, configurable via lr_min_ratio)
+        lr_min_ratio = getattr(config, 'lr_min_ratio', 0.1)
+        min_lrs = [base_lr * lr_min_ratio]
         if swin_params:
-            max_lrs.append(swin_lr)
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            min_lrs.append(swin_lr * lr_min_ratio)
+        
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            max_lr=max_lrs,
-            total_steps=total_steps,
-            pct_start=warmup_steps / total_steps,
-            anneal_strategy='cos',
+            lr_lambda=[
+                lambda step: self._get_lr_scale(step, base_lr, base_lr * lr_min_ratio, warmup_steps, total_steps),
+                lambda step: self._get_lr_scale(step, swin_lr, swin_lr * lr_min_ratio, warmup_steps, total_steps),
+            ][:len(param_groups)],  # only use as many lambdas as param groups
         )
+        self.base_lr = base_lr
+        self.min_lr = base_lr * lr_min_ratio
+        self.swin_lr = swin_lr if swin_params else None
+        self.swin_min_lr = swin_lr * lr_min_ratio if swin_params else None
 
         # Mixed precision
         self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
@@ -212,25 +221,67 @@ class Trainer:
         self._build_token_type_masks()
 
     def _get_guidance_weight(self) -> float:
-        """Cosine-decay guidance_loss_weight, held constant during warmup.
+        """Cosine-decay guidance_loss_weight, starting decay after warmup.
 
         Schedule:
-          Steps 0 → warmup_steps         : weight = guidance_loss_weight  (constant)
-          Steps warmup_steps → decay_end : cosine decay → guidance_loss_weight_end
-          Steps > decay_end              : weight = guidance_loss_weight_end (constant)
+          Steps 0 → warmup_steps              : weight = guidance_loss_weight  (constant)
+          Steps warmup_steps → decay_end      : cosine decay → guidance_loss_weight_end
+          Steps > decay_end                   : weight = guidance_loss_weight_end (constant)
 
-        guidance_decay_steps sets the absolute step at which decay reaches the
-        end value. If 0 or unset, falls back to total_steps (old behaviour).
+        guidance_decay_steps sets the number of steps AFTER warmup for decay
+        (e.g., guidance_decay_steps=2500 means decay from warmup_steps to warmup_steps+2500).
+        If 0 or unset, falls back to total_steps - warmup_steps (old behaviour).
         """
         import math
         start = self.config.guidance_loss_weight
         end = getattr(self.config, 'guidance_loss_weight_end', start)
         if start == end or self.global_step <= self.warmup_steps:
             return start
-        decay_end = getattr(self.config, 'guidance_decay_steps', 0) or self.total_steps
-        decay_steps = max(decay_end - self.warmup_steps, 1)
-        t = min((self.global_step - self.warmup_steps) / decay_steps, 1.0)
+        
+        # guidance_decay_steps is now relative to warmup_steps (duration of decay, not absolute step)
+        decay_duration = getattr(self.config, 'guidance_decay_steps', 0) or (self.total_steps - self.warmup_steps)
+        decay_end = self.warmup_steps + decay_duration
+        
+        if self.global_step >= decay_end:
+            return end
+        
+        # Cosine decay from start to end over [warmup_steps, decay_end]
+        decay_steps = max(decay_duration, 1)
+        t = (self.global_step - self.warmup_steps) / decay_steps
         return end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * t))
+
+    def _get_lr_scale(self, step: int, max_lr: float, min_lr: float, warmup_steps: int, total_steps: int) -> float:
+        """Return LR scale factor for LambdaLR scheduler.
+        
+        Schedule:
+          Steps 0 → warmup_steps: linear warmup from 0 to 1.0
+          Steps warmup_steps → total_steps: cosine decay from 1.0 to min_lr/max_lr ratio
+        
+        Args:
+            step: Current training step
+            max_lr: Maximum learning rate (initial LR)
+            min_lr: Minimum learning rate (final LR after cosine decay)
+            warmup_steps: Number of warmup steps
+            total_steps: Total training steps
+            
+        Returns:
+            Scale factor to multiply with base LR (LambdaLR expects scale, not absolute LR)
+        """
+        import math
+        
+        # Linear warmup: 0 → 1.0
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        
+        # Cosine decay: 1.0 → min_lr/max_lr
+        if step >= total_steps:
+            return min_lr / max_lr
+        
+        decay_steps = max(total_steps - warmup_steps, 1)
+        t = (step - warmup_steps) / decay_steps  # 0 → 1
+        min_scale = min_lr / max_lr
+        # Cosine annealing from 1.0 to min_scale
+        return min_scale + 0.5 * (1.0 - min_scale) * (1.0 + math.cos(math.pi * t))
 
     def _get_tf_ratio(self) -> float:
         """Linear decay of teacher-forcing ratio for BarGRU scheduled sampling.

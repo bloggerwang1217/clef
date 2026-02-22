@@ -24,8 +24,6 @@ model:
   swin_unfreeze: ["patch_embed", "position_bias", "downsample"]  # Minimal unfreeze
   swin_lr_scale: 0.1
 
-  # Serial encoder: Swin eats Flow output (pitch space)
-  swin_on_pitch_space: true
   swin_start_stage: 0  # Start from S0
   swin_pool_strides: [1]
 
@@ -41,7 +39,6 @@ model:
   use_flow: true
   n_harmonics: 6
   flow_pool_stride: 4
-  use_temporal_cnn: false
 
   # Attention config
   d_model: 512
