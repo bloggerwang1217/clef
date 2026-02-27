@@ -22,7 +22,7 @@ from transformers import Swinv2Model
 from .config import ClefPianoConfig
 from .guided_attn import build_guidance_bounds
 from ..bridge import MultiScaleBridge
-from ..decoder import ClefDecoder, MambaOnlyLayer
+from ..decoder import ClefDecoder, MambaOnlyLayer, MambaWindowCALayer
 from ..flow import HarmonizingFlow, Octopus2D
 
 
@@ -117,10 +117,6 @@ class ClefPianoBase(nn.Module):
             d_model=config.d_model,
             n_heads=config.n_heads,
             n_levels=config.n_levels,
-            n_points_freq=config.n_points_freq,
-            n_points_time=config.n_points_time,
-            freq_offset_scale=config.freq_offset_scale,
-            time_offset_scale=config.time_offset_scale,
             n_layers=config.bridge_layers,
             ff_dim=config.ff_dim,
             dropout=config.dropout,
@@ -140,16 +136,9 @@ class ClefPianoBase(nn.Module):
             n_heads=config.n_heads,
             n_layers=config.decoder_layers,
             n_levels=config.n_levels,
-            n_points_freq=config.n_points_freq,
-            n_points_time=config.n_points_time,
-            freq_offset_scale=config.freq_offset_scale,
-            time_offset_scale=config.time_offset_scale,
             ff_dim=config.ff_dim,
             dropout=config.dropout,
-            use_time_prior=config.use_time_prior,
             use_freq_prior=config.use_freq_prior,
-            n_freq_groups=config.n_freq_groups,
-            refine_range=config.refine_range,
             rope_base=config.rope_base,
             time_prior_d_state=config.time_prior_d_state,
             time_prior_d_state_context=config.time_prior_d_state_context,
@@ -169,6 +158,7 @@ class ClefPianoBase(nn.Module):
             onset_1d_channels=getattr(config, 'octopus_channels', 32),
             note_gru_hidden_size=getattr(config, 'note_gru_hidden_size', 256),
             note_gru_input_dropout=getattr(config, 'note_gru_input_dropout', 0.1),
+            window_exp_decay_lambda=getattr(config, 'window_exp_decay_lambda', 0.0),
         )
 
         # === Output ===
@@ -199,7 +189,13 @@ class ClefPianoBase(nn.Module):
         if getattr(config, 'gradient_checkpointing', False):
             self.decoder.gradient_checkpointing = True
             if hasattr(self.swin, 'gradient_checkpointing_enable'):
-                self.swin.gradient_checkpointing_enable()
+                # Must use use_reentrant=False to avoid DDP conflict.
+                # HF's default reentrant checkpointing causes "variable marked ready twice"
+                # when combined with DDP, because the same Swin parameter is hit by
+                # multiple autograd hooks during backward.
+                self.swin.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={'use_reentrant': False}
+                )
 
         if self.use_octopus:
             self.octopus.apply(self._init_weights)
@@ -522,13 +518,13 @@ class ClefPianoBase(nn.Module):
                     memory, spatial_shapes, level_start_index,
                 )
             elif hasattr(layer, 'window_ca'):
-                # SAWindowCALayer: WindowCrossAttention KV cache (only active levels)
+                # SAWindowCALayer / MambaWindowCALayer: WindowCrossAttention KV cache
                 cache = layer.window_ca.compute_kv_cache(
                     memory, spatial_shapes, level_start_index,
                     active_levels=layer.active_ca_levels,
                 )
             else:
-                cache = None  # MambaOnlyLayer, PerceiverLayer, SAFullCALayer
+                cache = None  # MambaOnlyLayer, MambaFullCALayer
             value_cache_list.append(cache)
         return value_cache_list
 

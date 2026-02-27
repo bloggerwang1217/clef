@@ -55,6 +55,7 @@ class WindowCrossAttention(nn.Module):
         full_freq_levels: Optional[List[int]] = None,  # per-level full_freq override (overrides full_freq)
         cascade_com: bool = False,  # after each level, use its CoM as center for the next level
         use_checkpoint: bool = True,  # gradient checkpoint per seq-chunk during training
+        exp_decay_lambda: float = 0.0,  # >0: soft exponential decay mask (L1 dist); 0 = disabled
     ):
         super().__init__()
 
@@ -81,6 +82,7 @@ class WindowCrossAttention(nn.Module):
         self.full_freq_levels = set(full_freq_levels) if full_freq_levels is not None else None
         self.cascade_com = cascade_com
         self.use_checkpoint = use_checkpoint
+        self.exp_decay_lambda = exp_decay_lambda
 
         self.query_proj = nn.Linear(d_model, d_model)
         self.key_proj = nn.Linear(d_model, d_model)
@@ -233,6 +235,15 @@ class WindowCrossAttention(nn.Module):
             # scores: [B, C, H, 1, K_l]  (tiny: N_q×H×K_l × 2 bytes)
             scores_l = torch.matmul(q_exp, k_s.transpose(-1, -2)) / scale
             del k_s  # free K before V gather
+
+            # Exponential decay soft mask: bias score by -λ·|t_j - tc_curr|
+            # Gradient flows through tc_curr (com_t from BarMamba / previous layer),
+            # providing an L1-style pull toward the true bar position.
+            # t_norm_l: [B, C, K_l], tc_curr: [B, C] → dist [B, C, K_l]
+            if self.exp_decay_lambda > 0.0:
+                dist = (t_norm_l.to(scores_l.dtype) - tc_curr.unsqueeze(-1)).abs()  # [B, C, K_l]
+                scores_l = scores_l + (-self.exp_decay_lambda * dist).unsqueeze(2).unsqueeze(2)  # [B,C,1,1,K_l]
+
             lse_l = torch.logsumexp(scores_l, dim=-1, keepdim=True)  # [B, C, H, 1, 1]
             w_l = torch.exp(scores_l - lse_l)                        # [B, C, H, 1, K_l]
             del scores_l

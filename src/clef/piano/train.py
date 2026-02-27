@@ -120,6 +120,7 @@ class Trainer:
         gradient_clip: float = 1.0,
         validate_every_n_steps: int = 500,
         early_stopping_patience: int = 0,  # 0 = disabled
+        save_every_n_epochs: int = 10,
     ):
         self.config = config
         self.rank = rank
@@ -130,6 +131,7 @@ class Trainer:
         self.gradient_clip = gradient_clip
         self.validate_every_n_steps = validate_every_n_steps
         self.early_stopping_patience = early_stopping_patience
+        self.save_every_n_epochs = save_every_n_epochs
 
         # Model
         self.model = model.to(self.device)
@@ -151,30 +153,59 @@ class Trainer:
         swin_lr_scale = getattr(config, 'swin_lr_scale', 0.1)
         swin_lr = base_lr * swin_lr_scale
         weight_decay = config.weight_decay if hasattr(config, 'weight_decay') else 0.01
+        # Fine-tuning Swin: smaller WD preserves pretrained representations.
+        # Defaults to 0 (rely on reduced LR alone); set explicitly to match main WD if training from scratch.
+        swin_weight_decay = getattr(config, 'swin_weight_decay', 0.0)
 
-        swin_params = []
-        other_params = []
+        # No-decay parameter names: embeddings, norms, biases, Mamba SSM state params.
+        # Mamba's A_log encodes the SSM poles (sensitive to magnitude shrinking).
+        NO_DECAY_SUFFIXES = ('bias',)
+        NO_DECAY_KEYWORDS = (
+            'norm', 'ln_',               # LayerNorm / RMSNorm weights
+            '.embedding', 'token_emb',   # token / bar PE embeddings
+            'A_log', '.D',               # Mamba SSM poles and skip
+        )
+
+        def _is_no_decay(name: str) -> bool:
+            if name.endswith(NO_DECAY_SUFFIXES):
+                return True
+            return any(kw in name for kw in NO_DECAY_KEYWORDS)
+
+        # Four groups: (swin / other) × (decay / no_decay)
+        swin_decay, swin_nodecay = [], []
+        other_decay, other_nodecay = [], []
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
+            nodecay = _is_no_decay(name)
             if name.startswith('swin.'):
-                swin_params.append(param)
+                (swin_nodecay if nodecay else swin_decay).append(param)
                 if self.rank == 0:
-                    logger.debug(f'Swin param (lr={swin_lr:.2e}): {name}')
+                    logger.debug(f'Swin param (lr={swin_lr:.2e}, wd={"0" if nodecay else weight_decay}): {name}')
             else:
-                other_params.append(param)
+                (other_nodecay if nodecay else other_decay).append(param)
 
+        n_decay   = len(other_decay)   + len(swin_decay)
+        n_nodecay = len(other_nodecay) + len(swin_nodecay)
         if self.rank == 0:
-            logger.info(f'Optimizer: {len(other_params)} other params (lr={base_lr:.2e}), '
-                       f'{len(swin_params)} swin params (lr={swin_lr:.2e})')
+            logger.info(
+                f'Optimizer: {n_decay} decay params (wd={weight_decay}), '
+                f'{n_nodecay} no-decay params (wd=0) | '
+                f'base_lr={base_lr:.2e}, swin_lr={swin_lr:.2e}, swin_wd={swin_weight_decay}'
+            )
 
-        # Group order: [0] other, [1] swin (optional)
-        param_groups = [{'params': other_params, 'lr': base_lr}]
-        if swin_params:
-            param_groups.append({'params': swin_params, 'lr': swin_lr})
+        param_groups = [
+            {'params': other_decay,   'lr': base_lr,  'weight_decay': weight_decay},
+            {'params': other_nodecay, 'lr': base_lr,  'weight_decay': 0.0},
+        ]
+        if swin_decay or swin_nodecay:
+            param_groups += [
+                {'params': swin_decay,   'lr': swin_lr, 'weight_decay': swin_weight_decay},
+                {'params': swin_nodecay, 'lr': swin_lr, 'weight_decay': 0.0},
+            ]
 
-        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)  # per-group WD above
 
         # Learning rate scheduler
         total_steps = len(train_loader) * (config.max_epochs if hasattr(config, 'max_epochs') else 50)
@@ -187,21 +218,23 @@ class Trainer:
         # - Steps warmup_steps → total_steps: cosine decay from max_lr to min_lr (not 0)
         # - min_lr = max_lr / 10 (default, configurable via lr_min_ratio)
         lr_min_ratio = getattr(config, 'lr_min_ratio', 0.1)
-        min_lrs = [base_lr * lr_min_ratio]
-        if swin_params:
-            min_lrs.append(swin_lr * lr_min_ratio)
-        
+
+        # Build one lambda per param group; no-decay groups share LR schedule with decay peers.
+        other_lambda = lambda step: self._get_lr_scale(step, base_lr, base_lr * lr_min_ratio, warmup_steps, total_steps)
+        swin_lambda  = lambda step: self._get_lr_scale(step, swin_lr, swin_lr * lr_min_ratio, warmup_steps, total_steps)
+        lr_lambdas = [other_lambda, other_lambda]           # other_decay, other_nodecay
+        if swin_decay or swin_nodecay:
+            lr_lambdas += [swin_lambda, swin_lambda]        # swin_decay, swin_nodecay
+
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=[
-                lambda step: self._get_lr_scale(step, base_lr, base_lr * lr_min_ratio, warmup_steps, total_steps),
-                lambda step: self._get_lr_scale(step, swin_lr, swin_lr * lr_min_ratio, warmup_steps, total_steps),
-            ][:len(param_groups)],  # only use as many lambdas as param groups
+            lr_lambda=lr_lambdas,
         )
         self.base_lr = base_lr
         self.min_lr = base_lr * lr_min_ratio
-        self.swin_lr = swin_lr if swin_params else None
-        self.swin_min_lr = swin_lr * lr_min_ratio if swin_params else None
+        has_swin = bool(swin_decay or swin_nodecay)
+        self.swin_lr = swin_lr if has_swin else None
+        self.swin_min_lr = swin_lr * lr_min_ratio if has_swin else None
 
         # Mixed precision
         self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
@@ -252,35 +285,41 @@ class Trainer:
 
     def _get_lr_scale(self, step: int, max_lr: float, min_lr: float, warmup_steps: int, total_steps: int) -> float:
         """Return LR scale factor for LambdaLR scheduler.
-        
-        Schedule:
-          Steps 0 → warmup_steps: linear warmup from 0 to 1.0
-          Steps warmup_steps → total_steps: cosine decay from 1.0 to min_lr/max_lr ratio
-        
-        Args:
-            step: Current training step
-            max_lr: Maximum learning rate (initial LR)
-            min_lr: Minimum learning rate (final LR after cosine decay)
-            warmup_steps: Number of warmup steps
-            total_steps: Total training steps
-            
-        Returns:
-            Scale factor to multiply with base LR (LambdaLR expects scale, not absolute LR)
+
+        Schedule (WSD — Warmup → Stable → Decay):
+          Steps 0          → warmup_steps : linear warmup 0 → 1.0
+          Steps warmup_steps → flat_end   : flat plateau at 1.0  (grokking zone)
+          Steps flat_end   → total_steps  : cosine decay 1.0 → min_lr/max_lr
+          Steps >= total_steps             : hold at min_lr/max_lr
+
+        lr_flat_ratio (config, default 0.0) controls the fraction of the
+        post-warmup budget spent on the flat plateau.
+          0.0 → original cosine-only behaviour (backward compatible)
+          0.6 → 60% of post-warmup steps are flat, 40% cosine decay
         """
         import math
-        
-        # Linear warmup: 0 → 1.0
+
+        flat_ratio = getattr(self.config, 'lr_flat_ratio', 0.0)
+        post_warmup = max(total_steps - warmup_steps, 1)
+        flat_steps = int(flat_ratio * post_warmup)
+        flat_end = warmup_steps + flat_steps
+
+        # Linear warmup
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
-        
-        # Cosine decay: 1.0 → min_lr/max_lr
+
+        # Flat plateau
+        if step < flat_end:
+            return 1.0
+
+        # Hold at min after total_steps
         if step >= total_steps:
             return min_lr / max_lr
-        
-        decay_steps = max(total_steps - warmup_steps, 1)
-        t = (step - warmup_steps) / decay_steps  # 0 → 1
+
+        # Cosine decay: flat_end → total_steps
+        decay_steps = max(total_steps - flat_end, 1)
+        t = (step - flat_end) / decay_steps  # 0 → 1
         min_scale = min_lr / max_lr
-        # Cosine annealing from 1.0 to min_scale
         return min_scale + 0.5 * (1.0 - min_scale) * (1.0 + math.cos(math.pi * t))
 
     def _get_tf_ratio(self) -> float:
@@ -504,12 +543,9 @@ class Trainer:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
 
-                # Gradient clipping — Groups: [0] other, [1] swin (optional)
-                base_params = [p for p in self.optimizer.param_groups[0]['params']]
-                grad_norm = torch.nn.utils.clip_grad_norm_(base_params, self.gradient_clip)
-                if len(self.optimizer.param_groups) > 1:
-                    swin_params_clip = [p for p in self.optimizer.param_groups[1]['params']]
-                    torch.nn.utils.clip_grad_norm_(swin_params_clip, self.gradient_clip)
+                # Gradient clipping — clip all trainable params together
+                all_params = [p for g in self.optimizer.param_groups for p in g['params']]
+                grad_norm = torch.nn.utils.clip_grad_norm_(all_params, self.gradient_clip)
 
                 if self.scaler is not None:
                     old_scale = self.scaler.get_scale()
@@ -530,6 +566,13 @@ class Trainer:
                 epoch_ce_loss_accum += avg_accum_loss
                 num_batches += 1
                 self.global_step += 1
+
+                # Sync curriculum step on decoder for build_curriculum_input
+                _model = self.model.module if hasattr(self.model, 'module') else self.model
+                _decoder = getattr(_model, 'decoder', None)
+                if _decoder is not None:
+                    _decoder._curriculum_step = self.global_step
+
 
                 # Log to wandb
                 if self.use_wandb:
@@ -775,7 +818,7 @@ class Trainer:
                 else:
                     self.epochs_without_improvement += 1
 
-            if (epoch + 1) % 10 == 0 or is_best:
+            if (epoch + 1) % self.save_every_n_epochs == 0 or is_best:
                 self.save_checkpoint(
                     checkpoint_dir / f'epoch_{epoch:03d}.pt',
                     is_best=is_best,
@@ -906,25 +949,9 @@ def main():
 
     parser = argparse.ArgumentParser(description='Train clef-piano-base')
     parser.add_argument('--config', type=str, default='configs/clef_piano_base.yaml',
-                        help='Path to config file')
-    parser.add_argument('--manifest-dir', type=str, default='data/experiments/clef_piano_base',
-                        help='Directory containing train/valid/test manifests')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints/clef_piano_base',
-                        help='Directory to save checkpoints')
+                        help='Path to config YAML (single source of truth for all hyperparameters)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
-    parser.add_argument('--max-epochs', type=int, default=50,
-                        help='Maximum number of epochs')
-    parser.add_argument('--batch-size', type=int, default=2,
-                        help='Batch size per GPU')
-    parser.add_argument('--gradient-accumulation-steps', type=int, default=4,
-                        help='Gradient accumulation steps')
-    parser.add_argument('--gradient-clip', type=float, default=1.0,
-                        help='Gradient clipping max norm')
-    parser.add_argument('--validate-every-n-steps', type=int, default=500,
-                        help='Validate every N steps (0 to disable step-based validation)')
-    parser.add_argument('--early-stopping-patience', type=int, default=5,
-                        help='Stop training if valid_loss does not improve for N epochs (0 to disable)')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of data loading workers')
     parser.add_argument('--sanity-check', action='store_true',
@@ -933,8 +960,8 @@ def main():
                         help='Enable wandb logging')
     parser.add_argument('--wandb-project', type=str, default='clef-piano-base',
                         help='Wandb project name')
-    parser.add_argument('--wandb-entity', type=str, default='bloggerwang1217-national-taiwan-university',
-                        help='Wandb entity/team')
+    parser.add_argument('--wandb-entity', type=str, default=None,
+                        help='Wandb entity (team/user); defaults to wandb default entity if not set')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging')
     args = parser.parse_args()
@@ -968,7 +995,7 @@ def main():
         logger.info(f'Model created ({model_name}): {model.get_num_params():,} trainable params')
 
         # Create datasets
-        manifest_dir = Path(args.manifest_dir)
+        manifest_dir = Path(config.manifest_dir)
         train_manifest = manifest_dir / 'train_manifest.json'
         valid_manifest = manifest_dir / 'valid_manifest.json'
 
@@ -1033,14 +1060,14 @@ def main():
             # Use DistributedBucketSampler for efficient padding
             train_sampler = DistributedBucketSampler(
                 train_dataset,
-                batch_size=args.batch_size,
+                batch_size=config.batch_size,
                 num_replicas=world_size,
                 rank=rank,
                 shuffle=True,
             )
             train_loader = DataLoader(
                 train_dataset,
-                batch_size=args.batch_size,
+                batch_size=config.batch_size,
                 sampler=train_sampler,
                 num_workers=args.num_workers,
                 collate_fn=collator,
@@ -1050,12 +1077,12 @@ def main():
             # Single GPU: use regular BucketSampler
             train_sampler = BucketSampler(
                 train_dataset,
-                batch_size=args.batch_size,
+                batch_size=config.batch_size,
                 shuffle=True,
             )
             train_loader = DataLoader(
                 train_dataset,
-                batch_size=args.batch_size,
+                batch_size=config.batch_size,
                 sampler=train_sampler,
                 num_workers=args.num_workers,
                 collate_fn=collator,
@@ -1066,7 +1093,7 @@ def main():
         if valid_dataset is not None:
             valid_loader = DataLoader(
                 valid_dataset,
-                batch_size=args.batch_size,
+                batch_size=config.batch_size,
                 shuffle=False,
                 num_workers=args.num_workers,
                 collate_fn=collator,
@@ -1089,14 +1116,14 @@ def main():
                 project=args.wandb_project,
                 name=f'train-{world_size}gpu',
                 config={
-                    'batch_size': args.batch_size,
+                    'batch_size': config.batch_size,
                     'world_size': world_size,
-                    'effective_batch_size': args.batch_size * world_size * args.gradient_accumulation_steps,
-                    'gradient_accumulation_steps': args.gradient_accumulation_steps,
-                    'gradient_clip': args.gradient_clip,
-                    'max_epochs': args.max_epochs,
-                    'learning_rate': config.learning_rate if hasattr(config, 'learning_rate') else 1e-4,
-                    'validate_every_n_steps': args.validate_every_n_steps,
+                    'effective_batch_size': config.batch_size * world_size * config.gradient_accumulation_steps,
+                    'gradient_accumulation_steps': config.gradient_accumulation_steps,
+                    'gradient_clip': config.gradient_clip,
+                    'max_epochs': config.max_epochs,
+                    'learning_rate': config.learning_rate,
+                    'validate_every_n_steps': config.validate_every_n_steps,
                     'model_params': model.get_num_params(),
                 },
                 tags=['training', f'{world_size}gpu'],
@@ -1113,10 +1140,11 @@ def main():
             world_size=world_size,
             local_rank=local_rank,
             use_wandb=use_wandb,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            gradient_clip=args.gradient_clip,
-            validate_every_n_steps=args.validate_every_n_steps,
-            early_stopping_patience=args.early_stopping_patience,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            gradient_clip=config.gradient_clip,
+            validate_every_n_steps=config.validate_every_n_steps,
+            early_stopping_patience=config.early_stopping_patience,
+            save_every_n_epochs=config.save_every_n_epochs,
         )
 
         # Resume if specified
@@ -1125,8 +1153,8 @@ def main():
 
         # Train
         trainer.train(
-            max_epochs=args.max_epochs,
-            checkpoint_dir=Path(args.checkpoint_dir),
+            max_epochs=config.max_epochs,
+            checkpoint_dir=Path(config.checkpoint_dir),
         )
 
     finally:

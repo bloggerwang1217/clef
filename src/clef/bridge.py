@@ -62,10 +62,6 @@ class MultiScaleBridge(nn.Module):
         d_model: int = 512,
         n_heads: int = 8,  # Unused, kept for API compatibility
         n_levels: int = 4,
-        n_points_freq: int = 2,  # Unused
-        n_points_time: int = 2,  # Unused
-        freq_offset_scale: float = 0.15,  # Unused
-        time_offset_scale: float = 0.15,  # Unused
         n_layers: int = 2,  # Unused - no self-attention layers!
         ff_dim: int = 2048,  # Unused
         dropout: float = 0.1,

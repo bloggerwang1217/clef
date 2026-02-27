@@ -5,12 +5,12 @@ Clef Decoder
 Hybrid decoder: Mamba2 + Self-Attention + Cross-Attention.
 
 Layer pattern (clef_piano_base, 6 layers):
-  L1: window_ca  — SA + Bar Full-Attn on onset_1d + Window CA on S2+S3
-  L2: mamba_only — sequential writing
-  L3: window_ca  — SA + Window CA on S0+S1  (t from L1 DSNT, f from L1 DSNT)
-  L4: mamba_only — sequential writing
-  L5: window_ca  — SA + Window CA on L0+L1  (t from L3 DSNT, f from L3 DSNT)
-  L6: mamba_only — sequential writing
+  L1: sa_window_ca  — SA + Bar Full-Attn on onset_1d + Window CA on S2+S3
+  L2: mamba_only    — sequential writing
+  L3: sa_window_ca  — SA + Window CA on S0+S1  (t from L1 DSNT, f from L1 DSNT)
+  L4: mamba_only    — sequential writing
+  L5: sa_window_ca  — SA + Window CA on L0+L1  (t from L3 DSNT, f from L3 DSNT)
+  L6: mamba_only    — sequential writing
 
 Key design:
 - <bar> tokens in L1 do full attention over onset_1d (Octopus F-pooled, [B,T_octopus,C]).
@@ -65,635 +65,259 @@ def _carry_forward_h_bar(
     return torch.gather(table, 1, idx)
 
 
-class BarGRU(nn.Module):
-    """Hierarchical bar-level GRU for cross-bar time tracking (Zeng-inspired).
+# =============================================================================
+# BarMamba — Simplified bar-level temporal localizer
+# =============================================================================
 
-    Architecture:
-      1. note_gru: encodes all tokens within a bar into a bar_summary vector.
-      2. bar_gru:  updates across bars using bar_summary → h_bar.
-      3. query_proj: maps h_bar to an attention query.
-      4. FullAttn(query, onset_1d): audio-grounded bar center (com_t).
+class BarMamba(nn.Module):
+    """Bar-level DSNT attention on BiMamba encoder memory.
 
-    Training: bar segments are processed with PackedSequence for parallelism.
-    Scheduled sampling: each bar independently uses GT or predicted tokens
-    (bar-level TF), and within a bar each token independently (note-level TF).
+    Architecture (two-stage):
 
-    Cache:
-      _cached_com_t: [B, S, 1] — com_t at each <bar> position (zeros elsewhere).
-      _cached_h_bar: [1, B, D_bar] — last bar_gru hidden state.
+    Stage 1 — Bar Summary Attention (Perceiver-style, local within each bar):
+        At each <bar_N> position, attend ONLY to the note embeddings of bar N-1.
+        - Query  : embed(<bar_N>) + BarPE(N)   — who am I?
+        - Key/Val: embed(notes of bar N-1) + BarPE(N-1)   — what happened before me?
+        - Mask   : block-diagonal, so <bar_N> cannot see any other bar's notes.
+        Result: summary_query[N] — unique, bar-isolated representation.
+
+    Stage 2 — DSNT Attention on BiMamba memory:
+        Use summary_query to attend BiMamba level 2 → com_t ∈ [0, 1].
+
+    Bar PE: sinusoidal on bar_index (integer), NOT on token position.
+    This is an explicit hierarchical PE: unlike RoPE (which operates on token pos),
+    BarPE encodes *musical structure*, letting the model compare bars globally.
     """
 
     def __init__(
         self,
         d_model: int = 512,
-        d_bar: int = 256,
-        onset_1d_channels: int = 32,
-        input_dropout: float = 0.1,
         n_heads: int = 8,
+        active_ca_level: int = 2,  # BiMamba output level (shape [1, W])
+        n_levels: int = 6,         # kept for API compatibility
     ):
         super().__init__()
-        self.d_model = d_model
-        self.d_bar = d_bar
-        self.n_heads = n_heads
-        self.head_dim = d_bar // n_heads
+        self.d_model   = d_model
+        self.n_heads   = n_heads
+        self.head_dim  = d_model // n_heads
+        self.active_ca_level = active_ca_level
 
-        # note_gru: encode intra-bar token sequence → bar summary
-        self.note_gru = nn.GRU(d_model, d_bar, batch_first=True)
-        # bar_gru: update across bars
-        self.bar_gru = nn.GRU(d_bar, d_bar, batch_first=True)
-        # query projection: h_bar → attention query for onset_1d FullAttn
-        self.query_proj = nn.Linear(d_bar, d_bar)
-        # onset_1d projection: C → d_bar (K only; attention output is com_t, not V-aggregated)
-        self.onset_k_proj = nn.Linear(onset_1d_channels, d_bar)
+        # Stage 1: Bar Summary Attention projections
+        self.bar_q_proj  = nn.Linear(d_model, d_model, bias=False)  # <bar> → Q
+        self.bar_k_proj  = nn.Linear(d_model, d_model, bias=False)  # notes → K
+        self.bar_v_proj  = nn.Linear(d_model, d_model, bias=False)  # notes → V
+        self.bar_out     = nn.Linear(d_model, d_model, bias=False)  # summary → D
 
-        self.input_dropout = nn.Dropout(input_dropout)
+        # Stage 2: DSNT attention on BiMamba memory
+        self.query_proj    = nn.Linear(d_model, d_model, bias=False)
+        self.memory_k_proj = nn.Linear(d_model, d_model, bias=False)
 
-        # Cached state (set during training forward; updated incrementally during inference)
-        self._cached_com_t: Optional[torch.Tensor] = None
-        self._cached_h_bar: Optional[torch.Tensor] = None
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _sinusoidal_pe(self, position: torch.Tensor, scale: int = 1) -> torch.Tensor:
+        """Sinusoidal PE for arbitrary integer positions.
+
+        Args:
+            position: [N] integer or float positions
+            scale: multiply position by this before applying PE (for time-norm → frame idx)
+        Returns: [N, d_model]
+        """
+        half_d = self.d_model // 2
+        device = position.device
+        pos = position.float() * scale
+        dim = torch.arange(half_d, device=device, dtype=torch.float32)
+        inv_freq = 1.0 / (10000.0 ** (dim / half_d))
+        angles = pos.unsqueeze(1) * inv_freq.unsqueeze(0)   # [N, half_d]
+        return torch.cat([angles.sin(), angles.cos()], dim=-1)  # [N, d_model]
+
+    def _bar_pe(self, bar_indices: torch.Tensor) -> torch.Tensor:
+        """Bar Positional Encoding: sinusoidal on bar INDEX (not token position).
+
+        bar_indices: [S] int — the bar number each token belongs to (0-based).
+        Returns: [S, d_model]
+        """
+        return self._sinusoidal_pe(bar_indices.float(), scale=1)
+
+    # ── Forward ──────────────────────────────────────────────────────────────
 
     def forward(
         self,
-        token_embs: torch.Tensor,    # [B, S, D] full sequence embedding
-        onset_1d: torch.Tensor,       # [B, T_oct, C_onset]
-        bar_mask: torch.Tensor,       # [B, S] bool — True at <bar> positions
-        tf_ratio: float = 1.0,        # teacher-forcing ratio for note_gru (1.0 = all GT)
-        pred_embs: Optional[torch.Tensor] = None,  # [B, S, D] predicted embeddings for TF
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute per-bar com_t, final bar_gru hidden state, and per-position carried h_bar.
+        y: torch.Tensor,                 # [B, S, D]  — raw token embeddings (tgt)
+        memory: torch.Tensor,            # [B, N_mem, D] — full flattened encoder memory
+        spatial_shapes: torch.Tensor,    # [n_levels, 2]
+        level_start_index: torch.Tensor, # [n_levels]
+        bar_mask: torch.Tensor,          # [B, S] bool — True at <bar> positions
+        input_ids: Optional[torch.Tensor] = None,  # [B, S] int — for bar index derivation
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (com_t_all [B, S, 1], summary_embed_dense [B, S, D]).
 
-        Returns:
-            com_t_all:    [B, S, 1]      — com_t at <bar> positions, 0 elsewhere
-            h_bar_final:  [1, B, D_bar]  — final bar_gru hidden state (last bar)
-            h_bar_carried:[B, S, D_bar]  — carry-forward of h_bar at each position;
-                                           h_bar_carried[b, s] = h_bar after most recent bar ≤ s.
-                                           Used by NoteGRU to reset from the *correct* bar's h_bar,
-                                           avoiding future-leakage during teacher-forced training.
+        com_t_all: DSNT time center at <bar> positions (zeros elsewhere).
+        summary_embed_dense: Stage 1 bar summary embed forward-filled to all tokens in
+            each complete bar (bar_index < N_b). Tokens in the current bar (bar_index ==
+            N_b, still being decoded) are left as zeros so the caller can substitute tgt.
         """
-        B, S, D = token_embs.shape
-        device = token_embs.device
-        dtype = token_embs.dtype
+        B, S, D = y.shape
+        device, dtype = y.device, y.dtype
 
-        # Pool onset_1d 8x → ~160ms resolution
-        pool = 8
-        onset_pooled = F.avg_pool1d(
-            onset_1d.permute(0, 2, 1),
-            kernel_size=pool, stride=pool, ceil_mode=True,
-        ).permute(0, 2, 1)  # [B, T_oct//8, C_onset]
-        T_oct = onset_pooled.shape[1]
-        C_onset = onset_pooled.shape[2]
+        # ── Compute bar_index per token: token at pos s belongs to bar k
+        #    bar_index[s] = number of <bar> tokens at positions ≤ s (0-based).
+        #    First group (before any <bar>) is bar 0.
+        bar_index = bar_mask.long().cumsum(dim=1)          # [B, S], 0-indexed bar number
+        # <bar> token at pos s gets the index it just opened (already incremented).
+        # Notes before it should belong to the PREVIOUS bar.
+        # After cumsum: bar_index[s] for a note = number of <bar>'s seen so far.
+        # For a <bar> at position s: bar_index[s] is incremented AT s, so it == bar N.
+        # Notes following that <bar> until the next <bar> also have bar_index == N.
+        # This is exactly the "you belong to bar N" assignment we want for notes.
 
-        # Project K for FullAttn (attention output is com_t, not V-aggregated)
-        K = self.onset_k_proj(onset_pooled)  # [B, T_oct, D_bar]
+        # ── Compute Bar PE for the full sequence ─────────────────────────────
+        # shape: [S, D] for a single bar_index sequence.
+        # We compute per-sample since bar_index differs per batch element.
+        y_with_bar_pe = y.clone()
+        for b in range(B):
+            pe = self._bar_pe(bar_index[b])                # [S, D]
+            y_with_bar_pe[b] = y[b] + pe.to(dtype)
 
-        bar_positions = bar_mask.nonzero(as_tuple=False)  # [N_bars_total, 2]
+        # ── Stage 1: Bar Summary Attention ───────────────────────────────────
+        # For each <bar_N>, attend to bar N's OWN notes.
+        # summary_queries[i] = bar N's complete context.
+        # com_t is stored at <bar_{N+1}> (one-bar delay): bar N's summary guides bar N+1.
+        # In inference: run Perceiver after bar N is fully generated (when <bar_{N+1}> appears).
 
         com_t_all = torch.zeros(B, S, 1, device=device, dtype=dtype)
-        h_bar_final = torch.zeros(1, B, self.d_bar, device=device, dtype=dtype)
-        h_bar_scatter = torch.zeros(B, S, self.d_bar, device=device, dtype=dtype)
+        summary_embed_dense = torch.zeros(B, S, D, device=device, dtype=dtype)
+        bar_positions = bar_mask.nonzero(as_tuple=False)   # [N_bars_total, 2]
+
         if bar_positions.shape[0] == 0:
-            self._cached_com_t = com_t_all
-            self._cached_h_bar = h_bar_final
-            return com_t_all, h_bar_final, h_bar_scatter
+            return com_t_all, summary_embed_dense
 
-        # --- Fast path: tf_ratio == 1.0 (no scheduled sampling) ---
-        # Use PackedSequence to process all bar segments across all batches in one GRU call.
-        if tf_ratio >= 1.0 or pred_embs is None:
-            self._forward_fast(
-                token_embs, K, bar_mask, B, S, T_oct, device, dtype,
-                com_t_all, h_bar_final, h_bar_scatter,
-            )
-        else:
-            # Slow path: per-batch per-bar loop (needed for TF mixing)
-            self._forward_slow(
-                token_embs, pred_embs, K, bar_mask, tf_ratio, B, S, T_oct, device, dtype,
-                com_t_all, h_bar_final, h_bar_scatter,
-            )
+        # ── Stage 2 setup: BiMamba memory ────────────────────────────────────
+        lvl = self.active_ca_level
+        n_levels = spatial_shapes.shape[0]
+        start = level_start_index[lvl].item()
+        end = (level_start_index[lvl + 1].item()
+               if lvl < n_levels - 1 else memory.shape[1])
+        H_l = int(spatial_shapes[lvl, 0].item())
+        W_l = int(spatial_shapes[lvl, 1].item())
+        assert H_l == 1, (
+            f"BarMamba expects a 1D (time-only) level, but level {lvl} has H={H_l}."
+        )
+        memory_lvl = memory[:, start:end]                  # [B, W_l, D]
+        time_norm = torch.arange(W_l, device=device, dtype=torch.float32) / max(W_l - 1, 1)
+        time_pe   = self._sinusoidal_pe(time_norm, scale=W_l)  # [W_l, D]
+        K_mem     = self.memory_k_proj(memory_lvl) + time_pe.unsqueeze(0).to(dtype)  # [B, W_l, D]
 
-        # Carry h_bar forward: each position gets the h_bar after the most recent bar.
-        h_bar_carried = _carry_forward_h_bar(h_bar_scatter, bar_mask)  # [B, S, D_bar]
+        H, d_h = self.n_heads, self.head_dim
 
-        self._cached_com_t = com_t_all
-        self._cached_h_bar = h_bar_final
-        return com_t_all, h_bar_final, h_bar_carried
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _compute_attn_batched(
-        self,
-        queries: torch.Tensor,   # [N, D_bar] — one query per bar
-        K: torch.Tensor,         # [B, T_oct, D_bar]
-        bar_b_idx: torch.Tensor, # [N] — which batch each bar belongs to
-        T_oct: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Compute com_t for N bars in parallel.
-
-        Returns:
-            com_t:  [N, 1]        — DSNT center-of-mass
-        """
-        N = queries.shape[0]
-        H = self.n_heads
-        d_h = self.head_dim
-
-        # Project queries
-        Q_proj = self.query_proj(queries)  # [N, D_bar]
-        Q = Q_proj.view(N, H, d_h)         # [N, H, d_h]
-
-        # Gather K for each bar's batch: [N, T_oct, D_bar]
-        K_N = K[bar_b_idx]                                              # [N, T_oct, D_bar]
-        K_N = K_N.view(N, T_oct, H, d_h).permute(0, 2, 1, 3)          # [N, H, T_oct, d_h]
-
-        # Scaled dot-product: [N, H, T_oct]
-        scores = torch.einsum('nhd,nhtd->nht', Q, K_N) / math.sqrt(d_h)
-
-        attn_w_heads = F.softmax(scores, dim=-1)  # [N, H, T_oct]
-        attn_w = attn_w_heads.mean(1)             # [N, T_oct] head-averaged
-
-        # com_t: DSNT weighted mean of time positions
-        time_pos = torch.linspace(0, 1, T_oct, device=device, dtype=dtype)
-        com_t = (attn_w * time_pos).sum(-1, keepdim=True)  # [N, 1]
-        return com_t
-
-    def _forward_fast(
-        self,
-        token_embs: torch.Tensor,  # [B, S, D]
-        K: torch.Tensor,           # [B, T_oct, D_bar]
-        bar_mask: torch.Tensor,    # [B, S] bool
-        B: int, S: int, T_oct: int,
-        device: torch.device, dtype: torch.dtype,
-        com_t_all: torch.Tensor,        # [B, S, 1] — written in-place
-        h_bar_final: torch.Tensor,      # [1, B, D_bar] — written in-place
-        h_bar_scatter: torch.Tensor,    # [B, S, D_bar] — written in-place
-    ):
-        """Fast path: no TF mixing. PackedSequence over all segments at once."""
-        # Build per-batch bar info
-        # bar_positions_b[b] = sorted list of bar token positions for batch b
-        per_batch_bar_pos: List[torch.Tensor] = []
+        # Process per batch element (bar structure differs per sample)
         for b in range(B):
-            per_batch_bar_pos.append(bar_mask[b].nonzero(as_tuple=False).squeeze(1))  # [N_b]
-
-        # --- Step 1: Encode all bar segments with note_gru (PackedSequence) ---
-        # Each bar segment: tokens from (prev_bar+1) to (bar_pos) inclusive
-        # We want the final hidden state of note_gru for each segment.
-        # Collect all segments across all batches.
-        all_segs: List[torch.Tensor] = []   # each: [seg_len, D]
-        seg_lengths: List[int] = []
-        seg_b_idx: List[int] = []           # which batch each segment belongs to
-        seg_bar_idx: List[int] = []         # which bar within batch
-
-        # Also need per-batch bar info for bar_gru
-        per_batch_n_bars: List[int] = []
-        per_batch_bar_pos_lists: List[List[int]] = []
-
-        for b in range(B):
-            bar_pos_b = per_batch_bar_pos[b]  # [N_b]
-            N_b = bar_pos_b.shape[0]
-            per_batch_n_bars.append(N_b)
-
-            bar_pos_list = bar_pos_b.tolist()
-            per_batch_bar_pos_lists.append(bar_pos_list)
-
-            if N_b == 0:
+            b_bars = (bar_positions[:, 0] == b).nonzero(as_tuple=False).squeeze(1)
+            if b_bars.shape[0] == 0:
                 continue
 
-            bar_starts = [0] + [int(p) + 1 for p in bar_pos_list[:-1]]
-            bar_ends   = [int(p) for p in bar_pos_list]  # inclusive end = bar token pos
+            bar_seq_positions = bar_positions[b_bars, 1]  # [N_b] seq positions of <bar>
+            N_b = bar_seq_positions.shape[0]
+            bi  = bar_index[b]                             # [S] bar index per token
 
-            for bar_i, (seg_s, seg_e) in enumerate(zip(bar_starts, bar_ends)):
-                seg_len = seg_e - seg_s
-                seg_b_idx.append(b)
-                seg_bar_idx.append(bar_i)
-                if seg_len > 0:
-                    all_segs.append(token_embs[b, seg_s:seg_e])  # [seg_len, D]
-                    seg_lengths.append(seg_len)
+            # Collect summary queries for all bars in this sample
+            summary_queries = torch.zeros(N_b, D, device=device, dtype=dtype)
+
+            # <sos> id=1: never a "previous bar note", exclude so the leading
+            # <bar> (pos 1 in the new token format) correctly falls back to
+            # using its own embedding rather than trivially attending to <sos>.
+            b_ids = input_ids[b] if input_ids is not None else None
+
+            for i, bar_pos in enumerate(bar_seq_positions.tolist()):
+                bar_n = bi[bar_pos].item()  # this <bar> opened bar N
+
+                # Notes of bar N itself: tokens with bar_index == bar_n, not a <bar>,
+                # and not <sos>/<pad>. In training (teacher-forcing) these are available;
+                # in inference they exist once bar N is fully generated (caller ensures
+                # BarMamba is invoked only after <bar_{N+1}> appears).
+                own_note_mask = (bi == bar_n) & (~bar_mask[b])
+                if b_ids is not None:
+                    own_note_mask = own_note_mask & (b_ids > 1)
+
+                if own_note_mask.any():
+                    # <bar_N> queries its own bar's complete notes.
+                    q_bar = self.bar_q_proj(y_with_bar_pe[b, bar_pos].unsqueeze(0))  # [1, D]
+
+                    own_notes = y_with_bar_pe[b, own_note_mask]     # [n_notes, D]
+                    K_note = self.bar_k_proj(own_notes)               # [n_notes, D]
+                    V_note = self.bar_v_proj(own_notes)               # [n_notes, D]
+
+                    # Multi-head attention
+                    n_notes = own_notes.shape[0]
+                    q_h = q_bar.view(1, H, d_h).permute(1, 0, 2)       # [H, 1, d_h]
+                    k_h = K_note.view(n_notes, H, d_h).permute(1, 0, 2)# [H, n, d_h]
+                    v_h = V_note.view(n_notes, H, d_h).permute(1, 0, 2)# [H, n, d_h]
+                    sc  = torch.bmm(q_h, k_h.transpose(1, 2)) / math.sqrt(d_h)  # [H, 1, n]
+                    aw  = F.softmax(sc, dim=-1)                          # [H, 1, n]
+                    ctx = torch.bmm(aw, v_h)                             # [H, 1, d_h]
+                    ctx = ctx.permute(1, 0, 2).reshape(1, D)             # [1, D]
+                    summary_queries[i] = self.bar_out(ctx).squeeze(0)
                 else:
-                    # Empty segment → use a dummy zero tensor of length 1
-                    # Final hidden state of zeros is what we want (zero bar_summary).
-                    all_segs.append(token_embs.new_zeros(1, token_embs.shape[-1]))
-                    seg_lengths.append(0)  # mark as empty
+                    # Empty bar (no notes): use <bar_N>'s own embedding as fallback.
+                    summary_queries[i] = y_with_bar_pe[b, bar_pos]
 
-        N_segs = len(all_segs)
+            # ── Stage 2: DSNT on BiMamba memory ──────────────────────────────
+            Q_proj = self.query_proj(summary_queries)           # [N_b, D]
+            Q_h    = Q_proj.view(N_b, H, d_h)                  # [N_b, H, d_h]
 
-        # Run note_gru on non-empty segments via PackedSequence
-        nonempty_mask = [l > 0 for l in seg_lengths]
-        nonempty_indices = [i for i, m in enumerate(nonempty_mask) if m]
-        nonempty_segs = [all_segs[i] for i in nonempty_indices]
-        nonempty_lens = [seg_lengths[i] for i in nonempty_indices]
+            K_b    = K_mem[b].unsqueeze(0).expand(N_b, -1, -1)             # [N_b, W_l, D]
+            K_b_h  = K_b.view(N_b, W_l, H, d_h).permute(0, 2, 1, 3)      # [N_b, H, W_l, d_h]
 
-        # bar_summaries[i] = [D_bar] final hidden state for segment i
-        bar_summaries = token_embs.new_zeros(N_segs, self.d_bar)
+            scores = torch.einsum('nhd,nhtd->nht', Q_h, K_b_h) / math.sqrt(d_h)  # [N_b, H, W_l]
+            attn_w = F.softmax(scores, dim=-1).mean(1)                             # [N_b, W_l]
 
-        if nonempty_segs:
-            # Sort by length descending (required by pack_padded_sequence)
-            sorted_order = sorted(range(len(nonempty_lens)), key=lambda x: -nonempty_lens[x])
-            sorted_segs_tensors = [nonempty_segs[i] for i in sorted_order]
-            sorted_lens = [nonempty_lens[i] for i in sorted_order]
+            com_t_b = (attn_w * time_norm).sum(-1, keepdim=True)                  # [N_b, 1]
+            # One-bar delay: bar N's com_t goes to <bar_{N+1}> position.
+            # bar_seq_positions[0] (<bar_1>) stays zero (no prior summary yet).
+            # The last bar's com_t is discarded (no <bar_{N+1}> to store it).
+            if N_b > 1:
+                com_t_all[b, bar_seq_positions[1:]] = com_t_b[:-1].to(dtype)
 
-            # Use pad_sequence (no loop scatter → no CopySlices)
-            from torch.nn.utils.rnn import pad_sequence as _pad_seq
-            padded = _pad_seq(sorted_segs_tensors, batch_first=True)  # [N_ne, max_len, D]
+            # ── Build summary_embed_dense for this batch item ─────────────────
+            # summary_queries[i] = bar N's complete notes summary (N = bar_n at bar_pos_i).
+            # Inject into bar N+1's tokens so they use it as CA query.
+            # Bar 1's tokens (bi==1) have no prior summary → stay zero → caller uses raw tgt.
+            bar_ns = [bi[p].item() for p in bar_seq_positions.tolist()]
+            for i in range(N_b - 1):  # skip last bar (no bar N+1 to inject into)
+                next_bar_n = bar_ns[i] + 1
+                tok_mask_b = (bi == next_bar_n)
+                if tok_mask_b.any():
+                    summary_embed_dense[b, tok_mask_b] = summary_queries[i]
 
-            # PackedSequence + note_gru
-            packed = pack_padded_sequence(
-                padded,
-                lengths=torch.tensor(sorted_lens, dtype=torch.long),
-                batch_first=True,
-                enforce_sorted=True,
-            )
-            _, h_n = self.note_gru(packed)  # h_n: [1, N_ne, D_bar]
-            h_n = h_n.squeeze(0)             # [N_ne, D_bar]
-
-            # Unsort
-            N_ne = len(sorted_order)
-            unsort_order = [0] * N_ne
-            for sorted_i, orig_i in enumerate(sorted_order):
-                unsort_order[orig_i] = sorted_i
-            h_n_unsorted = h_n[torch.tensor(unsort_order, device=device)]  # [N_ne, D_bar]
-
-            # Write back to bar_summaries (scalar indexing: no CopySlices)
-            for ne_i, seg_i in enumerate(nonempty_indices):
-                bar_summaries[seg_i] = h_n_unsorted[ne_i]
-
-        # Apply input dropout
-        bar_summaries = self.input_dropout(bar_summaries)  # [N_segs, D_bar]
-
-        # --- Step 2: bar_gru sequentially per batch (but each batch is one GRU call) ---
-        # Rearrange bar_summaries into per-batch tensors
-        # seg index mapping: for batch b, bar i → segment index
-        seg_global_idx: List[List[int]] = [[] for _ in range(B)]
-        seg_ptr = 0
-        for i in range(N_segs):
-            b = seg_b_idx[i]
-            seg_global_idx[b].append(seg_ptr)
-            seg_ptr += 1
-
-        # Build padded bar_summary tensor: [B, max_N_bars, D_bar]
-        max_n_bars = max(per_batch_n_bars) if per_batch_n_bars else 0
-        bar_sum_padded = token_embs.new_zeros(B, max_n_bars, self.d_bar)
-        bar_n_bars_tensor = torch.zeros(B, dtype=torch.long, device=device)
-
-        for b in range(B):
-            N_b = per_batch_n_bars[b]
-            bar_n_bars_tensor[b] = N_b
-            if N_b == 0:
-                continue
-            for bar_i, seg_i in enumerate(seg_global_idx[b]):
-                bar_sum_padded[b, bar_i] = bar_summaries[seg_i]
-
-        # Run bar_gru: pack across batches for efficiency
-        if max_n_bars > 0:
-            # Sort by n_bars descending (required by pack_padded_sequence)
-            sorted_b_order = torch.argsort(bar_n_bars_tensor, descending=True)
-            sorted_lens_b = bar_n_bars_tensor[sorted_b_order].tolist()
-            bar_sum_sorted = bar_sum_padded[sorted_b_order]  # [B, max_N_bars, D_bar]
-
-            # Remove batches with 0 bars (they appear last after sorting)
-            n_nonzero = sum(1 for l in sorted_lens_b if l > 0)
-            if n_nonzero > 0:
-                bar_sum_nz = bar_sum_sorted[:n_nonzero]
-                lens_nz = sorted_lens_b[:n_nonzero]
-                orig_b_of_sorted = sorted_b_order[:n_nonzero]  # original b indices [n_nonzero]
-
-                packed_bar = pack_padded_sequence(
-                    bar_sum_nz,
-                    lengths=torch.tensor(lens_nz, dtype=torch.long),
-                    batch_first=True,
-                    enforce_sorted=True,
-                )
-                bar_out_packed, h_bar_n = self.bar_gru(packed_bar)
-                bar_out_padded, _ = pad_packed_sequence(bar_out_packed, batch_first=True)
-                # bar_out_padded: [n_nonzero, max_bars_in_nz, D_bar]
-                # h_bar_n:        [1, n_nonzero, D_bar]
-                # bar_out_padded[i] corresponds to batch orig_b_of_sorted[i]
-
-                for i in range(n_nonzero):
-                    b = int(orig_b_of_sorted[i].item())
-                    N_b = per_batch_n_bars[b]
-                    h_bar_per_bar = bar_out_padded[i, :N_b]   # [N_b, D_bar]
-                    h_bar_final[0, b] = h_bar_n[0, i]
-
-                    # Write h_bar to h_bar_scatter at each bar token position
-                    bar_pos_list = per_batch_bar_pos_lists[b]
-                    for bar_i, bar_pos in enumerate(bar_pos_list):
-                        h_bar_scatter[b, bar_pos] = h_bar_per_bar[bar_i]
-
-        # --- Step 3: Attention — compute com_t for all bars in parallel ---
-        # Gather queries from h_bar_scatter at bar positions
-        all_bar_pos = bar_mask.nonzero(as_tuple=False)  # [N_bars_total, 2]
-        if all_bar_pos.shape[0] > 0:
-            b_idx_all = all_bar_pos[:, 0]
-            s_idx_all = all_bar_pos[:, 1]
-            queries = h_bar_scatter[b_idx_all, s_idx_all]  # [N_total, D_bar]
-
-            com_t_vals = self._compute_attn_batched(
-                queries, K, b_idx_all, T_oct, device, dtype,
-            )  # [N_total, 1]
-
-            com_t_all[b_idx_all, s_idx_all] = com_t_vals
-
-    def _forward_slow(
-        self,
-        token_embs: torch.Tensor,
-        pred_embs: torch.Tensor,
-        K: torch.Tensor,           # [B, T_oct, D_bar]
-        bar_mask: torch.Tensor,    # [B, S] bool
-        tf_ratio: float,
-        B: int, S: int, T_oct: int,
-        device: torch.device, dtype: torch.dtype,
-        com_t_all: torch.Tensor,
-        h_bar_final: torch.Tensor,
-        h_bar_scatter: torch.Tensor,
-    ):
-        """Slow path: per-batch per-bar loop for scheduled sampling (tf_ratio < 1.0)."""
-        for b in range(B):
-            batch_bar_positions = bar_mask[b].nonzero(as_tuple=False).squeeze(1)  # [N_bars_b]
-            if batch_bar_positions.shape[0] == 0:
-                continue
-
-            h_b = torch.zeros(1, 1, self.d_bar, device=device, dtype=dtype)
-
-            bar_starts = torch.cat([
-                bar_mask[b].new_zeros(1),
-                batch_bar_positions[:-1] + 1,
-            ])
-            bar_ends = batch_bar_positions
-
-            for bar_i, (seg_start, seg_end) in enumerate(zip(bar_starts.tolist(), bar_ends.tolist())):
-                seg_start = int(seg_start)
-                seg_end = int(seg_end)
-
-                seg_len = seg_end - seg_start
-                if seg_len > 0:
-                    if torch.rand(1).item() < tf_ratio:
-                        seg_emb = token_embs[b, seg_start:seg_end]
-                    else:
-                        note_tf_mask = torch.rand(seg_len, device=device) < tf_ratio
-                        gt_seg = token_embs[b, seg_start:seg_end]
-                        pred_seg = pred_embs[b, seg_start:seg_end]
-                        seg_emb = torch.where(note_tf_mask.unsqueeze(1), gt_seg, pred_seg)
-
-                    seg_emb = seg_emb.unsqueeze(0)  # [1, seg_len, D]
-                    _, h_note = self.note_gru(seg_emb)
-                    bar_summary = h_note.squeeze(0)  # [1, D_bar]
-                else:
-                    bar_summary = torch.zeros(1, self.d_bar, device=device, dtype=dtype)
-
-                bar_summary_dropped = self.input_dropout(bar_summary)
-                _, h_b = self.bar_gru(bar_summary_dropped.unsqueeze(0), h_b)
-
-                # Attention: compute com_t for this bar
-                query = self.query_proj(h_b.squeeze(0))  # [1, D_bar]
-                Q = query.view(1, self.n_heads, self.head_dim)     # [1, H, d_h]
-                K_b = K[b].view(T_oct, self.n_heads, self.head_dim).permute(1, 0, 2).unsqueeze(0)
-                # K_b: [1, H, T_oct, d_h]
-                scores = torch.einsum('nhd,nhtd->nht',
-                                      Q, K_b.squeeze(0).unsqueeze(0).view(1, self.n_heads, T_oct, self.head_dim)
-                                      ) / math.sqrt(self.head_dim)  # [1, H, T_oct]
-                attn_w_heads = F.softmax(scores, dim=-1)            # [1, H, T_oct]
-                attn_w_b = attn_w_heads.mean(1)                     # [1, T_oct]
-                time_pos = torch.linspace(0, 1, T_oct, device=device, dtype=dtype)
-                com_t_b = (attn_w_b * time_pos).sum(-1, keepdim=True)  # [1, 1]
-
-                bar_pos = int(batch_bar_positions[bar_i].item())
-                com_t_all[b, bar_pos] = com_t_b.to(dtype)
-                h_bar_scatter[b, bar_pos] = h_b[0, 0]
-
-        h_bar_final[0, b] = h_b[0, 0]
+        return com_t_all, summary_embed_dense  # [B, S, 1], [B, S, D]
 
 
-class NoteGRU(nn.Module):
-    """Note-level GRU for shared time_center (read-before / write-after).
 
-    - Read: time_center = sigmoid(time_head(h_note)) before token processing.
-    - Write: h_note = GRU(token_emb, h_note) after token processing.
-    - Reset: if previous token is <bar>, h_note = init_proj(h_bar).
 
-    scan_sequence uses nn.GRU (not GRUCell) for GPU-efficient sequence processing.
-    The sequence is split at bar boundaries; each segment is run as a single
-    nn.GRU call. This reduces the Python loop from S iterations to N_bars+1
-    iterations (~20-50x fewer kernel launches for typical piano pieces).
+def compute_curriculum_mask(
+    bar_mask: torch.Tensor, # [B, S] bool — True at <bar> positions
+    visible_bars: int,      # how many trailing bars are shown in full
+) -> torch.Tensor:
+    """Return a [B, S] bool mask — True for positions that should be zeroed out.
+
+    All token positions belonging to bars BEFORE the visible window are masked.
+    The <bar> tokens themselves are also masked (they're part of the compressed bar).
+    visible_bars=0 → everything masked; visible_bars≥total_bars → nothing masked.
     """
+    B, S = bar_mask.shape
+    curriculum_mask = torch.zeros(B, S, dtype=torch.bool, device=bar_mask.device)
+    for b in range(B):
+        bar_pos = bar_mask[b].nonzero(as_tuple=False).squeeze(1).tolist()
+        n_bars = len(bar_pos)
+        if n_bars <= visible_bars:
+            continue  # all bars visible — nothing to compress
+        n_compress = n_bars - visible_bars
+        # Mask everything up to and including the last compressed <bar> token
+        first_visible_start = bar_pos[n_compress]   # first <bar> of visible window
+        curriculum_mask[b, :first_visible_start] = True
+    return curriculum_mask
 
-    def __init__(
-        self,
-        d_model: int = 512,
-        d_bar: int = 256,
-        d_note: int = 256,
-        input_dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.d_note = d_note
-        self.d_bar = d_bar
 
-        self.input_proj = nn.Linear(d_model, d_note)
-        self.init_proj = nn.Linear(d_bar, d_note)
-        # nn.GRU instead of GRUCell: allows full-segment forward in one CUDA kernel.
-        # scan_sequence uses this for training; step() uses GRUCell semantics via
-        # calling gru with seq_len=1.
-        self.note_gru = nn.GRU(d_note, d_note, batch_first=True)
-        self.time_head = nn.Linear(d_note, 1)
-        # Initialize time_head bias to start from ~0 (not 0.5)
-        # sigmoid(-6) ≈ 0.0025, so time_center starts near 0 and increases with GRU updates
-        nn.init.constant_(self.time_head.bias, -6.0)
 
-        self.input_dropout = nn.Dropout(input_dropout)
-
-    def scan_sequence(
-        self,
-        inputs: torch.Tensor,         # [B, S, D_model] token embeddings
-        bar_mask: torch.Tensor,        # [B, S] bool
-        h_bar_carried: torch.Tensor,   # [B, S, D_bar]
-        com_t_all: torch.Tensor,       # [B, S, 1] com_t at <bar> positions
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Scan over a full sequence, returning time_center and h_notes_all.
-
-        time_center at position s uses h_note before update, with bar override.
-
-        Vectorized strategy: split the sequence at bar boundaries and run ALL
-        segments in a single PackedSequence GRU call.
-
-        Key insight: h0 for segment i (i > 0) is init_proj(h_bar_carried[b, bar_pos_{i-1}]),
-        which depends only on h_bar_carried (an input), NOT on GRU output.
-        Therefore all segment h0s can be precomputed, and every segment is independent
-        given its h0.  We collect all (b, seg_i) non-empty segments, sort by length,
-        pad into [N_segs_total, max_len, D_note], set h_0 per segment, and run one
-        nn.GRU call.  This reduces GRU kernel launches from ~B*N_bars to 1.
-
-        time_center[b_k] is overridden with com_t_all[:, b_k] (bar-token override).
-        time_center for all other positions = sigmoid(time_head(h_before_update)).
-        """
-        B, S, _ = inputs.shape
-        device = inputs.device
-        dtype = inputs.dtype
-
-        # Project all inputs at once: one big matmul instead of S small ones
-        inputs_proj = self.input_dropout(self.input_proj(inputs))  # [B, S, D_note]
-
-        h_before = torch.zeros(B, S, self.d_note, device=device, dtype=dtype)
-        h_after  = torch.zeros(B, S, self.d_note, device=device, dtype=dtype)
-
-        # Collect ALL non-empty segments across all batch items.
-        # For each segment: (b, seg_s, seg_len, h0_vec [D_note])
-        # h0 is precomputed: zeros for first segment, init_proj(h_bar_carried) for others.
-        all_segs: List[Tuple[int, int, int]] = []  # (b, seg_s, seg_len)
-        all_h0s: List[torch.Tensor] = []           # each: [D_note]
-
-        for b in range(B):
-            bar_pos_b = bar_mask[b].nonzero(as_tuple=False).squeeze(1)  # [N_bars]
-            seg_starts_t = torch.cat([bar_pos_b.new_zeros(1), bar_pos_b + 1])
-            seg_ends_t   = torch.cat([bar_pos_b + 1, bar_pos_b.new_full((1,), S)])
-            N_segs_b = len(seg_starts_t)
-
-            for i in range(N_segs_b):
-                seg_s = int(seg_starts_t[i].item())
-                seg_e = int(seg_ends_t[i].item())
-                seg_len = seg_e - seg_s
-                if seg_len == 0:
-                    continue
-
-                if i == 0:
-                    h0_vec = inputs_proj.new_zeros(self.d_note)
-                else:
-                    bar_reset_pos = int(seg_ends_t[i - 1].item()) - 1
-                    h0_vec = self.init_proj(h_bar_carried[b, bar_reset_pos])  # [D_note]
-
-                all_segs.append((b, seg_s, seg_len))
-                all_h0s.append(h0_vec)
-
-        if all_segs:
-            # Sort by seg_len descending (required by pack_padded_sequence)
-            order = sorted(range(len(all_segs)), key=lambda i: -all_segs[i][2])
-            sorted_segs = [all_segs[i] for i in order]
-            sorted_lens = [all_segs[i][2] for i in order]
-            sorted_h0s  = [all_h0s[i] for i in order]
-
-            N_total  = len(sorted_segs)
-            max_len  = sorted_lens[0]
-
-            # Gather h0s: [1, N_total, D_note]
-            h0_all = torch.stack(sorted_h0s, dim=0).unsqueeze(0)  # [1, N_total, D_note]
-
-            # Pad inputs via pad_sequence (no loop slice → no CopySlices in backward)
-            from torch.nn.utils.rnn import pad_sequence as _pad_seq
-            segs_list = [inputs_proj[b, seg_s:seg_s + seg_len] for b, seg_s, seg_len in sorted_segs]
-            padded = _pad_seq(segs_list, batch_first=True)  # [N_total, max_len, D_note]
-
-            # Single PackedSequence GRU call over all segments
-            packed = pack_padded_sequence(
-                padded,
-                lengths=torch.tensor(sorted_lens, dtype=torch.long),
-                batch_first=True,
-                enforce_sorted=True,
-            )
-            seg_out_packed, _ = self.note_gru(packed, h0_all)
-            seg_out_padded, _ = pad_packed_sequence(seg_out_packed, batch_first=True)
-            # seg_out_padded: [N_total, max_len, D_note]
-
-            # Build flat indices for h_before and h_after to avoid in-place slice
-            # assignments (which produce CopySlices nodes in backward).
-            # Strategy: collect all (flat_position, source_row, source_col) tuples,
-            # then do a single index_put_ on the flat [B*S, D_note] views.
-            #
-            # h_before at position (b, seg_s + k) = seg_out_padded[idx, k-1] for k >= 1
-            #                                       = h0_b              for k == 0
-            # h_after  at position (b, seg_s + k) = seg_out_padded[idx, k]
-
-            # Collect flat indices and the corresponding values from seg_out_padded.
-            # We build two lists of flat_idx (int) and two lists of (seg_idx, time_offset)
-            # pointing into seg_out_padded so we can gather them in one tensor op.
-
-            # before_flat_idx[j]: flat index b*S+s for j-th h_before position
-            # before_src_idx[j]:  row in seg_out_padded (seg index)
-            # before_src_t[j]:    time offset in seg_out_padded (-1 means use h0)
-            before_flat_idx: List[int] = []
-            before_src_seg:  List[int] = []
-            before_src_t:    List[int] = []   # -1 → use h0_all[0, seg, :]
-
-            after_flat_idx: List[int] = []
-            after_src_seg:  List[int] = []
-            after_src_t:    List[int] = []
-
-            for idx, (b, seg_s, seg_len) in enumerate(sorted_segs):
-                for k in range(seg_len):
-                    flat = b * S + seg_s + k
-                    # h_before
-                    before_flat_idx.append(flat)
-                    before_src_seg.append(idx)
-                    before_src_t.append(k - 1)  # -1 means h0
-                    # h_after
-                    after_flat_idx.append(flat)
-                    after_src_seg.append(idx)
-                    after_src_t.append(k)
-
-            # Build index tensors
-            bf_idx = torch.tensor(before_flat_idx, dtype=torch.long, device=device)
-            af_idx = torch.tensor(after_flat_idx,  dtype=torch.long, device=device)
-            seg_t_before = torch.tensor(before_src_t, dtype=torch.long, device=device)  # may contain -1
-            seg_t_after  = torch.tensor(after_src_t,  dtype=torch.long, device=device)
-            seg_i_before = torch.tensor(before_src_seg, dtype=torch.long, device=device)
-            seg_i_after  = torch.tensor(after_src_seg,  dtype=torch.long, device=device)
-
-            # Gather h_before values:
-            #   For k>0: seg_out_padded[seg_i, k-1, :]
-            #   For k=0: h0_all[0, seg_i, :]   (h0_all shape: [1, N_total, D_note])
-            is_h0_mask = (seg_t_before < 0)  # [M_total] — positions that use h0
-
-            # Clamp to 0 so we can gather without OOB (h0 positions will be overwritten)
-            seg_t_before_clamped = seg_t_before.clamp(min=0)
-            # seg_out_padded: [N_total, max_len, D_note]
-            # Gather: [M_total, D_note]
-            h_before_vals = seg_out_padded[seg_i_before, seg_t_before_clamped]
-            # Override h0 positions with the actual h0 vectors
-            if is_h0_mask.any():
-                h0_flat = h0_all[0]  # [N_total, D_note]
-                h_before_vals = h_before_vals.clone()
-                h_before_vals[is_h0_mask] = h0_flat[seg_i_before[is_h0_mask]]
-
-            # Gather h_after values:
-            h_after_vals = seg_out_padded[seg_i_after, seg_t_after]  # [M_total, D_note]
-
-            # Write back via index_put_ on flat view (single CopySlices node for entire scatter)
-            h_before_flat = h_before.view(B * S, self.d_note)
-            h_after_flat  = h_after.view(B * S, self.d_note)
-            h_before_flat = h_before_flat.index_put((bf_idx,), h_before_vals)
-            h_after_flat  = h_after_flat.index_put((af_idx,), h_after_vals)
-            h_before = h_before_flat.view(B, S, self.d_note)
-            h_after  = h_after_flat.view(B, S, self.d_note)
-
-        # time_center: read-before-write = sigmoid(time_head(h_before))
-        time_center = torch.sigmoid(self.time_head(h_before))  # [B, S, 1]
-
-        # Bar token override (shifted): the token AFTER a <bar> gets time_center = com_t
-        # of that bar (audio-grounded center from BarGRU).
-        # This matches the old GRUCell logic where position s checks bar_mask[s-1].
-        if bar_mask.any():
-            # prev_was_bar[b, s] = True iff bar_mask[b, s-1] is True
-            prev_was_bar = torch.zeros_like(bar_mask)
-            prev_was_bar[:, 1:] = bar_mask[:, :-1]  # shift right by 1
-
-            # com_t to inject: com_t_all[b, s-1] at position s → shift right
-            com_t_shifted = torch.zeros_like(com_t_all)
-            com_t_shifted[:, 1:] = com_t_all[:, :-1]
-
-            prev_was_bar_3d = prev_was_bar.unsqueeze(-1)  # [B, S, 1]
-            time_center = torch.where(prev_was_bar_3d, com_t_shifted, time_center)
-
-        return time_center, h_after
-
-    def step(
-        self,
-        input_t: torch.Tensor,  # [B, D_model]
-        h: torch.Tensor,        # [B, D_note]
-    ) -> torch.Tensor:
-        """Single-step update for inference."""
-        x = self.input_dropout(self.input_proj(input_t))
-        # nn.GRU with seq_len=1: equivalent to GRUCell
-        h_out, _ = self.note_gru(x.unsqueeze(1), h.unsqueeze(0))
-        return h_out.squeeze(1)
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -792,141 +416,6 @@ class RotaryPositionalEmbedding(nn.Module):
 
 
 
-class PerceiverLayer(nn.Module):
-    """Perceiver IO beat tracker: builds audio_latent from S0+S1.
-
-    Role: Encode-only — does NOT modify tgt.
-    - Compresses active encoder levels (S0+S1) into M latent slots
-    - Passes tgt through unchanged
-    - audio_latent [B, M, D] cached in _cached_audio_latent for ClefDecoder
-      and consumed by the downstream use_audio_ca SAWindowCALayer (L1)
-
-    S0 (0.16s): octave/fifth relationships, tonality — best bar discriminator (probe)
-    S1 (0.32s): beat perception, pitch register
-
-    Architecture: 2 rounds of cross-attn (one per active level), shared weights.
-    Perceiver IO (Jaegle et al., 2021).
-    """
-
-    def __init__(self, d_model=512, n_heads=8, ff_dim=2048, dropout=0.1,
-                 n_latents=512, active_ca_levels=None, n_levels=6,
-                 **kwargs):  # absorbs unused base_kwargs
-        super().__init__()
-        self.active_ca_levels = active_ca_levels  # e.g. [2, 3] for S0+S1
-        self.n_levels = n_levels
-        self.d_model = d_model
-
-        # Learned latent queries [M, D] — content specialization per slot
-        self.latent_queries = nn.Parameter(torch.randn(n_latents, d_model) * 0.02)
-
-        # Fixed sinusoidal temporal PE for latent slots [M, D].
-        # Slot i has a prior "I represent time i/M of the audio."
-        # Normalized to [0,1] → consistent with encoder token time_norm (col/W).
-        # Fixed (not learned) so temporal ordering is always well-defined.
-        self.register_buffer('latent_pe', self._make_sinusoidal_pe(
-            torch.linspace(0, 1, n_latents), d_model
-        ))
-
-        # Shared cross-attention: latents attend to each active encoder level
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True,
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-
-        # FFN applied between rounds
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ff_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, d_model),
-            nn.Dropout(dropout),
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-
-        # Output cache — read by ClefDecoder after forward()
-        self._cached_audio_latent: Optional[torch.Tensor] = None
-
-    @staticmethod
-    def _make_sinusoidal_pe(t_norm: torch.Tensor, d_model: int) -> torch.Tensor:
-        """Sinusoidal PE for normalized time positions [0, 1].
-
-        Same formula as SAFullCALayer._sinusoidal_time_pe — ensures latent slot i
-        and encoder token at col/W produce the same PE when t_norm matches.
-        Scale by N so adjacent slots have distinct encodings.
-        """
-        N = t_norm.shape[0]
-        half_d = d_model // 2
-        position = t_norm.float() * N                              # [N]
-        dim = torch.arange(half_d, device=t_norm.device, dtype=torch.float32)
-        inv_freq = 1.0 / (10000.0 ** (dim / half_d))              # [D/2]
-        angles = position.unsqueeze(1) * inv_freq.unsqueeze(0)    # [N, D/2]
-        return torch.cat([angles.sin(), angles.cos()], dim=-1)    # [N, D]
-
-    def forward(
-        self,
-        tgt: torch.Tensor,              # [B, S, D] — passed through unchanged
-        memory: torch.Tensor,           # [B, N_total, D]
-        spatial_shapes: torch.Tensor,
-        level_start_index: torch.Tensor,
-        valid_ratios: torch.Tensor,
-        tgt_pos=None,
-        past_state=None,
-        use_cache: bool = False,
-        value_cache=None,
-        audio_latent=None,              # unused (we produce it)
-        window_center=None,             # unused
-        guidance_bounds=None,           # unused
-        onset_1d=None,                  # unused (no bar attention in Perceiver)
-        input_ids=None,                 # unused
-    ):
-        """Build audio_latent by attending to active encoder levels, pass tgt through.
-
-        Both latents and encoder KV tokens receive time PE so cross-attn can
-        align by time position: latent i (time i/M) attends to encoder tokens
-        at col/W ≈ i/M regardless of encoder level resolution.
-        """
-        B = tgt.shape[0]
-        n_enc_levels = level_start_index.shape[0]
-
-        levels = self.active_ca_levels if self.active_ca_levels else list(range(n_enc_levels))
-
-        # Latent queries + fixed temporal PE: slot i biased toward time i/M
-        latents = self.latent_queries.unsqueeze(0).expand(B, -1, -1)  # [B, M, D]
-        latents = latents + self.latent_pe.unsqueeze(0)               # [B, M, D]
-
-        # One cross-attn round per active level (shared weights = Perceiver IO style).
-        # Time PE added to K only (not V): Q (latent) finds correct time via PE,
-        # V stays as pure audio content — same principle as SAFullCALayer.
-        for lvl in levels:
-            start = level_start_index[lvl].item()
-            end = (level_start_index[lvl + 1].item()
-                   if lvl + 1 < n_enc_levels else memory.shape[1])
-            kv = memory[:, start:end, :]   # [B, N_lvl, D]
-
-            # Build time_norm for this level: col/W ∈ [0, 1] per encoder token
-            H_l = int(spatial_shapes[lvl, 0].item())
-            W_l = int(spatial_shapes[lvl, 1].item())
-            w_norm = (torch.arange(W_l, device=tgt.device, dtype=torch.float32)
-                      / max(W_l - 1, 1))
-            # Each row (freq bin) gets the same time_norm as its column
-            time_norm = w_norm.unsqueeze(0).expand(H_l, -1).reshape(-1)  # [H_l*W_l]
-
-            # Time PE on K only — latent slot i and encoder token at col/W≈i/M
-            # share the same PE value, enabling time-aligned cross-attn
-            time_pe = self._make_sinusoidal_pe(time_norm, self.d_model)  # [N_lvl, D]
-            k = kv + time_pe.to(kv.dtype)
-
-            latents2, _ = self.cross_attn(latents, k, kv)
-            latents = self.norm1(latents + latents2)
-            latents = self.norm2(latents + self.ffn(latents))
-
-        self._cached_audio_latent = latents  # [B, M, D]
-
-        if use_cache:
-            return tgt, None
-        return tgt
-
-
 class MambaOnlyLayer(nn.Module):
     """Mamba-only decoder layer: Mamba + FFN (no CA).
 
@@ -1007,8 +496,304 @@ class MambaOnlyLayer(nn.Module):
         tgt = self.norm3(tgt)
 
         if use_cache:
-            return tgt, (inference_params, None)
+            return tgt, (None, inference_params)
         return tgt
+
+
+class MambaFullCALayer(nn.Module):
+    """Mamba + Full Cross-Attention decoder layer.
+    
+    Architecture (Zamba inspired):
+      1. Mamba Block (compresses history, provides temporal/structural context)
+      2. Full Cross-Attention (queries Audio based on Mamba context)
+      3. No FFN (Mamba internally provides non-linear expand/proj FFN equivalents)
+      
+    This fundamentally prevents "Lazy Decoder" (Attention Collapse) because Mamba 
+    has a compressed hidden state and cannot perfectly copy historical tokens.
+    """
+    def __init__(
+        self,
+        d_model: int = 512,
+        d_state: int = 128,
+        d_conv: int = 4,
+        expand: int = 2,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        active_ca_levels: Optional[List[int]] = None,
+        n_levels: int = 6,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.ca_head_dim = d_model // n_heads
+        self.active_ca_levels = active_ca_levels if active_ca_levels is not None else list(range(n_levels))
+        self.ca_attn_dropout = dropout
+
+        # 1. Mamba2 (processes token history → produces context-rich state y)
+        # Mirrors Zeng's GRU: y_t encodes everything seen up to t-1.
+        self.norm1 = nn.LayerNorm(d_model)  # pre-norm before Mamba
+        from mamba_ssm import Mamba2
+        self.mamba = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.dropout_mamba = nn.Dropout(dropout)
+
+        # 2. Cross-Attention (Q = y = Mamba output, K/V = Audio)
+        # Mirrors Zeng's:  attn_weights = self.attn(hidden, encoder_outputs)
+        #                  context      = bmm(attn_weights, encoder_outputs)
+        self.norm2 = nn.LayerNorm(d_model)  # pre-norm before CA (applied to y)
+        self.ca_q_proj  = nn.Linear(d_model, d_model)
+        self.ca_kv_proj = nn.Linear(d_model, 2 * d_model)
+        self.ca_out_proj = nn.Linear(d_model, d_model)
+        self.dropout_ca  = nn.Dropout(dropout)
+
+        # Sinusoidal time PE for CA keys (absolute audio-frame coordinate)
+        class SinusoidalPositionEmbedding(nn.Module):
+            def __init__(self, d_model: int):
+                super().__init__()
+                self.d_model = d_model
+
+            def forward(self, time_norm: torch.Tensor) -> torch.Tensor:
+                N = time_norm.shape[0]
+                half_d = self.d_model // 2
+                device = time_norm.device
+                position = time_norm.float() * N
+                dim = torch.arange(half_d, device=device, dtype=torch.float32)
+                inv_freq = 1.0 / (10000.0 ** (dim / half_d))
+                angles = position.unsqueeze(1) * inv_freq.unsqueeze(0)
+                return torch.cat([angles.sin(), angles.cos()], dim=-1)
+
+        self._sinusoidal_time_pe = SinusoidalPositionEmbedding(d_model)
+
+        # 3. Sidechain Compressor Fusion
+        # Mirrors Zeng: out = Linear(cat[gru_out, context])
+        # Ours:         fused = ducked_y + ca_out
+        self.render_proj     = nn.Linear(d_model, d_model)
+        self.compressor_temp = nn.Parameter(torch.tensor(2.659))
+
+
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+        valid_ratios: torch.Tensor,
+        past_state: Optional[Tuple] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[Tuple]] | torch.Tensor:
+        B, S, D = tgt.shape
+        mamba_state = past_state[1] if past_state is not None else None
+
+        # Optional separate query path for curriculum learning:
+        # When curriculum zeroes tgt for compressed bars, tgt_query provides a
+        # meaningful bar_embedding for those positions so CA Q is not degenerate.
+        tgt_query: Optional[torch.Tensor] = kwargs.get('tgt_query', None)
+        # ── Step 1: Mamba2  (≡ Zeng: GRU hidden state) ──────────────────────────
+        # y encodes the full causal token history, just like GRU hidden.
+        tgt_normed = self.norm1(tgt)
+        mamba_out = self.mamba(tgt_normed, inference_params=mamba_state)
+        y = tgt + self.dropout_mamba(mamba_out)   # y = history-aware state
+
+        # ── Step 2: Cross-Attention with Q = y  (≡ Zeng: Attn(hidden, encoder)) ────
+        # Q carries full history; K carries physical audio-frame time.
+        # When curriculum is active, tgt_query substitutes bar_embed for compressed bars,
+        # so Q is never a dead zero vector.
+        if tgt_query is not None:
+            y_for_q = tgt_query + self.dropout_mamba(self.mamba(self.norm1(tgt_query),
+                                                               inference_params=mamba_state))
+            y_normed = self.norm2(y_for_q)
+        else:
+            y_normed = self.norm2(y)
+
+        memory_ca = []
+        time_norm_list = []
+        for lvl in self.active_ca_levels:
+            start = level_start_index[lvl].item()
+            end   = (level_start_index[lvl + 1].item()
+                     if lvl < spatial_shapes.shape[0] - 1
+                     else memory.shape[1])
+            memory_ca.append(memory[:, start:end])
+            H_l = int(spatial_shapes[lvl, 0].item())
+            W_l = int(spatial_shapes[lvl, 1].item())
+            w_norm = torch.arange(W_l, device=tgt.device, dtype=torch.float32) / max(W_l - 1, 1)
+            time_norm_list.append(w_norm.unsqueeze(0).expand(H_l, -1).reshape(-1))
+
+        memory_ca = torch.cat(memory_ca, dim=1)   # [B, N_kv, D]
+        time_norm  = torch.cat(time_norm_list)     # [N_kv]
+        N_kv = memory_ca.shape[1]
+
+        q_ca = self.ca_q_proj(y_normed).reshape(B, S, self.n_heads, self.ca_head_dim).permute(0, 2, 1, 3).contiguous()
+        kv   = self.ca_kv_proj(memory_ca).reshape(B, N_kv, 2, self.n_heads, self.ca_head_dim)
+        k_ca = kv[:, :, 0].permute(0, 2, 1, 3).contiguous()
+        v_ca = kv[:, :, 1].permute(0, 2, 1, 3).contiguous()
+
+
+        # Sinusoidal PE on K: "I am audio frame at physical time τ"
+        time_pe   = self._sinusoidal_time_pe(time_norm)
+        time_pe_k = (time_pe.view(N_kv, self.n_heads, self.ca_head_dim)
+                             .permute(1, 0, 2).unsqueeze(0).to(k_ca.dtype))
+        k_ca = k_ca + time_pe_k
+
+        ca_sdpa = F.scaled_dot_product_attention(
+            q_ca, k_ca, v_ca,
+            dropout_p=self.ca_attn_dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        ca_out = self.ca_out_proj(ca_sdpa.permute(0, 2, 1, 3).reshape(B, S, D))
+        ca_out = self.dropout_ca(ca_out)
+
+        # ── Step 3: Sidechain Compressor Fusion  (≡ Zeng: cat[gru_out, context]) ──
+        # fused = ducked_y + ca_out
+        # ∂fused/∂ca_out = 1 always → Audio gradient path is never broken.
+        y_rendered      = self.render_proj(y)
+        cosine_sim      = F.cosine_similarity(y_rendered, ca_out, dim=-1)
+        compressor_gate = torch.sigmoid(self.compressor_temp * cosine_sim)
+        ducked_y        = y_rendered * compressor_gate.unsqueeze(-1)
+        fused           = ducked_y + ca_out   # Audio (ca_out) is the immutable base
+
+        if use_cache:
+            return fused, (None, mamba_state)
+        return fused
+
+
+class MambaWindowCALayer(nn.Module):
+    """Mamba2 + Window Cross-Attention decoder layer.
+
+    Combines the best of MambaFullCALayer and SAWindowCALayer:
+    - Mamba2 compresses token history (replaces SA as Q-source).
+    - WindowCrossAttention provides coarse-to-fine DSNT cascade (replaces full SDPA).
+    - Compressor Fusion gates the Mamba2 pathway by audio similarity.
+    - No SA, no FFN (Mamba2's expand/project provides equivalent non-linearity).
+
+    State format: (None, mamba_state) — no SA KV cache, only Mamba2 InferenceParams.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 512,
+        d_state: int = 128,
+        d_conv: int = 4,
+        expand: int = 2,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        active_ca_levels: Optional[List[int]] = None,
+        n_levels: int = 6,
+        # Window CA params (same as SAWindowCALayer)
+        window_time_frames: Union[int, List[int]] = 16,
+        window_freq_bins: Union[int, List[int]] = 8,
+        window_seq_chunk_size: int = 128,
+        full_freq: bool = False,
+        full_freq_levels: Optional[List[int]] = None,
+        cascade_com: bool = False,
+        window_ca_use_checkpoint: bool = True,
+        exp_decay_lambda: float = 0.0,        # >0: soft exp decay mask on window CA scores
+        **kwargs,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.active_ca_levels = active_ca_levels if active_ca_levels is not None else list(range(n_levels))
+
+        # 1. Mamba2 (processes token history → produces context-rich state y)
+        self.norm1 = nn.LayerNorm(d_model)
+        from mamba_ssm import Mamba2
+        self.mamba = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.dropout_mamba = nn.Dropout(dropout)
+
+        # 2. Window Cross-Attention (Q = Mamba2 output)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.window_ca = WindowCrossAttention(
+            d_model=d_model,
+            n_levels=n_levels,
+            n_heads=n_heads,
+            window_time=window_time_frames,
+            window_freq=window_freq_bins,
+            seq_chunk_size=window_seq_chunk_size,
+            full_freq=full_freq,
+            full_freq_levels=full_freq_levels,
+            cascade_com=cascade_com,
+            use_checkpoint=window_ca_use_checkpoint,
+            exp_decay_lambda=exp_decay_lambda,
+        )
+        self.dropout_ca = nn.Dropout(dropout)
+
+        # 3. Compressor Fusion (same as MambaFullCALayer)
+        self.render_proj = nn.Linear(d_model, d_model)
+        self.compressor_temp = nn.Parameter(torch.tensor(2.659))
+
+        # Caches read by ClefDecoder after forward
+        self._cached_com_t_wca: Optional[torch.Tensor] = None
+        self._cached_com_f: Optional[torch.Tensor] = None
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+        valid_ratios: torch.Tensor,
+        past_state: Optional[Tuple] = None,
+        use_cache: bool = False,
+        value_cache=None,
+        time_center_in=None,   # [B, S, 1] cascade from previous window_ca layer
+        freq_center_in=None,   # [B, S, 1] cascade from previous window_ca layer
+        **kwargs,
+    ):
+        """Mamba → Window CA (Q = Mamba output) → Compressor Fusion."""
+        B, S, D = tgt.shape
+        mamba_state = past_state[1] if past_state is not None else None
+
+        # Step 1: Mamba2
+        tgt_normed = self.norm1(tgt)
+        mamba_out = self.mamba(tgt_normed, inference_params=mamba_state)
+        y = tgt + self.dropout_mamba(mamba_out)
+
+        # Step 2: Window Cross-Attention (Q = y from Mamba output)
+        if freq_center_in is not None:
+            freq_center = freq_center_in
+        else:
+            freq_center = torch.full((B, S, 1), 0.5, device=tgt.device, dtype=tgt.dtype)
+
+        if time_center_in is not None:
+            time_center = time_center_in
+        else:
+            time_center = torch.full((B, S, 1), 0.5, device=tgt.device, dtype=tgt.dtype)
+
+        y_normed = self.norm2(y)
+        ca_out, com_t, com_f = self.window_ca(
+            query=y_normed,
+            time_center=time_center,
+            freq_center=freq_center,
+            value=memory,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            active_levels=self.active_ca_levels,
+            kv_cache=value_cache,
+        )
+        self._cached_com_t_wca = com_t   # [B, S, 1]
+        self._cached_com_f = com_f       # [B, S, 1]
+        ca_out = self.dropout_ca(ca_out)
+
+        # Step 3: Compressor Fusion (same as MambaFullCALayer)
+        y_rendered = self.render_proj(y)
+        cosine_sim = F.cosine_similarity(y_rendered, ca_out, dim=-1)
+        compressor_gate = torch.sigmoid(self.compressor_temp * cosine_sim)
+        ducked_y = y_rendered * compressor_gate.unsqueeze(-1)
+        fused = ducked_y + ca_out   # Audio (ca_out) is the immutable base
+
+        if use_cache:
+            return fused, (None, mamba_state)
+        return fused
 
 
 class SAFullCALayer(nn.Module):
@@ -1253,8 +1038,6 @@ class SAFullCALayer(nn.Module):
         # The actual tgt (with both paths) is still used for decoding + CE loss.
         tgt_for_guidance = self.norm2(tgt_sa.detach() + ca_out_dropped)
         time_pred = torch.sigmoid(self.time_predictor(tgt_for_guidance))  # [B, S, 1]
-        freq_center_init = torch.full((B, S, 1), 0.5, device=tgt.device, dtype=tgt.dtype)
-        self._cached_window_center = (time_pred, freq_center_init)
 
         if self.training and guidance_bounds is not None:
             lo = guidance_bounds[:, :, 0]  # [B, S]
@@ -1314,8 +1097,8 @@ class SAWindowCALayer(nn.Module):
         full_freq_levels: Optional[List[int]] = None,  # per-level full_freq (overrides full_freq)
         cascade_com: bool = False,            # cascade CoM between levels (coarse→fine)
         window_ca_use_checkpoint: bool = True,  # gradient checkpoint per seq-chunk in WindowCA
-        bar_gru_hidden_size: int = 256,       # d_bar for BarGRU
-        bar_gru_input_dropout: float = 0.1,   # dropout on note_gru → bar_gru input
+        exp_decay_lambda: float = 0.0,        # >0: soft exp decay mask on window CA scores
+
         **kwargs,  # absorbs unused base_kwargs (n_points_*, use_time_prior, etc.)
     ):
         super().__init__()
@@ -1326,7 +1109,6 @@ class SAWindowCALayer(nn.Module):
         self.n_levels = n_levels
         self.self_attn_dropout = dropout
         self.bar_token_id = bar_token_id
-        self.bar_gru_hidden_size = bar_gru_hidden_size
 
         # Causal Self-Attention with RoPE
         self.self_attn_qkv = nn.Linear(d_model, 3 * d_model)
@@ -1335,18 +1117,6 @@ class SAWindowCALayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.rope = RotaryPositionalEmbedding(self.sa_head_dim)
 
-        # BarGRU provides cross-bar time tracking via note_gru + bar_gru + FullAttn.
-        if bar_token_id is not None:
-            # L1: build BarGRU (note_gru + bar_gru + audio-grounded FullAttn)
-            self.bar_gru_module = BarGRU(
-                d_model=d_model,
-                d_bar=bar_gru_hidden_size,
-                onset_1d_channels=onset_1d_channels,
-                input_dropout=bar_gru_input_dropout,
-                n_heads=n_heads,
-            )
-        else:
-            self.bar_gru_module = None
 
         # Window Cross-Attention
         self.window_ca = WindowCrossAttention(
@@ -1360,6 +1130,7 @@ class SAWindowCALayer(nn.Module):
             full_freq_levels=full_freq_levels,
             cascade_com=cascade_com,
             use_checkpoint=window_ca_use_checkpoint,
+            exp_decay_lambda=exp_decay_lambda,
         )
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
@@ -1374,18 +1145,17 @@ class SAWindowCALayer(nn.Module):
         )
         self.norm3 = nn.LayerNorm(d_model)
 
+        # Compressor Fusion: SA history gates itself by cosine similarity with CA output.
+        # Matches MambaWindowCALayer.render_proj / compressor_temp.
+        self.render_proj = nn.Linear(d_model, d_model)
+        self.compressor_temp = nn.Parameter(torch.tensor(2.659))
+
         # Caches read by ClefDecoder after forward.
-        # _cached_window_center: (time_center, freq_center) input to WindowCA.
         # _cached_com_f: [B, S, 1] com_f from this layer's WindowCA (passed to next layer as freq_center_in).
         # _cached_com_t_wca: [B, S, 1] com_t from this layer's WindowCA (time cascade to next layer).
-        # _cached_bar_gru_h: [1, B, D_bar] last bar_gru hidden state (L1 only).
-        # _cached_h_bar_carried: [B, S, D_bar] per-position h_bar (carry-forwarded, L1 only).
         # _cached_guidance_loss: optional hinge loss on bar_center at <bar> positions.
-        self._cached_window_center: Optional[Tuple] = None
         self._cached_com_f: Optional[torch.Tensor] = None
         self._cached_com_t_wca: Optional[torch.Tensor] = None
-        self._cached_bar_gru_h: Optional[torch.Tensor] = None
-        self._cached_h_bar_carried: Optional[torch.Tensor] = None
         self._cached_guidance_loss: Optional[torch.Tensor] = None
 
     def forward(
@@ -1399,25 +1169,14 @@ class SAWindowCALayer(nn.Module):
         past_state=None,
         use_cache: bool = False,
         value_cache=None,
-        onset_1d=None,          # [B, T_octopus, C] — required for L1 (BarGRU)
-        input_ids=None,         # [B, S] int — required for L1 to detect <bar> tokens
-        time_center_in=None,    # [B, S, 1] from ClefDecoder (NoteGRU read + cascade)
+        time_center_in=None,    # [B, S, 1] dense com_t from BarMamba (forward-filled)
         freq_center_in=None,    # [B, S, 1] com_f from previous layer's WindowCA (L3/L5 only)
         guidance_bounds=None,   # [B, S, 2] optional CoM hinge supervision
-        tf_ratio: float = 1.0,  # teacher-forcing ratio for note_gru scheduled sampling
-        pred_embs: Optional[torch.Tensor] = None,  # [B, S, D] for TF (optional)
         bar_mask: Optional[torch.Tensor] = None,   # [B, S] bool, precomputed in ClefDecoder
-        com_t_all: Optional[torch.Tensor] = None,  # [B, S, 1] com_t at <bar> positions
-        h_bar_final: Optional[torch.Tensor] = None,  # [1, B, D_bar]
-        h_bar_carried: Optional[torch.Tensor] = None,  # [B, S, D_bar]
         # Legacy kwargs passed by ClefDecoder (ignored here)
         audio_latent=None,
     ):
-        """SA + BarGRU (L1 only) + Window CA + FFN.
-
-        BarGRU provides audio-grounded com_t at <bar> positions. Time centers
-        are computed in ClefDecoder (NoteGRU read-before), then passed in.
-        """
+        """SA + Window CA + FFN."""
         B, S, D = tgt.shape
         past_kv = past_state[0] if past_state is not None else None
 
@@ -1452,35 +1211,8 @@ class SAWindowCALayer(nn.Module):
         tgt = tgt + self.dropout1(self.self_attn_out(sa_out))
         tgt = self.norm1(tgt)
 
-        # 2. Determine bar info (com_t_all / h_bar) for guidance and caching.
+        # 2. Determine bar info for guidance and caching.
         self._cached_guidance_loss = None
-        self._cached_bar_gru_h = None
-        self._cached_h_bar_carried = None
-
-        if (com_t_all is None or h_bar_carried is None or h_bar_final is None) and self.bar_gru_module is not None:
-            if onset_1d is not None and input_ids is not None:
-                # L1 fallback: run BarGRU if precomputed values are not provided.
-                bar_mask = (input_ids == self.bar_token_id)  # [B, S]
-                com_t_all, h_bar_final, h_bar_carried = self.bar_gru_module(
-                    token_embs=tgt,
-                    onset_1d=onset_1d,
-                    bar_mask=bar_mask,
-                    tf_ratio=tf_ratio,
-                    pred_embs=pred_embs,
-                )
-
-        if bar_mask is None:
-            bar_mask = torch.zeros(B, S, dtype=torch.bool, device=tgt.device)
-        if com_t_all is None:
-            com_t_all = torch.zeros(B, S, 1, device=tgt.device, dtype=tgt.dtype)
-        if h_bar_final is None:
-            h_bar_final = torch.zeros(1, B, self.bar_gru_hidden_size,
-                                      device=tgt.device, dtype=tgt.dtype)
-        if h_bar_carried is None:
-            h_bar_carried = torch.zeros(B, S, h_bar_final.shape[-1], device=tgt.device, dtype=tgt.dtype)
-
-        self._cached_bar_gru_h = h_bar_final       # [1, B, D_bar]
-        self._cached_h_bar_carried = h_bar_carried  # [B, S, D_bar]
 
         # Freq cascade: L1 starts at 0.5 (no prior); L3 uses L1's com_f; L5 uses L3's com_f.
         # com_f is the frequency center-of-mass from the previous layer's WindowCA attention
@@ -1490,12 +1222,10 @@ class SAWindowCALayer(nn.Module):
         else:
             freq_center = torch.full((B, S, 1), 0.5, device=tgt.device, dtype=tgt.dtype)
 
-        # Store window center as cached output (used by ClefDecoder + sanity check)
         if time_center_in is None:
             time_center = torch.full((B, S, 1), 0.5, device=tgt.device, dtype=tgt.dtype)
         else:
             time_center = time_center_in
-        self._cached_window_center = (time_center, freq_center)
 
         # Time center guidance loss: CoM hinge on bar + note tokens.
         # For each supervised token (bar or note), the time_center should land within
@@ -1521,9 +1251,10 @@ class SAWindowCALayer(nn.Module):
         self._cached_com_f = None
         self._cached_com_t_wca = None
 
-        # 4. Window Cross-Attention
+        # 4. Window Cross-Attention (Q = SA output, saved in tgt before WCA)
+        sa_normed = tgt  # [B, S, D] — pre-WCA SA output (used as Compressor input)
         tgt2, _com_t_wca, com_f_wca = self.window_ca(
-            query=tgt,
+            query=sa_normed,
             time_center=time_center,
             freq_center=freq_center,
             value=memory,
@@ -1532,11 +1263,18 @@ class SAWindowCALayer(nn.Module):
             active_levels=self.active_ca_levels,
             kv_cache=value_cache,
         )
-        # Cache com_f for ClefDecoder to pass to the next window_ca layer
+        # Cache com_f for ClefDecoder to pass to the next sa_window_ca layer
         self._cached_com_f = com_f_wca  # [B, S, 1]
         self._cached_com_t_wca = _com_t_wca  # [B, S, 1]
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
+        ca_out = self.dropout2(tgt2)
+
+        # Compressor Fusion: SA history gates itself by cosine similarity with audio CA output.
+        # Audio (ca_out) is the immutable base; SA (render_proj) is the compressor.
+        sa_rendered = self.render_proj(sa_normed)
+        cosine_sim = F.cosine_similarity(sa_rendered, ca_out, dim=-1)  # [B, S]
+        compressor_gate = torch.sigmoid(self.compressor_temp * cosine_sim)
+        ducked_sa = sa_rendered * compressor_gate.unsqueeze(-1)
+        tgt = self.norm2(ducked_sa + ca_out)
 
         # 5. FFN
         tgt = tgt + self.ffn(tgt)
@@ -1551,17 +1289,17 @@ class ClefDecoder(nn.Module):
     """Hybrid decoder: Mamba2 + Self-Attention + Cross-Attention.
 
     Layer pattern (clef_piano_base, 6 layers):
-      L1: window_ca  — SA + BarGRU (onset_1d) + Window CA on S2+S3
-      L2: mamba_only — sequential writing
-      L3: window_ca  — SA + Window CA on S0+S1
-      L4: mamba_only — sequential writing
-      L5: window_ca  — SA + Window CA on L0+L1
-      L6: mamba_only — sequential writing
+      L1: sa_window_ca - SA + Window CA on S2+S3
+      L2: mamba_only   - sequential writing
+      L3: sa_window_ca - SA + Window CA on S0+S1
+      L4: mamba_only   - sequential writing
+      L5: sa_window_ca - SA + Window CA on L0+L1
+      L6: mamba_only   - sequential writing
 
-    Temporal responsibility (Global NoteGRU):
-      L1 BarGRU computes h_bar + com_t (audio-grounded).
-      NoteGRU provides shared time_center (read-before / write-after).
-      Time cascade: L1 uses time_center_base; L3 uses L1.com_t_wca; L5 uses L3.com_t_wca.
+    Temporal responsibility:
+      BarMamba computes com_t at <bar> positions using BiMamba memory.
+      com_t is forward-filled to all notes within the bar.
+      Time cascade: L1 uses this dense com_t; L3 uses L1.com_t_wca; L5 uses L3.com_t_wca.
       (Direct cascade without blending: each layer refines the previous layer's output.)
     """
 
@@ -1584,7 +1322,7 @@ class ClefDecoder(nn.Module):
         expand: int = 2,
         use_rope: bool = True,  # RoPE for SA layers
         n_layers: int = 6,     # legacy fallback (ignored if decoder_layer_types is set)
-        bar_token_id: Optional[int] = None,   # set for first window_ca (L1 BarGRU)
+        bar_token_id: Optional[int] = None,   # set for first window_ca (L1 BarGRU) or mamba_full_ca
         onset_1d_channels: int = 32,          # C from Octopus F-pooled for bar attention
         decoder_layer_full_freq: Optional[List] = None,  # per-layer: True/False or List[int] of full-freq level IDs
         decoder_layer_cascade_com: Optional[List[bool]] = None,  # per-layer cascade CoM flag
@@ -1592,22 +1330,22 @@ class ClefDecoder(nn.Module):
         # Bar-GRU redesign params (forwarded to SAWindowCALayer)
         bar_gru_hidden_size: int = 256,
         bar_gru_input_dropout: float = 0.1,
-        note_gru_hidden_size: int = 256,
-        note_gru_input_dropout: float = 0.1,
-        **kwargs,              # absorb deprecated FluxAttention params (n_points_*, *_scale, etc.)
+        # Curriculum Learning for mamba_full_ca path
+        curriculum_warmup_steps: int = 0,     # 0 = disabled; >0 = bar-progressive window expansion
+        # Exponential decay soft mask for window CA (sa_window_ca and mamba_window_ca only)
+        window_exp_decay_lambda: float = 0.0,
     ):
         super().__init__()
 
         if decoder_layer_types is None:
-            decoder_layer_types = ['window_ca', 'mamba_only',
-                                   'window_ca', 'mamba_only', 'window_ca', 'mamba_only']
+            decoder_layer_types = ['sa_window_ca', 'mamba_only',
+                                   'sa_window_ca', 'mamba_only', 'sa_window_ca', 'mamba_only']
 
         self.layer_types = decoder_layer_types
         self.bar_token_id = bar_token_id
         self.use_rope = use_rope
         self.bar_gru_hidden_size = bar_gru_hidden_size
-        self.note_gru_hidden_size = note_gru_hidden_size
-        self.note_gru_input_dropout = note_gru_input_dropout
+        self.curriculum_warmup_steps = curriculum_warmup_steps
 
         # Shared kwargs passed to all layer constructors (unused keys absorbed by **kwargs)
         base_kwargs = dict(
@@ -1619,29 +1357,39 @@ class ClefDecoder(nn.Module):
             rope_base=rope_base,
         )
 
-        self.note_gru = NoteGRU(
-            d_model=d_model,
-            d_bar=bar_gru_hidden_size,
-            d_note=note_gru_hidden_size,
-            input_dropout=note_gru_input_dropout,
-        )
+        # Build shared BarMamba if bar_token_id is present.
+        # Uses level 0 (highest temporal resolution) for DSNT.
+        if bar_token_id is not None:
+            self.bar_mamba = BarMamba(
+                d_model=d_model,
+                n_heads=n_heads,
+                active_ca_level=2,   # BiMamba output level (same as MambaFullCALayer's active_ca_levels=[2])
+                n_levels=n_levels,
+            )
+        else:
+            self.bar_mamba = None
 
-        # The first window_ca layer gets bar_token_id for BarGRU.
+        # The first window_ca layer gets bar_token_id assigned (legacy mapping)
         bar_ca_assigned = False
 
         self.layers = nn.ModuleList()
         for i, lt in enumerate(decoder_layer_types):
             ca_levels = decoder_layer_ca_levels[i] if decoder_layer_ca_levels else None
-            if lt == 'perceiver':
-                # Legacy: keep PerceiverLayer available if config still uses it
-                self.layers.append(PerceiverLayer(
-                    active_ca_levels=ca_levels,
-                    **base_kwargs,
-                ))
-            elif lt == 'mamba_only':
+            if lt == 'mamba_only':
                 self.layers.append(MambaOnlyLayer(
                     d_state=d_state, d_conv=d_conv, expand=expand,
                     **base_kwargs,
+                ))
+            elif lt == 'mamba_full_ca':
+                self.layers.append(MambaFullCALayer(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    n_heads=n_heads,
+                    dropout=dropout,
+                    active_ca_levels=ca_levels,
+                    n_levels=n_levels,
                 ))
             elif lt == 'full_ca':
                 self.layers.append(SAFullCALayer(
@@ -1652,8 +1400,8 @@ class ClefDecoder(nn.Module):
                     active_ca_levels=ca_levels,
                     n_levels=n_levels,
                 ))
-            elif lt == 'window_ca':
-                # First window_ca: assign bar_token_id for bar full-attention
+            elif lt == 'sa_window_ca':
+                # First sa_window_ca: assign bar_token_id for bar full-attention
                 layer_bar_token_id = None
                 if not bar_ca_assigned and bar_token_id is not None:
                     layer_bar_token_id = bar_token_id
@@ -1696,6 +1444,44 @@ class ClefDecoder(nn.Module):
                     window_ca_use_checkpoint=window_ca_use_checkpoint,
                     bar_gru_hidden_size=bar_gru_hidden_size,
                     bar_gru_input_dropout=bar_gru_input_dropout,
+                    exp_decay_lambda=window_exp_decay_lambda,
+                ))
+            elif lt == 'mamba_window_ca':
+                # Same full_freq / cascade_com parsing as window_ca
+                raw_ff = (
+                    decoder_layer_full_freq[i]
+                    if decoder_layer_full_freq is not None and i < len(decoder_layer_full_freq)
+                    else False
+                )
+                if isinstance(raw_ff, (list, tuple)):
+                    layer_full_freq = False
+                    layer_full_freq_levels = list(raw_ff)
+                else:
+                    layer_full_freq = bool(raw_ff) if raw_ff is not None else False
+                    layer_full_freq_levels = None
+                layer_cascade_com = (
+                    bool(decoder_layer_cascade_com[i])
+                    if decoder_layer_cascade_com is not None and i < len(decoder_layer_cascade_com)
+                    and decoder_layer_cascade_com[i] is not None
+                    else False
+                )
+                self.layers.append(MambaWindowCALayer(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    n_heads=n_heads,
+                    dropout=dropout,
+                    active_ca_levels=ca_levels,
+                    n_levels=n_levels,
+                    window_time_frames=window_time_frames,
+                    window_freq_bins=window_freq_bins,
+                    window_seq_chunk_size=window_seq_chunk_size,
+                    full_freq=layer_full_freq,
+                    full_freq_levels=layer_full_freq_levels,
+                    cascade_com=layer_cascade_com,
+                    window_ca_use_checkpoint=window_ca_use_checkpoint,
+                    exp_decay_lambda=window_exp_decay_lambda,
                 ))
             else:
                 raise ValueError(f"Unknown decoder layer type: {lt!r}")
@@ -1703,18 +1489,12 @@ class ClefDecoder(nn.Module):
         # Assign layer_idx to Mamba layers (needed for InferenceParams state indexing)
         mamba_idx = 0
         for layer in self.layers:
-            if isinstance(layer, MambaOnlyLayer):
+            if isinstance(layer, (MambaOnlyLayer, MambaFullCALayer, MambaWindowCALayer)):
                 layer.mamba.layer_idx = mamba_idx
                 mamba_idx += 1
 
         self.norm = nn.LayerNorm(d_model)
         self.gradient_checkpointing = False  # enabled via enable_gradient_checkpointing()
-
-        # NoteGRU inference state.
-        self._note_gru_h: Optional[torch.Tensor] = None  # [B, D_note]
-        self._note_gru_prev_bar: Optional[torch.Tensor] = None  # [B] bool
-        self._note_gru_prev_bar_com: Optional[torch.Tensor] = None  # [B, 1]
-        self._note_gru_prev_bar_h: Optional[torch.Tensor] = None  # [B, D_bar]
 
     def forward(
         self,
@@ -1761,69 +1541,117 @@ class ClefDecoder(nn.Module):
         new_states = [] if use_cache else None
         self._cached_guidance_loss = None
 
-        # Precompute BarGRU outputs (for NoteGRU read + bar reset)
+
+        # Derive bar_mask from input_ids
         bar_mask = None
-        com_t_all = None
-        h_bar_final = None
-        h_bar_carried = None
         if input_ids is not None and self.bar_token_id is not None:
             bar_mask = (input_ids == self.bar_token_id)
-
-        if onset_1d is not None and input_ids is not None:
-            # Find first SAWindowCALayer with bar_token_id to run BarGRU once
-            for layer in self.layers:
-                if isinstance(layer, SAWindowCALayer) and layer.bar_token_id is not None:
-                    bar_mask = (input_ids == layer.bar_token_id)
-                    com_t_all, h_bar_final, h_bar_carried = layer.bar_gru_module(
-                        token_embs=tgt,
-                        onset_1d=onset_1d,
-                        bar_mask=bar_mask,
-                        tf_ratio=tf_ratio,
-                        pred_embs=pred_embs,
-                    )
-                    break
-
         if bar_mask is None:
             bar_mask = torch.zeros(B, S, dtype=torch.bool, device=output.device)
-        if com_t_all is None:
-            com_t_all = torch.zeros(B, S, 1, device=output.device, dtype=output.dtype)
-        if h_bar_carried is None:
-            h_bar_carried = torch.zeros(B, S, self.bar_gru_hidden_size,
-                                        device=output.device, dtype=output.dtype)
 
-        # NoteGRU: read time_center before decoding, write after decoding
-        time_center_base = None
-        if not use_cache:
-            time_center_base, _ = self.note_gru.scan_sequence(
-                inputs=tgt,
+
+        # ── BarMamba (Universal Bar-Level Temporal Localizer) ────────────────
+        # BarMamba computes com_t via DSNT attention on encoder memory at <bar> positions.
+        # We then forward-fill com_t to all notes within the bar so they share the same
+        # temporal center for Window Cross-Attention.
+        # BarMamba also returns summary_embed_dense: Stage 1 bar summary embed for each
+        # complete bar (bar_index < N_b), used as tgt_query for MambaFullCA.
+        dense_com_t = None
+        summary_embed_dense = None
+        # True if any layer type uses BarMamba's com_t (full CA or window CA)
+        has_bar_ca = any(isinstance(l, (MambaFullCALayer, MambaWindowCALayer)) for l in self.layers)
+
+        if (hasattr(self, 'bar_mamba')
+                and self.bar_mamba is not None
+                and memory is not None
+                and bar_mask is not None
+                and bar_mask.any()):
+
+            # 1. Compute sparse com_t [B, S, 1] and summary_embed_dense [B, S, D]
+            sparse_com_t, summary_embed_dense = self.bar_mamba(
+                y=tgt,
+                memory=memory,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
                 bar_mask=bar_mask,
-                h_bar_carried=h_bar_carried,
-                com_t_all=com_t_all,
+                input_ids=input_ids,
             )
+
+            # 2. Forward-fill com_t (step-and-hold) within each bar
+            B, S = bar_mask.shape
+            dense_com_t = sparse_com_t.clone()
+            for b in range(B):
+                b_mask = bar_mask[b]
+                if b_mask.any():
+                    # indices of <bar> tokens
+                    bar_idx = b_mask.nonzero(as_tuple=False).squeeze(1).tolist()
+                    bar_starts = bar_idx
+                    bar_ends = bar_idx[1:] + [S]
+                    
+                    for start, end in zip(bar_starts, bar_ends):
+                        # The <bar> token's com_t
+                        val = sparse_com_t[b, start, 0]
+                        # Fill subsequent non-bar tokens with this value
+                        dense_com_t[b, start:end, 0] = val
+
+        # ── Build tgt_query ──────────────────────────────────────────────────
+        # bar_index_per_tok[b, s] = number of <bar> tokens seen up to and including s.
+        # Complete bars: bar_index < N_b (N_b = total <bar> count for this sample).
+        # Current bar:   bar_index == N_b (still being decoded → use raw sequential tgt).
+        bar_index_per_tok = bar_mask.long().cumsum(dim=1)  # [B, S]
+
+        if summary_embed_dense is not None and bar_mask.any():
+            # For bars with a prior-bar summary (bar_index >= 2): CA query = summary embed.
+            # Bar 1 (bar_index == 1) has no preceding summary → raw tgt.
+            # Current bar (bar_index == N_b) still being decoded → raw tgt.
+            tgt_query = tgt.clone()
+            for b in range(B):
+                n_bars_b = int(bar_mask[b].float().sum().item())  # N_b
+                # summary_embed_dense is non-zero only at bar_index 2..N_b (bar 2 onwards).
+                # bar 1 notes get no summary replacement; current bar also stays raw.
+                complete_mask = (bar_index_per_tok[b] >= 2) & (bar_index_per_tok[b] < n_bars_b)
+                if complete_mask.any():
+                    tgt_query[b, complete_mask] = summary_embed_dense[b, complete_mask]
         else:
-            # Inference: compute time_center from cached NoteGRU state
-            if self._note_gru_h is None:
-                self._note_gru_h = torch.zeros(B, self.note_gru_hidden_size,
-                                               device=output.device, dtype=output.dtype)
-            if self._note_gru_prev_bar is None:
-                self._note_gru_prev_bar = torch.zeros(B, dtype=torch.bool, device=output.device)
-            if self._note_gru_prev_bar_h is None:
-                self._note_gru_prev_bar_h = torch.zeros(B, self.bar_gru_hidden_size,
-                                                        device=output.device, dtype=output.dtype)
-            if self._note_gru_prev_bar_com is None:
-                self._note_gru_prev_bar_com = torch.full((B, 1), 0.5,
-                                                         device=output.device, dtype=output.dtype)
+            tgt_query = output  # fallback: Mamba decode path (original behavior)
 
-            if self._note_gru_prev_bar.any():
-                h_reset = self.note_gru.init_proj(self._note_gru_prev_bar_h)
-                self._note_gru_h = torch.where(self._note_gru_prev_bar.unsqueeze(1), h_reset, self._note_gru_h)
+        # ── Curriculum: embedding masking (no sequence length change) ────────
+        # Compressed bars → their token embeddings are zeroed out.
+        # ClefPianoTiny reads self._curriculum_mask to mask out corresponding labels.
+        self._curriculum_mask = None  # reset each forward
+        if (has_bar_ca
+                and self.curriculum_warmup_steps > 0
+                and bar_mask is not None
+                and self.training):
+            total_bars = int(bar_mask.float().sum(-1).max().item())
+            global_step = getattr(self, '_curriculum_step', 0)
+            steps_per_bar = max(self.curriculum_warmup_steps / max(total_bars, 1), 1)
+            visible_bars = min(int(global_step / steps_per_bar) + 1, total_bars)
+            curr_mask = compute_curriculum_mask(bar_mask, visible_bars)  # [B, S]
+            if curr_mask.any():
+                self._curriculum_mask = curr_mask
+                # Zero-out Mamba decode path for compressed bars
+                output = output.clone()
+                output[curr_mask] = 0.0
 
-            time_center_base = torch.sigmoid(self.note_gru.time_head(self._note_gru_h)).unsqueeze(1)
-            time_center_base = torch.where(
-                self._note_gru_prev_bar.unsqueeze(1).unsqueeze(-1),
-                self._note_gru_prev_bar_com.unsqueeze(1),
-                time_center_base,
-            )
+                # ── Q-path scheduled sampling for compressed bars ─────────────
+                # tgt_query already has summary_embed_dense for complete bars (GT).
+                # For not-teacher-force: override with pred_embs (model's own prediction).
+                # Applied per bar (same TF choice for all tokens in the same bar).
+                if bar_mask.any() and tgt_query is not output:
+                    for b in range(B):
+                        compressed_bars = (
+                            bar_mask[b] & curr_mask[b]
+                        ).nonzero(as_tuple=False).squeeze(1)
+                        if compressed_bars.numel() == 0:
+                            continue
+                        for bar_pos in compressed_bars.tolist():
+                            bar_n = bar_index_per_tok[b, bar_pos].item()
+                            tok_mask = (bar_index_per_tok[b] == bar_n)
+                            teacher_force = (torch.rand(1, device=tgt.device).item() < tf_ratio)
+                            if not teacher_force and pred_embs is not None:
+                                tgt_query[b, tok_mask] = pred_embs[b, tok_mask].to(tgt.dtype)
+                            # teacher_force: tgt_query already has summary_embed_dense (GT)
 
 
         # com_t cascade: L1's WindowCA com_t → L3 time_center; L3's → L5 time_center.
@@ -1836,94 +1664,84 @@ class ClefDecoder(nn.Module):
             layer_value_cache = value_cache_list[i] if value_cache_list else None
 
             # Determine what to pass to this layer.
-            layer_onset_1d = None
-            layer_input_ids = None
             layer_window_center = None
             layer_freq_center_in = None
             layer_guidance_bounds = None
 
-            if isinstance(layer, PerceiverLayer):
-                pass  # Legacy Perceiver: no bar_center / onset_1d input
-
-            elif isinstance(layer, SAWindowCALayer):
+            if isinstance(layer, SAWindowCALayer):
                 if layer.bar_token_id is not None:
-                    # L1: receives onset_1d and input_ids, runs BarGRU internally if needed.
-                    layer_onset_1d = onset_1d
-                    layer_input_ids = input_ids
+                    # L1: Start with dense_com_t from BarMamba
+                    layer_window_center = dense_com_t
                     layer_guidance_bounds = guidance_bounds
                     # L1 freq_center starts at 0.5 (no prior)
                 else:
                     # L3, L5: use cascaded time/freq centers from previous window_ca layers.
                     layer_freq_center_in = last_com_f
+                    # Time cascade: L3/L5 directly use previous layer's com_t_wca (audio-grounded refinement).
+                    layer_window_center = last_com_t
 
-                # Time cascade: L1 uses base NoteGRU time_center;
-                # L3/L5 directly use previous layer's com_t_wca (audio-grounded refinement).
-                if time_center_base is not None:
-                    if last_com_t is not None:
-                        layer_window_center = last_com_t
-                    else:
-                        layer_window_center = time_center_base
+            elif isinstance(layer, MambaWindowCALayer):
+                # Use BarMamba's dense_com_t if this is the first CA layer (last_com_t is None)
+                # Otherwise cascade from the previous CA layer.
+                layer_freq_center_in = last_com_f
+                layer_window_center = last_com_t if last_com_t is not None else dense_com_t
 
             if use_cache:
-                _extra = {}
-                if isinstance(layer, SAWindowCALayer):
-                    _extra = dict(tf_ratio=tf_ratio, pred_embs=pred_embs)
-                output, new_state = layer(
-                    output, memory,
-                    spatial_shapes, level_start_index, valid_ratios,
+                layer_kwargs = dict(
                     tgt_pos=tgt_pos,
                     past_state=layer_state,
                     use_cache=True,
                     value_cache=layer_value_cache,
-                    onset_1d=layer_onset_1d,
-                    input_ids=layer_input_ids,
                     time_center_in=layer_window_center,
                     freq_center_in=layer_freq_center_in,
                     guidance_bounds=layer_guidance_bounds,
                     bar_mask=bar_mask,
-                    com_t_all=com_t_all,
-                    h_bar_final=h_bar_final,
-                    h_bar_carried=h_bar_carried,
-                    **_extra,
+                )
+                if isinstance(layer, MambaFullCALayer):
+                    layer_kwargs['tgt_query'] = tgt_query
+                output, new_state = layer(
+                    output, memory,
+                    spatial_shapes, level_start_index, valid_ratios,
+                    **layer_kwargs,
                 )
                 new_states.append(new_state)
             elif self.training and self.gradient_checkpointing:
-                # Layer-level gradient checkpoint.
-                # Use default-argument capture to avoid Python closure bug.
-                _onset = layer_onset_1d
                 _guidance = layer_guidance_bounds
                 _freq_in = layer_freq_center_in
                 _is_window = isinstance(layer, SAWindowCALayer)
-                def _layer_fn(out, mem, onset, gb, time_in, freq_in,
+                _is_mamba_full_ca = isinstance(layer, MambaFullCALayer)
+                _tgt_query = tgt_query if _is_mamba_full_ca else None
+                def _layer_fn(out, mem, gb, time_in, freq_in, tq,
                               _l=layer, _sp=spatial_shapes, _lsi=level_start_index,
-                              _vr=valid_ratios, _tp=tgt_pos, _ids=layer_input_ids,
-                              _tf=tf_ratio, _pe=pred_embs, _iw=_is_window,
-                              _bm=bar_mask, _ct=com_t_all, _hbf=h_bar_final, _hbc=h_bar_carried):
-                    _extra = dict(tf_ratio=_tf, pred_embs=_pe) if _iw else {}
-                    return _l(out, mem, _sp, _lsi, _vr, tgt_pos=_tp,
-                              onset_1d=onset, input_ids=_ids,
-                              time_center_in=time_in, freq_center_in=freq_in, guidance_bounds=gb,
-                              bar_mask=_bm, com_t_all=_ct, h_bar_final=_hbf, h_bar_carried=_hbc,
-                              **_extra)
+                              _vr=valid_ratios, _tp=tgt_pos, _iw=_is_window,
+                              _bm=bar_mask, _imfc=_is_mamba_full_ca):
+                    kwargs = dict(
+                        tgt_pos=_tp,
+                        time_center_in=time_in,
+                        freq_center_in=freq_in,
+                        guidance_bounds=gb,
+                        bar_mask=_bm,
+                    )
+                    if _imfc:
+                        kwargs['tgt_query'] = tq
+                    return _l(out, mem, _sp, _lsi, _vr, **kwargs)
                 output = grad_checkpoint(_layer_fn, output, memory,
-                                        _onset, _guidance, layer_window_center, _freq_in,
+                                        _guidance, layer_window_center, _freq_in, _tgt_query,
                                         use_reentrant=False)
             else:
-                _extra = dict(tf_ratio=tf_ratio, pred_embs=pred_embs) if isinstance(layer, SAWindowCALayer) else {}
-                output = layer(
-                    output, memory,
-                    spatial_shapes, level_start_index, valid_ratios,
+                layer_kwargs = dict(
                     tgt_pos=tgt_pos,
-                    onset_1d=layer_onset_1d,
-                    input_ids=layer_input_ids,
                     time_center_in=layer_window_center,
                     freq_center_in=layer_freq_center_in,
                     guidance_bounds=layer_guidance_bounds,
                     bar_mask=bar_mask,
-                    com_t_all=com_t_all,
-                    h_bar_final=h_bar_final,
-                    h_bar_carried=h_bar_carried,
-                    **_extra,
+                )
+                if isinstance(layer, MambaFullCALayer):
+                    layer_kwargs['tgt_query'] = tgt_query
+                output = layer(
+                    output, memory,
+                    spatial_shapes, level_start_index, valid_ratios,
+                    **layer_kwargs,
                 )
 
             # Update temporal state after each layer.
@@ -1936,23 +1754,19 @@ class ClefDecoder(nn.Module):
                 if layer.bar_token_id is not None:
                     self._cached_guidance_loss = layer._cached_guidance_loss
 
+            elif isinstance(layer, MambaWindowCALayer):
+                # Same cascade as SAWindowCALayer (no guidance loss for this layer type).
+                if layer._cached_com_t_wca is not None:
+                    last_com_t = layer._cached_com_t_wca  # [B, S, 1]
+                if layer._cached_com_f is not None:
+                    last_com_f = layer._cached_com_f  # [B, S, 1]
+
             elif isinstance(layer, SAFullCALayer):
                 # Legacy support if full_ca layers still exist in config
                 self._cached_guidance_loss = layer._cached_guidance_loss
 
         output = self.norm(output)
 
-        # NoteGRU write-after: update hidden with token embeddings
-        if use_cache:
-            if self._note_gru_h is None:
-                self._note_gru_h = torch.zeros(B, self.note_gru_hidden_size,
-                                               device=output.device, dtype=output.dtype)
-            self._note_gru_h = self.note_gru.step(tgt[:, -1], self._note_gru_h)
-            prev_was_bar = bar_mask[:, -1]
-            self._note_gru_prev_bar = prev_was_bar
-            if prev_was_bar.any():
-                self._note_gru_prev_bar_h = h_bar_carried[:, -1, :]
-                self._note_gru_prev_bar_com = com_t_all[:, -1, :]
 
         if use_cache:
             return output, new_states

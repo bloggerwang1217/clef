@@ -38,6 +38,7 @@ class ClefPianoConfig(ClefConfig):
     # Bar token ID for L1 bar full-attention (Zeng extended vocabulary).
     # <bar> tokens attend to onset_1d to compute bar_center (temporal authority).
     bar_token_id: int = 4
+    curriculum_warmup_steps: int = 0
 
     # Global NoteGRU redesign (global-notegru-plan.md)
     # bar_gru: cross-bar time tracking; note_gru: token-level shared time prior
@@ -53,6 +54,11 @@ class ClefPianoConfig(ClefConfig):
     # Per-layer cascade_com flag: after each level, use its CoM as next level's window center.
     decoder_layer_cascade_com: Optional[List] = None
 
+
+    # Exponential decay soft mask for window CA (sa_window_ca and mamba_window_ca only).
+    # score_j += -lambda * |t_j - com_t|  before softmax → L1-style gradient pull on com_t.
+    # 0.0 = disabled; recommended range: 10.0 (soft) to 50.0 (strong).
+    window_exp_decay_lambda: float = 0.0
 
     # Gradient checkpointing (trades compute for memory)
     gradient_checkpointing: bool = False
@@ -70,13 +76,35 @@ class ClefPianoConfig(ClefConfig):
     # freq_prior learns to focus on relevant register
     use_freq_prior: bool = True
 
-    # Training
+    # BiMamba Encoder (per-pitch-track temporal modeling, Zeng 2024 inspired)
+    use_bimamba_encoder: bool = False
+    bimamba_input_dim: int = 192        # S0 output channels (Swin V2 Tiny)
+    bimamba_d_model: int = 512          # Match decoder d_model
+    bimamba_d_state: int = 128
+    bimamba_d_conv: int = 4
+    bimamba_num_layers: int = 2
+    bimamba_dropout: float = 0.1
+
+    # Training hyperparameters (read from YAML; single source of truth)
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 1000
-    lr_min_ratio: float = 0.1  # min_lr = learning_rate * lr_min_ratio (cosine decay endpoint)
+    lr_min_ratio: float = 0.1   # min_lr = learning_rate * lr_min_ratio (cosine decay endpoint)
+    lr_flat_ratio: float = 0.0  # WSD: fraction of post-warmup steps held at peak LR (0.0 = original cosine)
     max_epochs: int = 100
     training_seed: int = 1234
+
+    # Runtime / infrastructure (read from YAML; CLI args are only --config/--resume/--wandb/--debug/--sanity-check)
+    batch_size: int = 2
+    gradient_accumulation_steps: int = 4
+    gradient_clip: float = 1.0
+    save_every_n_epochs: int = 5
+    early_stopping_patience: int = 0   # 0 = disabled
+    validate_every_n_steps: int = 500  # 0 = epoch-only validation
+
+    # Paths (defaults match legacy CLI defaults; override in YAML)
+    manifest_dir: str = "data/experiments/clef_piano_base"
+    checkpoint_dir: str = "checkpoints/clef_piano_base"
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ClefPianoConfig":
@@ -132,28 +160,29 @@ class ClefPianoConfig(ClefConfig):
             ff_dim=model_cfg.get("ff_dim", defaults.ff_dim),
             dropout=model_cfg.get("dropout", defaults.dropout),
 
-            # Sampling (square: same scale for both dimensions)
-            n_points_freq=model_cfg.get("n_points_freq", defaults.n_points_freq),
-            n_points_time=model_cfg.get("n_points_time", defaults.n_points_time),
-            freq_offset_scale=model_cfg.get("freq_offset_scale", defaults.freq_offset_scale),
-            time_offset_scale=model_cfg.get("time_offset_scale", defaults.time_offset_scale),
-
             # Priors
-            use_time_prior=model_cfg.get("use_time_prior", defaults.use_time_prior),
             use_freq_prior=model_cfg.get("use_freq_prior", defaults.use_freq_prior),
-            n_freq_groups=model_cfg.get("n_freq_groups", defaults.n_freq_groups),
-            refine_range=model_cfg.get("refine_range", defaults.refine_range),
             rope_base=model_cfg.get("rope_base", defaults.rope_base),
+
+            # BiMamba Encoder
+            use_bimamba_encoder=model_cfg.get("use_bimamba_encoder", defaults.use_bimamba_encoder),
+            bimamba_input_dim=model_cfg.get("bimamba_input_dim", defaults.bimamba_input_dim),
+            bimamba_d_model=model_cfg.get("bimamba_d_model", defaults.bimamba_d_model),
+            bimamba_d_state=model_cfg.get("bimamba_d_state", defaults.bimamba_d_state),
+            bimamba_d_conv=model_cfg.get("bimamba_d_conv", defaults.bimamba_d_conv),
+            bimamba_num_layers=model_cfg.get("bimamba_num_layers", defaults.bimamba_num_layers),
+            bimamba_dropout=model_cfg.get("bimamba_dropout", defaults.bimamba_dropout),
 
             # Bar attention
             bar_token_id=model_cfg.get("bar_token_id", defaults.bar_token_id),
+            curriculum_warmup_steps=model_cfg.get("curriculum_warmup_steps", defaults.curriculum_warmup_steps),
 
             # Global NoteGRU redesign
             bar_gru_hidden_size=model_cfg.get("bar_gru_hidden_size", defaults.bar_gru_hidden_size),
             bar_gru_input_dropout=model_cfg.get("bar_gru_input_dropout", defaults.bar_gru_input_dropout),
             note_gru_hidden_size=model_cfg.get("note_gru_hidden_size", defaults.note_gru_hidden_size),
             note_gru_input_dropout=model_cfg.get("note_gru_input_dropout", defaults.note_gru_input_dropout),
-            tf_anneal_steps=training_cfg.get("tf_anneal_steps", defaults.tf_anneal_steps),
+            tf_anneal_steps=model_cfg.get("tf_anneal_steps", training_cfg.get("tf_anneal_steps", defaults.tf_anneal_steps)),
 
 
             # Guided attention loss
@@ -179,6 +208,7 @@ class ClefPianoConfig(ClefConfig):
             vocab_size=model_cfg.get("vocab_size", defaults.vocab_size),
             window_time_frames=model_cfg.get("window_time_frames", defaults.window_time_frames),
             window_freq_bins=model_cfg.get("window_freq_bins", defaults.window_freq_bins),
+            window_exp_decay_lambda=model_cfg.get("window_exp_decay_lambda", defaults.window_exp_decay_lambda),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),
@@ -200,6 +230,19 @@ class ClefPianoConfig(ClefConfig):
             weight_decay=training_cfg.get("weight_decay", 0.01),
             warmup_steps=training_cfg.get("warmup_steps", 1000),
             lr_min_ratio=training_cfg.get("lr_min_ratio", 0.1),
+            lr_flat_ratio=training_cfg.get("lr_flat_ratio", 0.0),
             max_epochs=training_cfg.get("max_epochs", 100),
             training_seed=seed_cfg.get("training", 1234),
+
+            # Runtime / infrastructure
+            batch_size=training_cfg.get("batch_size", defaults.batch_size),
+            gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", defaults.gradient_accumulation_steps),
+            gradient_clip=training_cfg.get("gradient_clip", defaults.gradient_clip),
+            save_every_n_epochs=training_cfg.get("save_every_n_epochs", defaults.save_every_n_epochs),
+            early_stopping_patience=training_cfg.get("early_stopping_patience", defaults.early_stopping_patience),
+            validate_every_n_steps=training_cfg.get("validate_every_n_steps", defaults.validate_every_n_steps),
+
+            # Paths
+            manifest_dir=cfg.get("paths", {}).get("manifest_dir", defaults.manifest_dir),
+            checkpoint_dir=cfg.get("paths", {}).get("checkpoint_dir", defaults.checkpoint_dir),
         )

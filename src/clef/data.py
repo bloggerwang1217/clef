@@ -87,13 +87,14 @@ class ChunkedDataset(Dataset):
     def _chunk_list_path(self) -> Path:
         """Fixed path for the human-readable chunk list txt.
         Stored alongside the manifest so it's easy to find.
+        Includes chunk_frames to avoid overwriting caches of different lengths.
         """
         manifest_path = getattr(self.base_dataset, 'manifest_path', None)
         if manifest_path:
             manifest_path = Path(manifest_path)
-            return manifest_path.parent / f'chunk_list_{manifest_path.stem}.txt'
+            return manifest_path.parent / f'chunk_list_{manifest_path.stem}_{self.chunk_frames}.txt'
         # Fallback: put next to this file
-        return Path(__file__).resolve().parent / 'chunk_list_unknown.txt'
+        return Path(__file__).resolve().parent / f'chunk_list_unknown_{self.chunk_frames}.txt'
 
     def _load_or_create_chunks(self) -> List[Tuple[int, int, int]]:
         """Load chunks from txt if it exists, otherwise build and save it."""
@@ -306,7 +307,26 @@ class ChunkedDataset(Dataset):
                         if hs.startswith('*k[') or (hs.startswith('*M') and '/' in hs):
                             header_interps.append(hl)
 
-                    chunk_kern = ''.join(header_interps + all_lines[line_start - 1:line_end])
+                    # Include the barline that opens this chunk so the
+                    # tokenizer naturally emits <bar> [schema] before the
+                    # first measure's notes (consistent across all chunks).
+                    # Pickup measures have no real preceding barline, so we
+                    # prepend a synthetic one to give the same structure.
+                    line_barline = kern_measures[first_m].get('line_barline')
+                    if line_barline is not None:
+                        chunk_kern = ''.join(
+                            header_interps + all_lines[line_barline - 1:line_end]
+                        )
+                    else:
+                        # Pickup (anacrusis): synthesise "=0\t=0" so the
+                        # tokenizer sees a barline and emits <bar> [schema].
+                        m_num = kern_measures[first_m]['measure']
+                        synthetic_bar = f'={m_num}\t={m_num}\n'
+                        chunk_kern = (
+                            ''.join(header_interps)
+                            + synthetic_bar
+                            + ''.join(all_lines[line_start - 1:line_end])
+                        )
 
                     try:
                         tokens = self.tokenizer.encode(chunk_kern)

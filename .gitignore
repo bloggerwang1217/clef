@@ -71,6 +71,8 @@ poetry.toml
 
 # AI instructions
 CLAUDE.md
+.agents/
+.claude/
 
 # PyTorch / ML
 *.pt

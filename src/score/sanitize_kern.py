@@ -382,6 +382,10 @@ def extract_kern_measures(kern_path=None, include_timing: bool = False,
         measure_start_line = pickup_data_start
         measure_start_offset = Fraction(0)
 
+    # Tracks the 1-indexed line number of the barline that started the current
+    # measure (None for pickup measures that have no preceding barline).
+    current_measure_barline: Optional[int] = None
+
     for line_num, line in enumerate(lines, start=1):
         line = line.strip()
 
@@ -417,6 +421,8 @@ def extract_kern_measures(kern_path=None, include_timing: bool = False,
                         "line_start": measure_start_line,
                         "line_end": line_end,
                     }
+                    if current_measure_barline is not None:
+                        entry["line_barline"] = current_measure_barline
                     if include_timing:
                         entry["start_sec"] = round(offset_to_seconds(measure_start_offset), 4)
                         entry["end_sec"] = round(offset_to_seconds(current_offset), 4)
@@ -445,6 +451,7 @@ def extract_kern_measures(kern_path=None, include_timing: bool = False,
 
             measure_start_line = line_num + 1  # Start after barline
             measure_start_offset = current_offset
+            current_measure_barline = line_num  # barline that opens this measure
 
         elif first_token.startswith('*'):
             # Interpretation line (metadata) - not part of measure content

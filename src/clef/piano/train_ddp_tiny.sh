@@ -1,23 +1,23 @@
 #!/bin/bash
 # =============================================================================
-# clef-piano-base DDP Training Script
+# clef-piano-tiny DDP Training Script
 # =============================================================================
 #
-# All hyperparameters come from the config YAML — this script only handles
-# GPU selection and optional resume/wandb overrides.
+# All hyperparameters (batch size, epochs, LR, paths, etc.) come from the
+# config YAML — this script only handles GPU selection and optional overrides.
 #
 # Usage (from project root):
-#   # Default: GPU 1 and 2
-#   bash src/clef/piano/train_ddp.sh
+#   # Default: GPU 1 and 2, config from configs/clef_piano_tiny.yaml
+#   bash src/clef/piano/train_ddp_tiny.sh
 #
 #   # Custom GPUs
-#   GPUS=0,1 bash src/clef/piano/train_ddp.sh
+#   GPUS=0,1 bash src/clef/piano/train_ddp_tiny.sh
 #
 #   # Resume from checkpoint
-#   RESUME=checkpoints/clef_piano_base/epoch_010.pt bash src/clef/piano/train_ddp.sh
+#   RESUME=checkpoints/clef_piano_tiny/epoch_010.pt bash src/clef/piano/train_ddp_tiny.sh
 #
-#   # Enable wandb with custom project
-#   WANDB=true WANDB_PROJECT=my-project bash src/clef/piano/train_ddp.sh
+#   # Different config
+#   CONFIG=configs/clef_piano_base.yaml bash src/clef/piano/train_ddp_tiny.sh
 
 set -e
 
@@ -25,20 +25,19 @@ set -e
 # Environment / GPU selection (the only things that belong in shell)
 # =============================================================================
 
-CONFIG="${1:-${CONFIG:-configs/clef_piano_base.yaml}}"
+CONFIG="${1:-${CONFIG:-configs/clef_piano_tiny.yaml}}"
 GPUS="${GPUS:-1,2}"
 NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
-MASTER_PORT="${MASTER_PORT:-29500}"
+MASTER_PORT="${MASTER_PORT:-29501}"
 RESUME="${RESUME:-}"
 WANDB="${WANDB:-false}"
-WANDB_PROJECT="${WANDB_PROJECT:-clef-piano-base}"
 
 # =============================================================================
 # Print summary
 # =============================================================================
 
 echo "=============================================="
-echo "clef-piano-base DDP Training"
+echo "clef-piano DDP Training"
 echo "=============================================="
 echo "Config:      $CONFIG  (single source of truth)"
 echo "GPUs:        $GPUS  ($NUM_GPUS GPUs)"
@@ -67,7 +66,6 @@ CMD="$CMD --config $CONFIG"
 
 if [ "$WANDB" = "true" ]; then
     CMD="$CMD --wandb"
-    CMD="$CMD --wandb-project $WANDB_PROJECT"
 fi
 
 if [ -n "$RESUME" ]; then

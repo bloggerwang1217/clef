@@ -1,14 +1,16 @@
-# clef-piano-tiny Training Configuration
+# clef-piano-tiny Training Configuration (Zeng-style)
 # =======================================
 #
-# Minimal PoC: Octopus + Flow + Swin S0 only + 2-layer decoder
-# Goal: Beat SOTA with minimal architecture on short clips (30s)
+# Minimal PoC: Octopus + Flow + BiMamba + 2-layer decoder
+# Goal: Beat SOTA with minimal architecture following Zeng et al. 2024
+#
+# This YAML is the single source of truth for ALL hyperparameters.
+# Training: python -m src.clef.piano.train --config configs/clef_piano_tiny.yaml [--resume <ckpt>] [--wandb]
 
 # =============================================================================
 # Seeds
 # =============================================================================
 seed:
-  data_augmentation: 0
   training: 1234
 
 # =============================================================================
@@ -17,15 +19,21 @@ seed:
 model:
   name: "clef-piano-tiny"
 
-  # Encoder: Swin V2 (frozen core, selective fine-tune)
-  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"
-  swin_dims: [96]  # Only S0 - simplified for tiny model
+  # NO Swin in Zeng-style design — BiMamba directly processes Flow output
+  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"  # Keep for compatibility
+  swin_dims: []  # No Swin stages used
   freeze_encoder: true
-  swin_unfreeze: ["patch_embed", "position_bias", "downsample"]  # Minimal unfreeze
-  swin_lr_scale: 0.1
+  swin_start_stage: 0
+  swin_pool_strides: []
 
-  swin_start_stage: 0  # Start from S0
-  swin_pool_strides: [1]
+  # BiMamba Encoder (time-oriented, Zeng 2024 style)
+  use_bimamba_encoder: true
+  bimamba_input_dim: 128      # Flow output dimension (n_mels)
+  bimamba_d_model: 512        # Match decoder d_model
+  bimamba_d_state: 128
+  bimamba_d_conv: 4
+  bimamba_num_layers: 2
+  bimamba_dropout: 0.1
 
   # Octopus2D (onset detection)
   use_octopus: true
@@ -38,64 +46,68 @@ model:
   # HarmonizingFlow (pitch space transform)
   use_flow: true
   n_harmonics: 6
-  flow_pool_stride: 4
+  flow_pool_stride: 1  # No pooling (10ms resolution)
 
   # Attention config
   d_model: 512
   n_heads: 8
-  n_levels: 3                  # Octopus (L0) + Flow (L1) + S0 (L2) only
+  n_levels: 3                  # Octopus (L0) + Flow (L1) + BiMamba (L2)
   ff_dim: 2048
   dropout: 0.1
 
-  n_points_freq: 2
-  n_points_time: 2
-  freq_offset_scale: 1.0
-  time_offset_scale: 1.0
-
-  use_time_prior: true
-  use_freq_prior: true
-  n_freq_groups: 4
-  refine_range: 0.1
   rope_base: 10000.0
 
-  bridge_layers: 1  # Minimal bridge
+  bridge_layers: 1
 
-  # Decoder: 2 layers only (Full CA → Mamba)
-  # L0: SA + Full CA to S0 (level 2) + FFN
-  # L1: Mamba only
-  decoder_layers: 2
-  decoder_layer_types: ["full_ca", "mamba_only"]
+  # Decoder: 2 layers (CA → Mamba)
+  #   L0: mamba_full_ca — Mamba + Window CA to BiMamba (level 2, 1D temporal)
+  #   L1: mamba_only    — sequential writing
+  decoder_layer_types: ["mamba_full_ca", "mamba_only"]
+  # decoder_layer_types: ["mamba_window_ca", "mamba_only"]  # window CA variant
   decoder_layer_ca_levels:
-    - [2]       # L0: Full CA to S0 (level 2)
+    - [2]       # L0: Full CA to BiMamba (level 2, temporal features)
     - null      # L1: Mamba only
   decoder_layer_full_freq:
-    - true      # L0: Full freq (S0 only has 32 freq bins after Flow pool)
+    - true      # L0: BiMamba level 2 is H=1 (1D), full_freq is the only option
     - null
   decoder_layer_cascade_com:
     - false
     - null
 
-  # Window parameters (not used in full CA, but required by config)
-  window_time_frames: [32, 16, 8]
-  window_freq_bins: [4, 4, 4]
+  # BarMamba: bar-level module for mamba_full_ca path
+  bar_token_id: 4       # <bar> token ID in KernTokenizer vocab
+  curriculum_warmup_steps: 0  # Disabled
+
+  # tf_anneal_steps: 0 = disabled (always TF 1.0)
+  tf_anneal_steps: 100000
+
+  # Window parameters
+  # Level 2 = BiMamba (50fps, 30s = 1500 frames).
+  # 512 frames ≈ ±5.1s ≈ ±1.7 bars at 80bpm (covers ±2 bars at ≥100bpm).
+  # Levels 0,1 values are unused (only level 2 is active).
+  window_time_frames: [32, 16, 512]
+  window_freq_bins: [4, 4, 1]         # level 2: H=1 (1D BiMamba), must be 1
   window_seq_chunk_size: 10000
+
+  # Exponential decay soft mask: score_j += -lambda * |t_j - com_t| (before softmax).
+  # λ=10: 1 bar (150 frames, 0.1 unit) → bias=-1.0 (soft). Range: 10–50.
+  window_exp_decay_lambda: 10.0
 
   # Mamba config
   mamba_d_state: 128
   mamba_d_conv: 4
   mamba_expand: 2
 
-  # Sequence config
-  max_seq_len: 1024  # 30s should fit easily
+  max_seq_len: 2048
   vocab_size: 271
 
   label_smoothing: 0.0
 
-  # Gradient checkpointing (trades compute for memory)
-  gradient_checkpointing: true
-  window_ca_use_checkpoint: true
+  # Gradient checkpointing
+  gradient_checkpointing: false
+  window_ca_use_checkpoint: false
 
-  # No guided attention for tiny version (keep it simple)
+  # No guided attention
   guidance_loss_weight: 0.0
   guidance_loss_weight_end: 0.0
   guidance_decay_steps: 0
@@ -104,15 +116,8 @@ model:
 # Data
 # =============================================================================
 data:
-  datasets:
-    - musesyn
-    - humsyn
-
-  vocabulary: "zeng_extended"
-
   audio:
     sample_rate: 16000
-    feature: "log_mel"
     n_mels: 128
     n_fft: 2048
     hop_length: 160             # 100 fps
@@ -120,58 +125,41 @@ data:
     f_max: 7040.0
 
   chunking:
-    enabled: true
     chunk_frames: 3000          # 30 seconds @ 100 fps
     overlap_frames: 1500        # 15 seconds overlap
     min_chunk_ratio: 0.5
-    fallback_chunk_frames: 1500  # 15s fallback
-    fallback_overlap_frames: 750 # 7.5s overlap
+    fallback_chunk_frames: 1500
+    fallback_overlap_frames: 750
 
   augmentation:
-    transpose:
-      enabled: true
     soundfonts:
       - "TimGM6mb.sf2"
       - "FluidR3_GM.sf2"
       - "UprightPianoKW-20220221.sf2"
       - "SalamanderGrandPiano-V3+20200602.sf2"
-    loudness_norm:
-      target_lufs: -15
 
 # =============================================================================
 # Training
 # =============================================================================
 training:
-  distributed:
-    enabled: true
-    backend: "nccl"
-    num_gpus: 2
-
-  precision: "bf16"
-  batch_size: 2              # Smaller sequence → larger batch
+  batch_size: 2
   gradient_accumulation_steps: 2
-  effective_batch_size: 8
-
-  learning_rate: 2.0e-4
-  weight_decay: 0.01
-  max_epochs: 100            # More epochs for smaller model
-  warmup_steps: 1000
   gradient_clip: 1.0
 
-  save_every_n_epochs: 10
-  save_best: true
-  save_last: true
-  early_stopping_patience: 10
+  learning_rate: 2.0e-4
+  weight_decay: 0.05
+  max_epochs: 50
+  warmup_steps: 1000
+  lr_flat_ratio: 0.6   # WSD: 60% of post-warmup = flat plateau, 40% = cosine decay
+  lr_min_ratio: 0.1
 
-  wandb:
-    enabled: true
-    project: "clef-piano-base"
-    tags: ["piano", "a2s", "tiny", "30s", "poc"]
+  save_every_n_epochs: 5
+  early_stopping_patience: 0
+  validate_every_n_steps: 500
 
 # =============================================================================
 # Paths
 # =============================================================================
 paths:
-  data_dir: "data/datasets"
-  output_dir: "data/experiments/clef_piano_tiny"
+  manifest_dir: "data/experiments/clef_piano_tiny"
   checkpoint_dir: "checkpoints/clef_piano_tiny"

@@ -649,8 +649,9 @@ class KernTokenizer:
                         self._current_key_sig = normalize_key_sig(field)
 
         result = ["<sos>"]
-        # Emit initial schema right after <sos>
-        result.extend(self._make_schema_tokens())
+        # No initial schema here: the leading <bar> (present in all chunks
+        # and full pieces) triggers schema injection via _make_schema_tokens(),
+        # so the first measure's schema always appears after the first <bar>.
 
         prev_was_data = False  # Was the previous emitted line a data line?
 
@@ -790,9 +791,14 @@ class KernTokenizer:
                     current_note = []
                 result.append(".")
             elif token in self._valid_durations:
-                if current_note:
+                # Only flush if current_note already contains a duration
+                # (i.e. a previous note is in progress). Pure prefix modifiers
+                # like "[" must stay attached to their following duration.
+                if current_note and any(c in self._valid_durations for c in current_note):
                     result.append("".join(current_note))
-                current_note = [token]
+                    current_note = [token]
+                else:
+                    current_note.append(token)
             elif token in self._valid_pitches:
                 current_note.append(token)
             elif token in ["[", "]", "(", ")", "{", "}", "q", "Q", "P", ";"]:

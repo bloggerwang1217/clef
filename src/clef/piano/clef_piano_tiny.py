@@ -2,14 +2,18 @@
 Clef Piano Tiny Model
 =====================
 
-Minimal PoC: Octopus + Flow + Swin S0 only + 2-layer decoder
+Minimal PoC: Octopus + Flow + BiMamba + 2-layer decoder
 
-Goal: Beat SOTA with minimal architecture on short clips (30s).
+Goal: Beat SOTA with minimal architecture following Zeng et al. 2024's design.
 This is a clean rewrite, importing modules from the main codebase.
 
-Architecture:
-- Encoder: Octopus2D → Flow → Swin S0 only (3 levels total)
-- Decoder: SA+Full CA (to S0) + Mamba → Output
+Architecture (Zeng-style):
+- Encoder: Octopus2D → Flow → BiMamba (3 levels total)
+  - Flow: 10ms resolution, clear piano roll (Top-1 = 44%)
+  - BiMamba: Time-oriented bidirectional Mamba (like Zeng's Bi-GRU)
+    - Linear projection for frequency integration (88 pitch → d_model)
+    - Temporal modeling on time axis (onset, sustain, release)
+- Decoder: SA+CA (to BiMamba) + Mamba → Output
 """
 
 from contextlib import nullcontext
@@ -21,16 +25,22 @@ import torch.nn.functional as F
 from transformers import Swinv2Model
 
 from .config import ClefPianoConfig
+from ..bimamba import BiMambaEncoder
 from ..bridge import MultiScaleBridge
 from ..decoder import ClefDecoder
 from ..flow import HarmonizingFlow, Octopus2D
 
 
 class ClefPianoTiny(nn.Module):
-    """Minimal Clef Piano model for 30-second audio clips.
+    """Minimal Clef Piano model for 30-second audio clips (Zeng-style).
 
-    Encoder: Octopus + Flow + Swin S0 only (3 levels)
-    Decoder: 2 layers (SA+Full CA + Mamba)
+    Encoder: Octopus + Flow + BiMamba (3 levels, following Zeng et al. 2024)
+    - Flow: 10ms resolution, clear piano roll representation
+    - BiMamba: Time-oriented Bi-Mamba (like Zeng's Bi-GRU)
+      - Linear projection: 88 pitch × 32 features → d_model (frequency integration)
+      - Bi-Mamba: Temporal modeling on time axis (forward + backward)
+
+    Decoder: 2 layers (SA+CA to BiMamba + Mamba)
 
     Target: ~1024 tokens max sequence length for 30s audio.
     """
@@ -39,21 +49,8 @@ class ClefPianoTiny(nn.Module):
         super().__init__()
         self.config = config
 
-        # === Encoder: Swin V2 (frozen) ===
-        self.swin = Swinv2Model.from_pretrained(
-            config.swin_model,
-            output_hidden_states=True,
-            dtype=torch.float32,
-            low_cpu_mem_usage=True,
-        )
-        if config.freeze_encoder:
-            self.swin.eval()
-            for p in self.swin.parameters():
-                p.requires_grad = False
-            # Selective unfreeze
-            swin_unfreeze = getattr(config, 'swin_unfreeze', [])
-            if swin_unfreeze:
-                self._unfreeze_swin_components(swin_unfreeze)
+        # === NO Swin in Zeng-style design ===
+        # BiMamba directly processes Flow output
 
         # === Octopus2D (onset detection) ===
         self.octopus = Octopus2D(
@@ -76,24 +73,34 @@ class ClefPianoTiny(nn.Module):
             init=getattr(config, 'flow_init', 'log'),
         )
 
+        # === BiMamba Encoder (time-oriented, Zeng-style) ===
+        self.use_bimamba = getattr(config, 'use_bimamba_encoder', True)  # Now default
+        if self.use_bimamba:
+            # Flow output: [B, T, 128] — 128 is total frequency features
+            # BiMamba: Linear(128 → d_model) + Bi-Mamba temporal modeling
+            self.bimamba_encoder = BiMambaEncoder(
+                input_dim=config.n_mels,  # 128 (Flow output dimension)
+                d_model=getattr(config, 'bimamba_d_model', config.d_model),
+                d_state=getattr(config, 'bimamba_d_state', 128),
+                d_conv=getattr(config, 'bimamba_d_conv', 4),
+                num_layers=getattr(config, 'bimamba_num_layers', 2),
+                dropout=getattr(config, 'bimamba_dropout', 0.1),
+            )
+
         # === Bridge: minimal (1 layer) ===
-        # Input dimensions for each level:
+        # Input dimensions for each level (Zeng-style, 3 levels):
         # Level 0: Octopus (32 channels)
         # Level 1: Flow (128 dims)
-        # Level 2: Swin S0 (192 dims - hidden_states[1] after first stage)
+        # Level 2: BiMamba (d_model, output from time-oriented Mamba)
         octopus_channels = getattr(config, 'octopus_channels', 32)
-        s0_dim = 192  # Swin V2 Tiny: embedding=96, S0=192, S1=384, S2=768, S3=768
-        input_dims = [octopus_channels, config.n_mels, s0_dim]
+        bimamba_d_model = getattr(config, 'bimamba_d_model', config.d_model)
+        input_dims = [octopus_channels, config.n_mels, bimamba_d_model]
 
         self.bridge = MultiScaleBridge(
             swin_dims=config.swin_dims,  # Keep original for compatibility
             d_model=config.d_model,
             n_heads=config.n_heads,
             n_levels=config.n_levels,  # 3: Octopus + Flow + S0
-            n_points_freq=config.n_points_freq,
-            n_points_time=config.n_points_time,
-            freq_offset_scale=config.freq_offset_scale,
-            time_offset_scale=config.time_offset_scale,
             ff_dim=config.ff_dim,
             dropout=config.dropout,
             n_layers=getattr(config, 'bridge_layers', 1),
@@ -132,7 +139,10 @@ class ClefPianoTiny(nn.Module):
             bar_gru_input_dropout=getattr(config, 'bar_gru_input_dropout', 0.1),
             note_gru_hidden_size=getattr(config, 'note_gru_hidden_size', 256),
             note_gru_input_dropout=getattr(config, 'note_gru_input_dropout', 0.1),
+            # Curriculum Learning for mamba_full_ca path
+            curriculum_warmup_steps=getattr(config, 'curriculum_warmup_steps', 0),
         )
+
 
         # === Token embedding ===
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
@@ -143,16 +153,6 @@ class ClefPianoTiny(nn.Module):
         # Gradient checkpointing (enabled via config)
         if getattr(config, 'gradient_checkpointing', False):
             self.decoder.gradient_checkpointing = True
-            if hasattr(self.swin, 'gradient_checkpointing_enable'):
-                self.swin.gradient_checkpointing_enable()
-
-    def _unfreeze_swin_components(self, components: list):
-        """Selectively unfreeze Swin components."""
-        for name, param in self.swin.named_parameters():
-            for comp in components:
-                if comp in name:
-                    param.requires_grad = True
-                    break
 
     def _pad_to_multiple(self, x: torch.Tensor, multiple: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """Pad frequency and time to multiple of `multiple`."""
@@ -231,38 +231,28 @@ class ClefPianoTiny(nn.Module):
         spatial_shapes_list.append((1, T_flow))
         valid_ratios_list.append([1.0, 1.0])
 
-        # === Step 3: Swin S0 only ===
-        swin_input = flow_with_onset.permute(0, 2, 1).unsqueeze(1)  # [B, 1, 128, T_flow]
-        swin_input, (orig_H_s, orig_W_s) = self._pad_to_multiple(swin_input, 32)
-        swin_input = swin_input.repeat(1, 3, 1, 1)  # [B, 3, 128, T_pad]
-        _, _, H_pad_s, T_pad_s = swin_input.shape
+        # === Step 3: BiMamba Encoder (Zeng-style, time-oriented) ===
+        # flow_with_onset: [B, T_flow, 128] — time-major, all frequencies visible
+        # This is exactly like Zeng's Bi-GRU input: (B, T, freq_features)
 
-        valid_ratio_h_s = orig_H_s / H_pad_s
-        valid_ratio_w_s = orig_W_s / T_pad_s
+        if self.use_bimamba:
+            # Apply time-oriented bidirectional Mamba (Zeng-style)
+            feat_bimamba = self.bimamba_encoder(flow_with_onset)
+            # feat_bimamba: [B, T_flow, d_model] — time-major output
 
-        # Run Swin
-        swin_fully_frozen = (self.config.freeze_encoder
-                             and not getattr(self.config, 'swin_unfreeze', []))
-        ctx = torch.no_grad() if swin_fully_frozen else nullcontext()
-        with ctx:
-            swin_out = self.swin(swin_input, output_hidden_states=True)
-
-        # Extract S0 only (hidden_states[1] = S0 output)
-        all_swin_shapes = self._compute_spatial_shapes(H_pad_s, T_pad_s)
-        feat_s0 = swin_out.hidden_states[1]  # [B, N_patches, C]
-        H_s0, W_s0 = all_swin_shapes[0]
-
-        features.append(feat_s0)
-        spatial_shapes_list.append((H_s0, W_s0))
-        valid_ratios_list.append([valid_ratio_w_s, valid_ratio_h_s])
+            # BiMamba output is [B, W, d_model], treat as spatial shape (1, W)
+            features.append(feat_bimamba)
+            spatial_shapes_list.append((1, T_flow))  # Time-only (1D sequence)
+            valid_ratios_list.append([1.0, 1.0])
 
         # === Bridge fusion ===
         # Convert valid ratios to tensor
+        n_levels_actual = len(features)  # 3 or 4 depending on use_bimamba
         level_valid_ratios = torch.tensor(
             valid_ratios_list,
             device=mel.device,
             dtype=torch.float32
-        ).unsqueeze(0).expand(B, -1, -1)  # [B, 3, 2]
+        ).unsqueeze(0).expand(B, -1, -1)  # [B, n_levels, 2]
 
         # Bridge will handle projection and concatenation
         memory, spatial_shapes, level_start_index, valid_ratios = self.bridge(
@@ -308,25 +298,53 @@ class ClefPianoTiny(nn.Module):
         tgt = self.token_embed(input_ids)  # [B, S] → [B, S, D]
 
         # Decode
+        # If scheduled sampling (tf_ratio < 1.0) is active during training, we need
+        # the model's own predictions (pred_embs) to substitute masked bar embeddings.
+        pred_embs = None
+        if self.training and tf_ratio < 1.0:
+            with torch.no_grad():
+                _decoder_out = self.decoder(
+                    tgt, memory, spatial_shapes, level_start_index, valid_ratios,
+                    input_ids=input_ids,
+                    tf_ratio=1.0,  # Pure TF for the first pass to get stable predictions
+                )
+                _logits = self.output_projection(_decoder_out)
+                # Greedy prediction → embedding
+                _preds = _logits.argmax(dim=-1)
+                pred_embs = self.token_embed(_preds)
+                # (Optional optimization: only compute pred_embs for <bar> positions if we care about speed,
+                # but computing for all is safer and mirrors standard scheduled sampling logic).
+
         decoder_out = self.decoder(
             tgt,
             memory,
             spatial_shapes,
             level_start_index,
             valid_ratios,
+            input_ids=input_ids,
+            tf_ratio=tf_ratio,
+            pred_embs=pred_embs,
         )
         logits = self.output_projection(decoder_out)
 
         # Compute loss if labels provided
         loss = None
         if labels is not None:
+            # ── Curriculum: mask labels for compressed bars ──────────────────
+            # decoder.forward sets _curriculum_mask=[B,S] True for zeroed positions.
+            # We set those label positions to 0 (ignore_index) so loss ignores them.
+            curriculum_mask = getattr(self.decoder, '_curriculum_mask', None)
+            if curriculum_mask is not None and curriculum_mask.any():
+                labels = labels.clone()
+                labels[curriculum_mask] = 0  # ignore_index in CrossEntropyLoss
+
             loss_fn = nn.CrossEntropyLoss(
                 ignore_index=0,  # <pad> token
                 label_smoothing=self.config.label_smoothing if hasattr(self.config, 'label_smoothing') else 0.0,
             )
             loss = loss_fn(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1)
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1)
             )
 
         return logits, loss, loss
@@ -366,14 +384,20 @@ class ClefPianoTiny(nn.Module):
         generated = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
 
         for _ in range(max_len - 1):
+            # Embed tokens
+            tgt = self.token_embed(generated)
+
             # Decode
             decoder_out = self.decoder(
-                generated,
+                tgt,
                 memory,
                 spatial_shapes,
                 level_start_index,
                 valid_ratios,
+                input_ids=generated,
             )
+            if isinstance(decoder_out, tuple):
+                decoder_out = decoder_out[0]
             logits = self.output_projection(decoder_out[:, -1:, :])  # [B, 1, vocab]
             next_token = logits.argmax(dim=-1)  # [B, 1]
 

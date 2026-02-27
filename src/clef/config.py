@@ -54,18 +54,6 @@ class ClefConfig:
     ff_dim: int = 2048
     dropout: float = 0.1
 
-    # Square sampling + Content-Dependent Prior
-    n_points_freq: int = 2         # Frequency direction: local detail
-    n_points_time: int = 2         # Time direction: local detail
-    freq_offset_scale: float = 0.15   # +/-15% (same as time for square)
-    time_offset_scale: float = 0.15   # +/-15% (same as freq for square)
-
-    # Content-Dependent Reference Points
-    use_time_prior: bool = True    # RoPE + Mamba learns content + position aware delta_t
-    use_freq_prior: bool = True    # freq_prior(tgt) -> freq region
-    n_freq_groups: int = 1         # Per-head freq_prior groups (1=shared, n_heads=fully independent)
-    refine_range: float = 0.1      # +/-10% refinement
-
     # Time prior: Two-stage Mamba (context + time)
     rope_base: float = 10000.0     # RoPE frequency base (same as SA layers)
     time_prior_d_state: int = 128  # Time Mamba state dimension (multi-scale timing)
@@ -77,7 +65,7 @@ class ClefConfig:
     # === Decoder ===
     decoder_layers: int = 6
     decoder_layer_types: List[str] = field(
-        default_factory=lambda: ['perceiver', 'full_ca', 'mamba_only', 'window_ca', 'mamba_only', 'window_ca', 'mamba_only']
+        default_factory=lambda: ['sa_window_ca', 'mamba_only', 'sa_window_ca', 'mamba_only', 'sa_window_ca', 'mamba_only']
     )
     decoder_layer_ca_levels: Optional[List] = None  # per-layer active CA levels, None=all
     mamba_d_state: int = 128
@@ -109,13 +97,14 @@ class ClefConfig:
         assert self.n_heads > 0, "n_heads must be positive"
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
         n_swin_used = len(self.swin_dims) - self.swin_start_stage
+        use_bimamba = getattr(self, 'use_bimamba_encoder', False)
         expected_levels = (n_swin_used
                           + (1 if self.use_flow else 0)
-                          + (1 if self.use_octopus else 0))
+                          + (1 if self.use_octopus else 0)
+                          + (1 if use_bimamba else 0))
         assert self.n_levels == expected_levels, (
             f"n_levels({self.n_levels}) must be "
             f"swin({n_swin_used}) + flow({1 if self.use_flow else 0}) "
-            f"+ octopus({1 if self.use_octopus else 0}) = {expected_levels}"
+            f"+ octopus({1 if self.use_octopus else 0}) "
+            f"+ bimamba({1 if use_bimamba else 0}) = {expected_levels}"
         )
-        assert self.n_points_freq > 0, "n_points_freq must be positive"
-        assert self.n_points_time > 0, "n_points_time must be positive"
