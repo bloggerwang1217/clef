@@ -60,6 +60,14 @@ class ClefPianoConfig(ClefConfig):
     # 0.0 = disabled; recommended range: 10.0 (soft) to 50.0 (strong).
     window_exp_decay_lambda: float = 0.0
 
+    # CIF (Continuous Integrate-and-Fire) — replaces BarMamba for tiny model.
+    # Enabled when use_cif=True. Provides per-token acoustic embeddings without CA.
+    use_cif: bool = False
+    cif_threshold: float = 1.0         # fire threshold (standard = 1.0)
+    cif_conv_kernel: int = 3           # depthwise conv kernel for weight predictor
+    cif_active_level: int = 2          # memory level index to extract encoder_1d (BiMamba)
+    cif_quantity_loss_weight: float = 0.0  # weight for |Σα - N_acoustic| loss
+
     # Gradient checkpointing (trades compute for memory)
     gradient_checkpointing: bool = False
     window_ca_use_checkpoint: bool = True  # checkpoint per seq-chunk inside WindowCrossAttention
@@ -209,6 +217,13 @@ class ClefPianoConfig(ClefConfig):
             window_time_frames=model_cfg.get("window_time_frames", defaults.window_time_frames),
             window_freq_bins=model_cfg.get("window_freq_bins", defaults.window_freq_bins),
             window_exp_decay_lambda=model_cfg.get("window_exp_decay_lambda", defaults.window_exp_decay_lambda),
+
+            # CIF
+            use_cif=model_cfg.get("use_cif", defaults.use_cif),
+            cif_threshold=model_cfg.get("cif_threshold", defaults.cif_threshold),
+            cif_conv_kernel=model_cfg.get("cif_conv_kernel", defaults.cif_conv_kernel),
+            cif_active_level=model_cfg.get("cif_active_level", defaults.cif_active_level),
+            cif_quantity_loss_weight=model_cfg.get("cif_quantity_loss_weight", defaults.cif_quantity_loss_weight),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),

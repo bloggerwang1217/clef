@@ -585,13 +585,16 @@ class Trainer:
                         'system/gpu_memory_gb': torch.cuda.max_memory_allocated(self.device) / 1024**3,
                     }
 
-                    # Guidance loss breakdown (last micro-batch)
+                    # Guidance/CIF loss breakdown (last micro-batch)
                     decoder = getattr(self.model.module if hasattr(self.model, 'module')
                                       else self.model, 'decoder', None)
                     guidance_loss_cached = getattr(decoder, '_cached_guidance_loss', None)
                     if guidance_loss_cached is not None:
                         log_dict['train/guidance_loss'] = guidance_loss_cached.item()
                         log_dict['train/guidance_weight'] = current_guidance_weight
+                    cif_qty_loss_cached = getattr(decoder, '_cif_quantity_loss', None)
+                    if cif_qty_loss_cached is not None:
+                        log_dict['train/cif_quantity_loss'] = cif_qty_loss_cached.item()
                     log_dict['train/tf_ratio'] = current_tf_ratio
 
                     if len(last_lrs) > 1:
@@ -962,6 +965,8 @@ def main():
                         help='Wandb project name')
     parser.add_argument('--wandb-entity', type=str, default=None,
                         help='Wandb entity (team/user); defaults to wandb default entity if not set')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='Wandb run name (defaults to train-{N}gpu)')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging')
     args = parser.parse_args()
@@ -1114,7 +1119,7 @@ def main():
             wandb.init(
                 entity=args.wandb_entity,
                 project=args.wandb_project,
-                name=f'train-{world_size}gpu',
+                name=args.wandb_run_name or f'train-{world_size}gpu',
                 config={
                     'batch_size': config.batch_size,
                     'world_size': world_size,

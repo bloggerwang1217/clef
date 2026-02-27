@@ -35,6 +35,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .attention import WindowCrossAttention
+from .cif import CIFModule, compute_acoustic_target_lengths
 
 
 def _carry_forward_h_bar(
@@ -417,10 +418,12 @@ class RotaryPositionalEmbedding(nn.Module):
 
 
 class MambaOnlyLayer(nn.Module):
-    """Mamba-only decoder layer: Mamba + FFN (no CA).
+    """Mamba-only decoder layer: pure Mamba block (no CA, no FFN).
 
     Used for sequential writing without audio re-injection.
-    Assumes audio context was already injected by earlier CA layer.
+    Assumes audio context was already injected by an earlier CIF/CA layer.
+    No FFN: Mamba's expand/project provides equivalent non-linearity internally
+    (same rationale as MambaFullCALayer and Zamba/RWKV-7 design conventions).
 
     Inherits nn.Module directly (not DecoderLayerBase) to avoid creating
     unused cross_attn, time_prior, freq_prior, reference_refine components
@@ -429,7 +432,7 @@ class MambaOnlyLayer(nn.Module):
 
     def __init__(self, d_model=512, ff_dim=2048, dropout=0.1,
                  d_state=128, d_conv=4, expand=2, **kwargs):
-        # kwargs absorbs unused base_kwargs (n_heads, n_levels, etc.)
+        # kwargs absorbs unused base_kwargs (n_heads, n_levels, ff_dim, etc.)
         super().__init__()
         from mamba_ssm import Mamba2
 
@@ -442,16 +445,6 @@ class MambaOnlyLayer(nn.Module):
         self._mamba_layer_idx_set = False
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
-
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ff_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, d_model),
-            nn.Dropout(dropout),
-        )
-        self.norm3 = nn.LayerNorm(d_model)
 
     def forward(
         self,
@@ -488,12 +481,6 @@ class MambaOnlyLayer(nn.Module):
         tgt2 = self.mamba(tgt, inference_params=inference_params)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-
-        # Skip CA
-
-        # FFN
-        tgt = tgt + self.ffn(tgt)
-        tgt = self.norm3(tgt)
 
         if use_cache:
             return tgt, (None, inference_params)
@@ -594,59 +581,69 @@ class MambaFullCALayer(nn.Module):
         # When curriculum zeroes tgt for compressed bars, tgt_query provides a
         # meaningful bar_embedding for those positions so CA Q is not degenerate.
         tgt_query: Optional[torch.Tensor] = kwargs.get('tgt_query', None)
+
+        # CIF bypass: if acoustic_emb_dense [B, S, D] is provided, skip full CA
+        # and use it directly as ca_out. This is the CIF sidechain path.
+        acoustic_emb_dense: Optional[torch.Tensor] = kwargs.get('acoustic_emb_dense', None)
+
         # ── Step 1: Mamba2  (≡ Zeng: GRU hidden state) ──────────────────────────
         # y encodes the full causal token history, just like GRU hidden.
         tgt_normed = self.norm1(tgt)
         mamba_out = self.mamba(tgt_normed, inference_params=mamba_state)
         y = tgt + self.dropout_mamba(mamba_out)   # y = history-aware state
 
-        # ── Step 2: Cross-Attention with Q = y  (≡ Zeng: Attn(hidden, encoder)) ────
-        # Q carries full history; K carries physical audio-frame time.
-        # When curriculum is active, tgt_query substitutes bar_embed for compressed bars,
-        # so Q is never a dead zero vector.
-        if tgt_query is not None:
-            y_for_q = tgt_query + self.dropout_mamba(self.mamba(self.norm1(tgt_query),
-                                                               inference_params=mamba_state))
-            y_normed = self.norm2(y_for_q)
+        # ── Step 2: Cross-Attention (or CIF bypass) ───────────────────────────────
+        if acoustic_emb_dense is not None:
+            # CIF path: use pre-computed per-token acoustic embedding as ca_out.
+            # Audio (acoustic_emb_dense) is the immutable base; full CA is skipped.
+            # Gradient flows: acoustic_emb_dense ← CIF ← encoder_1d ← BiMamba.
+            ca_out = self.dropout_ca(acoustic_emb_dense)
         else:
-            y_normed = self.norm2(y)
+            # Standard full-CA path (base model compatibility).
+            # Q carries full history; K carries physical audio-frame time.
+            # When curriculum is active, tgt_query substitutes bar_embed for compressed bars.
+            if tgt_query is not None:
+                y_for_q = tgt_query + self.dropout_mamba(self.mamba(self.norm1(tgt_query),
+                                                                   inference_params=mamba_state))
+                y_normed = self.norm2(y_for_q)
+            else:
+                y_normed = self.norm2(y)
 
-        memory_ca = []
-        time_norm_list = []
-        for lvl in self.active_ca_levels:
-            start = level_start_index[lvl].item()
-            end   = (level_start_index[lvl + 1].item()
-                     if lvl < spatial_shapes.shape[0] - 1
-                     else memory.shape[1])
-            memory_ca.append(memory[:, start:end])
-            H_l = int(spatial_shapes[lvl, 0].item())
-            W_l = int(spatial_shapes[lvl, 1].item())
-            w_norm = torch.arange(W_l, device=tgt.device, dtype=torch.float32) / max(W_l - 1, 1)
-            time_norm_list.append(w_norm.unsqueeze(0).expand(H_l, -1).reshape(-1))
+            memory_ca = []
+            time_norm_list = []
+            for lvl in self.active_ca_levels:
+                start = level_start_index[lvl].item()
+                end   = (level_start_index[lvl + 1].item()
+                         if lvl < spatial_shapes.shape[0] - 1
+                         else memory.shape[1])
+                memory_ca.append(memory[:, start:end])
+                H_l = int(spatial_shapes[lvl, 0].item())
+                W_l = int(spatial_shapes[lvl, 1].item())
+                w_norm = torch.arange(W_l, device=tgt.device, dtype=torch.float32) / max(W_l - 1, 1)
+                time_norm_list.append(w_norm.unsqueeze(0).expand(H_l, -1).reshape(-1))
 
-        memory_ca = torch.cat(memory_ca, dim=1)   # [B, N_kv, D]
-        time_norm  = torch.cat(time_norm_list)     # [N_kv]
-        N_kv = memory_ca.shape[1]
+            memory_ca = torch.cat(memory_ca, dim=1)   # [B, N_kv, D]
+            time_norm  = torch.cat(time_norm_list)     # [N_kv]
+            N_kv = memory_ca.shape[1]
 
-        q_ca = self.ca_q_proj(y_normed).reshape(B, S, self.n_heads, self.ca_head_dim).permute(0, 2, 1, 3).contiguous()
-        kv   = self.ca_kv_proj(memory_ca).reshape(B, N_kv, 2, self.n_heads, self.ca_head_dim)
-        k_ca = kv[:, :, 0].permute(0, 2, 1, 3).contiguous()
-        v_ca = kv[:, :, 1].permute(0, 2, 1, 3).contiguous()
+            q_ca = self.ca_q_proj(y_normed).reshape(B, S, self.n_heads, self.ca_head_dim).permute(0, 2, 1, 3).contiguous()
+            kv   = self.ca_kv_proj(memory_ca).reshape(B, N_kv, 2, self.n_heads, self.ca_head_dim)
+            k_ca = kv[:, :, 0].permute(0, 2, 1, 3).contiguous()
+            v_ca = kv[:, :, 1].permute(0, 2, 1, 3).contiguous()
 
+            # Sinusoidal PE on K: "I am audio frame at physical time τ"
+            time_pe   = self._sinusoidal_time_pe(time_norm)
+            time_pe_k = (time_pe.view(N_kv, self.n_heads, self.ca_head_dim)
+                                 .permute(1, 0, 2).unsqueeze(0).to(k_ca.dtype))
+            k_ca = k_ca + time_pe_k
 
-        # Sinusoidal PE on K: "I am audio frame at physical time τ"
-        time_pe   = self._sinusoidal_time_pe(time_norm)
-        time_pe_k = (time_pe.view(N_kv, self.n_heads, self.ca_head_dim)
-                             .permute(1, 0, 2).unsqueeze(0).to(k_ca.dtype))
-        k_ca = k_ca + time_pe_k
-
-        ca_sdpa = F.scaled_dot_product_attention(
-            q_ca, k_ca, v_ca,
-            dropout_p=self.ca_attn_dropout if self.training else 0.0,
-            is_causal=False,
-        )
-        ca_out = self.ca_out_proj(ca_sdpa.permute(0, 2, 1, 3).reshape(B, S, D))
-        ca_out = self.dropout_ca(ca_out)
+            ca_sdpa = F.scaled_dot_product_attention(
+                q_ca, k_ca, v_ca,
+                dropout_p=self.ca_attn_dropout if self.training else 0.0,
+                is_causal=False,
+            )
+            ca_out = self.ca_out_proj(ca_sdpa.permute(0, 2, 1, 3).reshape(B, S, D))
+            ca_out = self.dropout_ca(ca_out)
 
         # ── Step 3: Sidechain Compressor Fusion  (≡ Zeng: cat[gru_out, context]) ──
         # fused = ducked_y + ca_out
@@ -656,6 +653,89 @@ class MambaFullCALayer(nn.Module):
         compressor_gate = torch.sigmoid(self.compressor_temp * cosine_sim)
         ducked_y        = y_rendered * compressor_gate.unsqueeze(-1)
         fused           = ducked_y + ca_out   # Audio (ca_out) is the immutable base
+
+        if use_cache:
+            return fused, (None, mamba_state)
+        return fused
+
+
+class MambaCIFLayer(nn.Module):
+    """Mamba + CIF sidechain decoder layer.
+
+    Replaces MambaFullCALayer when CIF is active.
+    No CA weights — acoustic_emb_dense from CIF is used directly as ca_out,
+    saving the 1.31M parameters that would otherwise be dead weight.
+
+    Architecture:
+      1. Mamba2 Block  (compresses token history → y)
+      2. Sidechain Compressor Fusion: fused = ducked_y + acoustic_emb
+         (identical gate to MambaFullCALayer; audio is the immutable base)
+    """
+
+    def __init__(
+        self,
+        d_model: int = 512,
+        d_state: int = 128,
+        d_conv: int = 4,
+        expand: int = 2,
+        dropout: float = 0.1,
+        **kwargs,  # absorbs unused base_kwargs (n_heads, n_levels, ff_dim, etc.)
+    ):
+        super().__init__()
+        from mamba_ssm import Mamba2
+
+        # 1. Mamba2
+        self.norm1 = nn.LayerNorm(d_model)
+        self.mamba = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self._mamba_layer_idx_set = False
+        self.dropout_mamba = nn.Dropout(dropout)
+
+        # 2. Sidechain Compressor (same as MambaFullCALayer)
+        # render_proj: project y → same space as acoustic_emb for cosine gate
+        self.render_proj = nn.Linear(d_model, d_model)
+        self.compressor_temp = nn.Parameter(torch.tensor(2.659))
+        self.dropout_ca = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+        valid_ratios: torch.Tensor,
+        past_state=None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        B, S, D = tgt.shape
+        mamba_state = past_state[1] if past_state is not None else None
+
+        # CIF provides pre-aligned acoustic embedding [B, S, D]
+        acoustic_emb_dense = kwargs.get('acoustic_emb_dense', None)
+
+        # Step 1: Mamba (history → y)
+        tgt_normed = self.norm1(tgt)
+        mamba_out = self.mamba(tgt_normed, inference_params=mamba_state)
+        y = tgt + self.dropout_mamba(mamba_out)
+
+        # Step 2: Sidechain Compressor Fusion
+        # Audio (acoustic_emb) is the immutable base; token history gates itself.
+        if acoustic_emb_dense is not None:
+            ca_out = self.dropout_ca(acoustic_emb_dense)
+        else:
+            # Fallback for inference steps where CIF hasn't fired yet
+            ca_out = torch.zeros_like(y)
+
+        y_rendered = self.render_proj(y)
+        cosine_sim = F.cosine_similarity(y_rendered, ca_out, dim=-1)
+        compressor_gate = torch.sigmoid(self.compressor_temp * cosine_sim)
+        ducked_y = y_rendered * compressor_gate.unsqueeze(-1)
+        fused = ducked_y + ca_out  # Audio is the immutable base
 
         if use_cache:
             return fused, (None, mamba_state)
@@ -1334,6 +1414,11 @@ class ClefDecoder(nn.Module):
         curriculum_warmup_steps: int = 0,     # 0 = disabled; >0 = bar-progressive window expansion
         # Exponential decay soft mask for window CA (sa_window_ca and mamba_window_ca only)
         window_exp_decay_lambda: float = 0.0,
+        # CIF (Continuous Integrate-and-Fire) — replaces BarMamba for tiny model
+        use_cif: bool = False,            # if True, build CIFModule instead of BarMamba
+        cif_threshold: float = 1.0,       # CIF fire threshold
+        cif_conv_kernel: int = 3,         # depthwise conv kernel for weight predictor
+        cif_active_level: int = 2,        # memory level index to extract encoder_1d from
     ):
         super().__init__()
 
@@ -1357,17 +1442,27 @@ class ClefDecoder(nn.Module):
             rope_base=rope_base,
         )
 
-        # Build shared BarMamba if bar_token_id is present.
-        # Uses level 0 (highest temporal resolution) for DSNT.
+        # Build shared BarMamba or CIFModule depending on use_cif flag.
+        # CIF replaces BarMamba for the tiny model (mamba_full_ca path).
+        # Base model uses BarMamba (sa_window_ca path, bar_token_id still needed for window center).
+        self.cif = None
+        self.bar_mamba = None
         if bar_token_id is not None:
-            self.bar_mamba = BarMamba(
-                d_model=d_model,
-                n_heads=n_heads,
-                active_ca_level=2,   # BiMamba output level (same as MambaFullCALayer's active_ca_levels=[2])
-                n_levels=n_levels,
-            )
-        else:
-            self.bar_mamba = None
+            if use_cif:
+                self.cif = CIFModule(
+                    d_model=d_model,
+                    threshold=cif_threshold,
+                    conv_kernel=cif_conv_kernel,
+                )
+                # Store which memory level CIF should extract from (BiMamba output)
+                self._cif_active_level = cif_active_level
+            else:
+                self.bar_mamba = BarMamba(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    active_ca_level=2,   # BiMamba output level
+                    n_levels=n_levels,
+                )
 
         # The first window_ca layer gets bar_token_id assigned (legacy mapping)
         bar_ca_assigned = False
@@ -1379,6 +1474,14 @@ class ClefDecoder(nn.Module):
                 self.layers.append(MambaOnlyLayer(
                     d_state=d_state, d_conv=d_conv, expand=expand,
                     **base_kwargs,
+                ))
+            elif lt == 'mamba_cif':
+                self.layers.append(MambaCIFLayer(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    dropout=dropout,
                 ))
             elif lt == 'mamba_full_ca':
                 self.layers.append(MambaFullCALayer(
@@ -1489,7 +1592,7 @@ class ClefDecoder(nn.Module):
         # Assign layer_idx to Mamba layers (needed for InferenceParams state indexing)
         mamba_idx = 0
         for layer in self.layers:
-            if isinstance(layer, (MambaOnlyLayer, MambaFullCALayer, MambaWindowCALayer)):
+            if isinstance(layer, (MambaOnlyLayer, MambaCIFLayer, MambaFullCALayer, MambaWindowCALayer)):
                 layer.mamba.layer_idx = mamba_idx
                 mamba_idx += 1
 
@@ -1550,24 +1653,48 @@ class ClefDecoder(nn.Module):
             bar_mask = torch.zeros(B, S, dtype=torch.bool, device=output.device)
 
 
-        # ── BarMamba (Universal Bar-Level Temporal Localizer) ────────────────
-        # BarMamba computes com_t via DSNT attention on encoder memory at <bar> positions.
-        # We then forward-fill com_t to all notes within the bar so they share the same
-        # temporal center for Window Cross-Attention.
-        # BarMamba also returns summary_embed_dense: Stage 1 bar summary embed for each
-        # complete bar (bar_index < N_b), used as tgt_query for MambaFullCA.
+        # ── CIF or BarMamba temporal alignment ──────────────────────────────
         dense_com_t = None
         summary_embed_dense = None
-        # True if any layer type uses BarMamba's com_t (full CA or window CA)
-        has_bar_ca = any(isinstance(l, (MambaFullCALayer, MambaWindowCALayer)) for l in self.layers)
+        acoustic_embs_dense = None  # [B, S, D] for CIF path (MambaFullCALayer bypass)
+        self._cif_quantity_loss = None
 
-        if (hasattr(self, 'bar_mamba')
+        # True if any layer type uses BarMamba/CIF's output (full CA or window CA)
+        has_bar_ca = any(isinstance(l, (MambaCIFLayer, MambaFullCALayer, MambaWindowCALayer)) for l in self.layers)
+
+        if self.cif is not None and memory is not None:
+            # ── CIF path (tiny model) ─────────────────────────────────────────
+            # Extract encoder_1d from memory at the CIF active level.
+            lvl = self._cif_active_level
+            n_lvls = spatial_shapes.shape[0]
+            cif_start = level_start_index[lvl].item()
+            cif_end = (level_start_index[lvl + 1].item()
+                       if lvl < n_lvls - 1 else memory.shape[1])
+            encoder_1d = memory[:, cif_start:cif_end]  # [B, T_bimamba, D]
+
+            # Target = non-padding token count: one CIF firing per token position.
+            # Aligns with Dong & Xu 2020: S̃ = target sequence length (every non-pad
+            # token gets one acoustic embedding regardless of structural vs. acoustic).
+            target_lengths = None
+            if input_ids is not None:
+                target_lengths = (input_ids != 0).sum(dim=1).float()  # [B]
+
+            acoustic_embs, alpha, qty_loss = self.cif(
+                encoder_1d,
+                input_lengths=None,  # valid_ratios=1.0, no padding mask needed
+                target_lengths=target_lengths,
+            )
+            # [B, N_max, D] → align to [B, S, D] for teacher-forcing
+            acoustic_embs_dense = self.cif.align_to_seq_len(acoustic_embs, S)
+            self._cif_quantity_loss = qty_loss
+
+        elif (hasattr(self, 'bar_mamba')
                 and self.bar_mamba is not None
                 and memory is not None
                 and bar_mask is not None
                 and bar_mask.any()):
 
-            # 1. Compute sparse com_t [B, S, 1] and summary_embed_dense [B, S, D]
+            # ── BarMamba path (base model, original behavior) ─────────────────
             sparse_com_t, summary_embed_dense = self.bar_mamba(
                 y=tgt,
                 memory=memory,
@@ -1577,43 +1704,30 @@ class ClefDecoder(nn.Module):
                 input_ids=input_ids,
             )
 
-            # 2. Forward-fill com_t (step-and-hold) within each bar
-            B, S = bar_mask.shape
+            # Forward-fill com_t (step-and-hold) within each bar
             dense_com_t = sparse_com_t.clone()
             for b in range(B):
                 b_mask = bar_mask[b]
                 if b_mask.any():
-                    # indices of <bar> tokens
                     bar_idx = b_mask.nonzero(as_tuple=False).squeeze(1).tolist()
-                    bar_starts = bar_idx
                     bar_ends = bar_idx[1:] + [S]
-                    
-                    for start, end in zip(bar_starts, bar_ends):
-                        # The <bar> token's com_t
+                    for start, end in zip(bar_idx, bar_ends):
                         val = sparse_com_t[b, start, 0]
-                        # Fill subsequent non-bar tokens with this value
                         dense_com_t[b, start:end, 0] = val
 
-        # ── Build tgt_query ──────────────────────────────────────────────────
-        # bar_index_per_tok[b, s] = number of <bar> tokens seen up to and including s.
-        # Complete bars: bar_index < N_b (N_b = total <bar> count for this sample).
-        # Current bar:   bar_index == N_b (still being decoded → use raw sequential tgt).
+        # ── Build tgt_query (BarMamba path only) ─────────────────────────────
+        # CIF path: tgt_query is not used (MambaFullCALayer uses acoustic_emb_dense instead)
         bar_index_per_tok = bar_mask.long().cumsum(dim=1)  # [B, S]
 
         if summary_embed_dense is not None and bar_mask.any():
-            # For bars with a prior-bar summary (bar_index >= 2): CA query = summary embed.
-            # Bar 1 (bar_index == 1) has no preceding summary → raw tgt.
-            # Current bar (bar_index == N_b) still being decoded → raw tgt.
             tgt_query = tgt.clone()
             for b in range(B):
-                n_bars_b = int(bar_mask[b].float().sum().item())  # N_b
-                # summary_embed_dense is non-zero only at bar_index 2..N_b (bar 2 onwards).
-                # bar 1 notes get no summary replacement; current bar also stays raw.
+                n_bars_b = int(bar_mask[b].float().sum().item())
                 complete_mask = (bar_index_per_tok[b] >= 2) & (bar_index_per_tok[b] < n_bars_b)
                 if complete_mask.any():
                     tgt_query[b, complete_mask] = summary_embed_dense[b, complete_mask]
         else:
-            tgt_query = output  # fallback: Mamba decode path (original behavior)
+            tgt_query = output  # fallback
 
         # ── Curriculum: embedding masking (no sequence length change) ────────
         # Compressed bars → their token embeddings are zeroed out.
@@ -1697,8 +1811,10 @@ class ClefDecoder(nn.Module):
                     guidance_bounds=layer_guidance_bounds,
                     bar_mask=bar_mask,
                 )
-                if isinstance(layer, MambaFullCALayer):
+                if isinstance(layer, (MambaFullCALayer, MambaCIFLayer)):
                     layer_kwargs['tgt_query'] = tgt_query
+                    if acoustic_embs_dense is not None:
+                        layer_kwargs['acoustic_emb_dense'] = acoustic_embs_dense
                 output, new_state = layer(
                     output, memory,
                     spatial_shapes, level_start_index, valid_ratios,
@@ -1709,12 +1825,13 @@ class ClefDecoder(nn.Module):
                 _guidance = layer_guidance_bounds
                 _freq_in = layer_freq_center_in
                 _is_window = isinstance(layer, SAWindowCALayer)
-                _is_mamba_full_ca = isinstance(layer, MambaFullCALayer)
-                _tgt_query = tgt_query if _is_mamba_full_ca else None
-                def _layer_fn(out, mem, gb, time_in, freq_in, tq,
+                _is_cif_ca = isinstance(layer, (MambaFullCALayer, MambaCIFLayer))
+                _tgt_query = tgt_query if _is_cif_ca else None
+                _acoustic = acoustic_embs_dense if _is_cif_ca else None
+                def _layer_fn(out, mem, gb, time_in, freq_in, tq, acou,
                               _l=layer, _sp=spatial_shapes, _lsi=level_start_index,
                               _vr=valid_ratios, _tp=tgt_pos, _iw=_is_window,
-                              _bm=bar_mask, _imfc=_is_mamba_full_ca):
+                              _bm=bar_mask, _imfc=_is_cif_ca):
                     kwargs = dict(
                         tgt_pos=_tp,
                         time_center_in=time_in,
@@ -1724,9 +1841,12 @@ class ClefDecoder(nn.Module):
                     )
                     if _imfc:
                         kwargs['tgt_query'] = tq
+                        if acou is not None:
+                            kwargs['acoustic_emb_dense'] = acou
                     return _l(out, mem, _sp, _lsi, _vr, **kwargs)
                 output = grad_checkpoint(_layer_fn, output, memory,
-                                        _guidance, layer_window_center, _freq_in, _tgt_query,
+                                        _guidance, layer_window_center, _freq_in,
+                                        _tgt_query, _acoustic,
                                         use_reentrant=False)
             else:
                 layer_kwargs = dict(
@@ -1736,8 +1856,10 @@ class ClefDecoder(nn.Module):
                     guidance_bounds=layer_guidance_bounds,
                     bar_mask=bar_mask,
                 )
-                if isinstance(layer, MambaFullCALayer):
+                if isinstance(layer, (MambaFullCALayer, MambaCIFLayer)):
                     layer_kwargs['tgt_query'] = tgt_query
+                    if acoustic_embs_dense is not None:
+                        layer_kwargs['acoustic_emb_dense'] = acoustic_embs_dense
                 output = layer(
                     output, memory,
                     spatial_shapes, level_start_index, valid_ratios,

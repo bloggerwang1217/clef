@@ -132,15 +132,14 @@ class ClefPianoTiny(nn.Module):
             expand=config.mamba_expand,
             # Position encoding
             use_rope=True,
-            # Bar/Note GRU config
+            # bar_token_id: still needed for bar_mask derivation in decoder.forward()
             bar_token_id=getattr(config, 'bar_token_id', None),
             onset_1d_channels=getattr(config, 'octopus_channels', 32),
-            bar_gru_hidden_size=getattr(config, 'bar_gru_hidden_size', 256),
-            bar_gru_input_dropout=getattr(config, 'bar_gru_input_dropout', 0.1),
-            note_gru_hidden_size=getattr(config, 'note_gru_hidden_size', 256),
-            note_gru_input_dropout=getattr(config, 'note_gru_input_dropout', 0.1),
-            # Curriculum Learning for mamba_full_ca path
-            curriculum_warmup_steps=getattr(config, 'curriculum_warmup_steps', 0),
+            # CIF
+            use_cif=getattr(config, 'use_cif', False),
+            cif_threshold=getattr(config, 'cif_threshold', 1.0),
+            cif_conv_kernel=getattr(config, 'cif_conv_kernel', 3),
+            cif_active_level=getattr(config, 'cif_active_level', 2),
         )
 
 
@@ -347,7 +346,15 @@ class ClefPianoTiny(nn.Module):
                 labels.reshape(-1)
             )
 
-        return logits, loss, loss
+        # CIF quantity loss: drives Σα → N_acoustic
+        total_loss = loss
+        cif_qty_loss = getattr(self.decoder, '_cif_quantity_loss', None)
+        if cif_qty_loss is not None and loss is not None and self.training:
+            cif_weight = getattr(self.config, 'cif_quantity_loss_weight', 0.0)
+            if cif_weight > 0.0:
+                total_loss = loss + cif_weight * cif_qty_loss
+
+        return logits, loss, total_loss
 
     def get_num_params(self, trainable_only: bool = True) -> int:
         """Count model parameters."""

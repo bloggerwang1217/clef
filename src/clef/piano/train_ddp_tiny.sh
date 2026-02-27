@@ -31,6 +31,7 @@ NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
 MASTER_PORT="${MASTER_PORT:-29501}"
 RESUME="${RESUME:-}"
 WANDB="${WANDB:-false}"
+RUN_NAME="${RUN_NAME:-}"
 
 # =============================================================================
 # Print summary
@@ -70,6 +71,10 @@ fi
 
 if [ -n "$RESUME" ]; then
     CMD="$CMD --resume $RESUME"
+fi
+
+if [ -n "$RUN_NAME" ]; then
+    CMD="$CMD --wandb-run-name $RUN_NAME"
 fi
 
 echo "Running:"

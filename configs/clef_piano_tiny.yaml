@@ -32,7 +32,7 @@ model:
   bimamba_d_model: 512        # Match decoder d_model
   bimamba_d_state: 128
   bimamba_d_conv: 4
-  bimamba_num_layers: 2
+  bimamba_num_layers: 1
   bimamba_dropout: 0.1
 
   # Octopus2D (onset detection)
@@ -62,7 +62,7 @@ model:
   # Decoder: 2 layers (CA → Mamba)
   #   L0: mamba_full_ca — Mamba + Window CA to BiMamba (level 2, 1D temporal)
   #   L1: mamba_only    — sequential writing
-  decoder_layer_types: ["mamba_full_ca", "mamba_only"]
+  decoder_layer_types: ["mamba_cif", "mamba_only"]
   # decoder_layer_types: ["mamba_window_ca", "mamba_only"]  # window CA variant
   decoder_layer_ca_levels:
     - [2]       # L0: Full CA to BiMamba (level 2, temporal features)
@@ -74,9 +74,17 @@ model:
     - false
     - null
 
-  # BarMamba: bar-level module for mamba_full_ca path
-  bar_token_id: 4       # <bar> token ID in KernTokenizer vocab
+  # bar_token_id: <bar>=4 still needed for bar_mask detection (schema injection)
+  bar_token_id: 4
   curriculum_warmup_steps: 0  # Disabled
+
+  # CIF (Continuous Integrate-and-Fire) — replaces BarMamba
+  # Encoder frames → per-token acoustic embeddings, no CA needed in tiny model.
+  use_cif: true
+  cif_threshold: 1.0
+  cif_conv_kernel: 3
+  cif_active_level: 2         # BiMamba level in memory (level index 2)
+  cif_quantity_loss_weight: 0.1  # |Σα - N_acoustic|, converges within 1-2 epochs
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
   tf_anneal_steps: 100000
@@ -142,8 +150,8 @@ data:
 # Training
 # =============================================================================
 training:
-  batch_size: 2
-  gradient_accumulation_steps: 2
+  batch_size: 32
+  gradient_accumulation_steps: 1
   gradient_clip: 1.0
 
   learning_rate: 2.0e-4
