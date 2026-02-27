@@ -1419,6 +1419,8 @@ class ClefDecoder(nn.Module):
         cif_threshold: float = 1.0,       # CIF fire threshold
         cif_conv_kernel: int = 3,         # depthwise conv kernel for weight predictor
         cif_active_level: int = 2,        # memory level index to extract encoder_1d from
+        cif_max_seq_len: int = 2048,      # used for weight_proj bias init (N estimate)
+        cif_encoder_len: int = 3000,      # used for weight_proj bias init (T estimate = chunk_frames)
     ):
         super().__init__()
 
@@ -1453,6 +1455,8 @@ class ClefDecoder(nn.Module):
                     d_model=d_model,
                     threshold=cif_threshold,
                     conv_kernel=cif_conv_kernel,
+                    max_seq_len=cif_max_seq_len,
+                    encoder_len=cif_encoder_len,
                 )
                 # Store which memory level CIF should extract from (BiMamba output)
                 self._cif_active_level = cif_active_level

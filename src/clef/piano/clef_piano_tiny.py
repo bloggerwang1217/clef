@@ -140,6 +140,8 @@ class ClefPianoTiny(nn.Module):
             cif_threshold=getattr(config, 'cif_threshold', 1.0),
             cif_conv_kernel=getattr(config, 'cif_conv_kernel', 3),
             cif_active_level=getattr(config, 'cif_active_level', 2),
+            cif_max_seq_len=getattr(config, 'max_seq_len', 2048),
+            cif_encoder_len=getattr(config, 'chunk_frames', 3000),
         )
 
 

@@ -84,7 +84,7 @@ model:
   cif_threshold: 1.0
   cif_conv_kernel: 3
   cif_active_level: 2         # BiMamba level in memory (level index 2)
-  cif_quantity_loss_weight: 0.1  # |Σα - N_acoustic|, converges within 1-2 epochs
+  cif_quantity_loss_weight: 0.01   # |Σα - N_acoustic|, converges within 1-2 epochs
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
   tf_anneal_steps: 100000
@@ -157,17 +157,17 @@ training:
   learning_rate: 2.0e-4
   weight_decay: 0.05
   max_epochs: 50
-  warmup_steps: 1000
-  lr_flat_ratio: 0.6   # WSD: 60% of post-warmup = flat plateau, 40% = cosine decay
+  warmup_steps: 2500
+  lr_flat_ratio: 0.25  # WSD: 25% of post-warmup = flat plateau, 75% = cosine decay
   lr_min_ratio: 0.1
 
   save_every_n_epochs: 5
-  early_stopping_patience: 0
+  early_stopping_patience: 5
   validate_every_n_steps: 500
 
 # =============================================================================
 # Paths
 # =============================================================================
 paths:
-  manifest_dir: "data/experiments/clef_piano_tiny"
+  manifest_dir: "data/experiments/clef_piano_base"
   checkpoint_dir: "checkpoints/clef_piano_tiny"

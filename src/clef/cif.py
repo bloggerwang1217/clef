@@ -26,6 +26,7 @@ Sidechain compressor semantics:
     Tiny model: acoustic_emb replaces full CA entirely (no WindowCrossAttention needed).
 """
 
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -93,6 +94,8 @@ class CIFModule(nn.Module):
         d_model: int,
         threshold: float = 1.0,
         conv_kernel: int = 3,
+        max_seq_len: int = 2048,
+        encoder_len: int = 3000,
     ):
         super().__init__()
         self.d_model = d_model
@@ -109,11 +112,12 @@ class CIFModule(nn.Module):
         )
         self.weight_norm = nn.LayerNorm(d_model)
         self.weight_proj = nn.Linear(d_model, 1, bias=True)
-        # Initialize bias so α ≈ threshold / expected_encoder_frames_per_token.
-        # Typical: 30s audio at 100fps / 10ms pool_stride → T≈3000 frames, S≈50 tokens,
-        # so target α per frame ≈ 50/3000 ≈ 0.017, sigmoid(x)=0.017 → x≈-4.
-        # This keeps initial Σα ≈ target count and prevents quantity loss explosion.
-        nn.init.constant_(self.weight_proj.bias, -4.0)
+        # Initialize bias so Σα ≈ max_seq_len at the start (upper-bound estimate).
+        # α_init = max_seq_len / encoder_len  → bias = logit(α_init)
+        # Quantity loss then converges Σα to the actual token count within 1-2 epochs.
+        alpha_init = min(max_seq_len / encoder_len, 0.99)
+        bias_init = math.log(alpha_init / (1.0 - alpha_init))
+        nn.init.constant_(self.weight_proj.bias, bias_init)
 
     def forward(
         self,
@@ -180,86 +184,65 @@ class CIFModule(nn.Module):
         alpha: torch.Tensor,           # [B, T]
         threshold: float,
     ) -> torch.Tensor:
-        """Batched CIF algorithm (time loop, vectorized over batch).
+        """Vectorized CIF via cumsum + scatter_add (no Python time loop).
 
-        At each time step:
-          - Accumulate α_t * h_t into a running weighted sum.
-          - When accumulator ≥ threshold: fire → emit weighted sum as acoustic_emb[k];
-            carry the overflow (remainder_alpha * h_t) into the next integration period.
-          - Tail: fire if accumulator > threshold/2 after all frames.
+        Key insight: the CIF integration window for token k spans frames where
+        cumsum(α) crosses the k-th integer boundary. Two scatter_add ops handle
+        all cases in parallel across both batch and time dimensions.
 
-        The output tensor is built via index_put (differentiable scatter) so
-        gradients flow from acoustic_embs back through alpha and encoder_output.
+        For each frame t:
+          cum_prev = Σ_{i<t} α_i,  cum = Σ_{i≤t} α_i
+          k_lo = floor(cum_prev)           — primary token index
+          k_hi = floor(cum)                — upper index (= k_lo + 1 if boundary crossed)
+          w_lo = min(cum, k_lo+1) - cum_prev  — weight for k_lo
+          w_hi = max(cum - (k_lo+1), 0)       — weight for k_hi (= α_t - w_lo)
 
-        Returns: [B, N_max, D] where N_max is the maximum fire count across batch.
+        emb[k] = Σ_t w_t_k * h_t  (scatter_add over k_lo and k_hi)
+
+        Assumption: α_t < threshold for all t (guaranteed since α = sigmoid(·) < 1
+        and threshold = 1.0, so at most one boundary is crossed per frame).
+
+        Complexity: O(T) parallel ops, O(1) Python overhead.
+        Gradients flow through scatter_add into both alpha and encoder_output.
+
+        Returns: [B, N_max, D] where N_max is max fire count across batch.
         """
         B, T, D = encoder_output.shape
         device, dtype = encoder_output.device, encoder_output.dtype
 
-        # Pre-allocate output (worst case: one fire per frame)
-        output = torch.zeros(B, T, D, device=device, dtype=dtype)
+        # Cumulative sum of α: cum[b, t] = Σ_{i≤t} α[b,i]
+        cum = alpha.cumsum(dim=1)                                   # [B, T]
+        cum_prev = F.pad(cum[:, :-1], (1, 0), value=0.0)           # [B, T]  (shifted by 1)
 
-        # Running state (no gradient tracking needed for the integer counter)
-        accumulator = torch.zeros(B, device=device, dtype=dtype)
-        weighted_sum = torch.zeros(B, D, device=device, dtype=dtype)
-        fire_idx = torch.zeros(B, dtype=torch.long, device=device)
-        b_range = torch.arange(B, device=device)
+        # Token indices each frame contributes to
+        k_lo = cum_prev.floor().long()                              # [B, T]
+        k_hi = cum.floor().long()                                   # [B, T]
 
-        for t in range(T):
-            a_t = alpha[:, t]           # [B]
-            h_t = encoder_output[:, t]  # [B, D]
+        # Weights: w_lo + w_hi = α_t (always)
+        boundary = (k_lo.float() + 1.0)                            # [B, T]
+        w_lo = (torch.min(cum, boundary) - cum_prev).clamp(min=0)  # [B, T]
+        w_hi = (cum - boundary).clamp(min=0)                       # [B, T]
 
-            new_acc = accumulator + a_t  # [B]
-            fired = new_acc >= threshold  # [B] bool
+        # Maximum number of fires across batch
+        n_max = int(cum[:, -1].max().item()) + 1   # round up for safety
+        n_max = max(n_max, 1)
 
-            if fired.any():
-                # Portion of a_t that fills the current fire
-                rem = (threshold - accumulator).clamp(min=0.0)  # [B]
-                ovf = (a_t - rem).clamp(min=0.0)               # [B]
+        output = torch.zeros(B, n_max, D, device=device, dtype=dtype)
 
-                # Complete the current fire
-                emb = weighted_sum + rem.unsqueeze(-1) * h_t   # [B, D]
+        # Primary scatter: w_lo * h_t → token k_lo
+        k_lo_clamped = k_lo.clamp(0, n_max - 1)                    # [B, T]
+        idx_lo = k_lo_clamped.unsqueeze(-1).expand(-1, -1, D)      # [B, T, D]
+        output.scatter_add_(1, idx_lo, encoder_output * w_lo.unsqueeze(-1))
 
-                # Scatter into output (differentiable index_put)
-                active = b_range[fired & (fire_idx < T)]
-                if active.numel() > 0:
-                    positions = fire_idx[active]
-                    output = output.index_put(
-                        (active, positions),
-                        emb[active],
-                    )
-                    fire_idx = fire_idx.clone()
-                    fire_idx[active] = fire_idx[active] + 1
+        # Overflow scatter: w_hi * h_t → token k_hi (only when k_hi > k_lo)
+        k_hi_clamped = k_hi.clamp(0, n_max - 1)                    # [B, T]
+        idx_hi = k_hi_clamped.unsqueeze(-1).expand(-1, -1, D)      # [B, T, D]
+        output.scatter_add_(1, idx_hi, encoder_output * w_hi.unsqueeze(-1))
 
-                # Update running state
-                accumulator = torch.where(fired, ovf, new_acc)
-                weighted_sum = torch.where(
-                    fired.unsqueeze(-1),
-                    ovf.unsqueeze(-1) * h_t,
-                    weighted_sum + a_t.unsqueeze(-1) * h_t,
-                )
-            else:
-                accumulator = new_acc
-                weighted_sum = weighted_sum + a_t.unsqueeze(-1) * h_t
-
-        # Tail fire: remaining accumulator > threshold/2 → emit one more
-        tail = accumulator > (threshold / 2)
-        if tail.any():
-            active = b_range[tail & (fire_idx < T)]
-            if active.numel() > 0:
-                positions = fire_idx[active]
-                output = output.index_put(
-                    (active, positions),
-                    weighted_sum[active],
-                )
-                fire_idx = fire_idx.clone()
-                fire_idx[active] = fire_idx[active] + 1
-
-        # Trim to actual max fires (zero-pad positions beyond each item's count are safe)
-        n_max = int(fire_idx.max().item())
-        if n_max == 0:
-            n_max = 1  # avoid empty tensor
-        return output[:, :n_max]  # [B, n_max, D]
+        # Trim trailing zeros: actual N per item = floor(cum[:, -1])
+        actual_n = int(cum[:, -1].floor().max().item())
+        actual_n = max(actual_n, 1)
+        return output[:, :actual_n]  # [B, N, D]
 
     def compute_quantity_loss(
         self,
