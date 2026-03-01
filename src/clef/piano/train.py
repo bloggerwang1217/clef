@@ -597,6 +597,13 @@ class Trainer:
                     cif_qty_loss_cached = getattr(decoder, '_cif_quantity_loss', None)
                     if cif_qty_loss_cached is not None:
                         log_dict['train/cif_quantity_loss'] = cif_qty_loss_cached.item()
+                        # Also log sum_alpha and target for diagnosis
+                        cif_sum_alpha = getattr(decoder, '_cif_sum_alpha', None)
+                        cif_target = getattr(decoder, '_cif_target', None)
+                        if cif_sum_alpha is not None:
+                            log_dict['train/cif_sum_alpha'] = cif_sum_alpha
+                        if cif_target is not None:
+                            log_dict['train/cif_target'] = cif_target
                     log_dict['train/tf_ratio'] = current_tf_ratio
 
                     if len(last_lrs) > 1:

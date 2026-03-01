@@ -86,10 +86,11 @@ model:
   # CIF (Continuous Integrate-and-Fire) — replaces BarMamba
   # Decoupled design: fire_signal (BiMamba) + acoustic_src (Swin S0)
   use_cif: true
-  cif_threshold: 1.0
+  cif_threshold: 1.0          # Base threshold (overridden by dynamic if enabled)
+  cif_use_dynamic_threshold: true  # Paraformer dynamic threshold: β = Σα / ⌈Σα⌉ (reduces train/inference mismatch)
   cif_conv_kernel: 1          # No temporal smoothing (BiMamba @ 100fps, Swin @ 25fps)
-  cif_scale_factor: 4.0       # Scaled sigmoid: α = 4.0 * sigmoid(x), allows α > 1
-  cif_quantity_loss_weight: 0.5    # |Σα - N_acoustic|; was 0.01 (qty_loss=440 * 0.01=4.4, negligible vs CE)
+  cif_scale_factor: 1.0       # No scaling (α ∈ [0,1]): only fire at time-advance tokens (<sos>, <nl>), 1 onset = 1 token
+  cif_quantity_loss_weight: 1.0    # |Σα - N_acoustic|; balanced with CE (was 5.0, caused grad explosion)
   cif_avg_fires: 128               # avg <sos>+<nl> per 30s chunk (mean≈127, median≈115 from tokenizer stats)
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)

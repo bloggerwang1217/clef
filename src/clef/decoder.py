@@ -1420,11 +1420,12 @@ class ClefDecoder(nn.Module):
         cif_acoustic_dim: int = 192,             # Swin S0 output dim (pitch content)
         cif_acoustic_s1_dim: int = 384,          # Swin S1 output dim (beat content)
         cif_d_model: int = 512,                  # Final acoustic embedding dim (decoder d_model)
-        cif_threshold: float = 1.0,              # CIF fire threshold
+        cif_threshold: float = 1.0,              # CIF fire threshold (base, overridden by dynamic)
         cif_conv_kernel: int = 1,                # depthwise conv kernel for weight predictor
-        cif_max_seq_len: int = 2048,             # used for weight_proj bias init (N estimate)
-        cif_encoder_len: int = 3000,             # used for weight_proj bias init (T estimate)
+        cif_target_fires: int = 128,             # Target fire count (avg structural tokens per chunk)
+        cif_encoder_len: int = 3000,             # Encoder length (used for weight_proj bias init)
         cif_scale_factor: float = 4.0,           # Scaled sigmoid (allow α > 1)
+        cif_use_dynamic_threshold: bool = True,  # Paraformer dynamic threshold: β = Σα / ⌈Σα⌉
     ):
         super().__init__()
 
@@ -1462,9 +1463,10 @@ class ClefDecoder(nn.Module):
                     d_model=cif_d_model,                    # Final embedding dim
                     threshold=cif_threshold,
                     conv_kernel=cif_conv_kernel,
-                    max_seq_len=cif_max_seq_len,
+                    target_fires=cif_target_fires,
                     encoder_len=cif_encoder_len,
                     scale_factor=cif_scale_factor,
+                    use_dynamic_threshold=cif_use_dynamic_threshold,
                 )
             else:
                 self.bar_mamba = BarMamba(
@@ -1671,6 +1673,8 @@ class ClefDecoder(nn.Module):
         summary_embed_dense = None
         acoustic_embs_dense = None  # [B, S, D] for CIF path (MambaFullCALayer bypass)
         self._cif_quantity_loss = None
+        self._cif_sum_alpha = None
+        self._cif_target = None
 
         # True if any layer type uses BarMamba/CIF's output (full CA or window CA)
         has_bar_ca = any(isinstance(l, (MambaCIFLayer, MambaFullCALayer, MambaWindowCALayer)) for l in self.layers)
@@ -1684,10 +1688,10 @@ class ClefDecoder(nn.Module):
             if fire_signal is None or acoustic_src is None:
                 raise ValueError("CIF requires both fire_signal and acoustic_src")
 
-            # Target = non-padding token count
+            # Target = structural token count (<sos> + <nl>), not all tokens
             target_lengths = None
             if input_ids is not None:
-                target_lengths = (input_ids != 0).sum(dim=1).float()  # [B]
+                target_lengths = compute_acoustic_target_lengths(input_ids)  # [B]
 
             # CIF forward with decoupled sources
             acoustic_embs, alpha, qty_loss = self.cif(
@@ -1700,6 +1704,9 @@ class ClefDecoder(nn.Module):
             # [B, N_max, d_model] → scatter to [B, S, d_model] using bar/nl alignment
             acoustic_embs_dense = self.cif.align_to_seq_len(acoustic_embs, S, input_ids=input_ids)
             self._cif_quantity_loss = qty_loss
+            # Cache for logging
+            self._cif_sum_alpha = alpha.sum(dim=1).mean().item()  # mean across batch
+            self._cif_target = target_lengths.mean().item() if target_lengths is not None else None
 
         elif (hasattr(self, 'bar_mamba')
                 and self.bar_mamba is not None

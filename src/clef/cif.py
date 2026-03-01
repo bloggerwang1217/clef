@@ -129,11 +129,12 @@ class CIFModule(nn.Module):
         acoustic_dim: int = 192,         # Swin S0 output dim (pitch content, after downsample)
         beat_dim: int = 192,             # Swin S1 output dim (beat-aware, pre-downsample)
         d_model: int = 512,              # Final acoustic embedding dim (decoder expects)
-        threshold: float = 1.0,
+        threshold: float = 1.0,          # Base threshold (overridden by dynamic if enabled)
         conv_kernel: int = 1,
-        max_seq_len: int = 2048,
+        target_fires: int = 128,         # Target fire count (avg structural tokens per chunk)
         encoder_len: int = 3000,
         scale_factor: float = 4.0,       # Scaling factor for sigmoid (allow α > 1)
+        use_dynamic_threshold: bool = True,  # Paraformer dynamic threshold: β = Σα / ⌈Σα⌉
     ):
         super().__init__()
         self.fire_signal_dim = fire_signal_dim
@@ -142,6 +143,7 @@ class CIFModule(nn.Module):
         self.d_model = d_model
         self.threshold = threshold
         self.scale_factor = scale_factor
+        self.use_dynamic_threshold = use_dynamic_threshold
 
         padding = conv_kernel // 2
         # Depthwise conv on fire_signal: captures local temporal context for onset detection
@@ -156,11 +158,12 @@ class CIFModule(nn.Module):
         self.weight_proj = nn.Linear(fire_signal_dim, 1, bias=True)
 
         # Initialize bias with scaled sigmoid: α = scale_factor * sigmoid(x)
-        # Want Σα ≈ max_seq_len at start → sigmoid should output ~(max_seq_len / encoder_len) / scale_factor
-        alpha_init = max_seq_len / encoder_len  # e.g., 2048/3000 = 0.68
-        alpha_init_sigmoid = min(alpha_init / scale_factor, 0.99)  # 0.68/4 = 0.17
+        # Want Σα ≈ target_fires at start → sigmoid should output ~(target_fires / encoder_len) / scale_factor
+        alpha_init = target_fires / encoder_len  # e.g., 128/3000 = 0.043
+        alpha_init_sigmoid = min(alpha_init / scale_factor, 0.99)  # 0.043/4 = 0.011
         bias_init = math.log(alpha_init_sigmoid / (1.0 - alpha_init_sigmoid))
         nn.init.constant_(self.weight_proj.bias, bias_init)
+        nn.init.zeros_(self.weight_proj.weight)  # init Σα ≈ target_fires at start
 
         # === FiLM modulation (Perez et al. 2018): temporal (BiMamba) modulates each Swin stage ===
         # Separate generators per stage — each stage has different semantics (per FiLM paper convention).
@@ -239,27 +242,43 @@ class CIFModule(nn.Module):
         else:
             alpha_cif = alpha
 
+        # ── Step 2.5: Dynamic threshold (Paraformer) ─────────────────────────────
+        # β = Σα / ⌈Σα⌉ reduces training/inference mismatch without changing alpha.
+        if self.use_dynamic_threshold:
+            sum_alpha_cif = alpha_cif.sum(dim=1)  # [B]
+            # ⌈Σα⌉ per batch sample (detach to avoid gradient through ceil)
+            ceil_sum = torch.ceil(sum_alpha_cif).clamp(min=1.0).detach()
+            # β = Σα / ⌈Σα⌉ (gradient flows through sum_alpha_cif, not ceil_sum)
+            beta = (sum_alpha_cif / ceil_sum).unsqueeze(1)  # [B, 1]
+            threshold_cif = beta  # dynamic threshold per sample
+        else:
+            threshold_cif = torch.full((B, 1), self.threshold, device=device, dtype=dtype)
+
         # ── Step 3: CIF integration on fire_signal only ─────────────────────────
         # Only fire_signal goes through CIF integration — it determines fire positions.
         # S0 and S1 use post-fire lookup (no upsample needed, much more memory-efficient).
-        acoustic_temporal = self._cif_forward(fire_signal, alpha_cif, self.threshold)  # [B, N, D_bi]
+        # Note: _cif_forward expects scalar threshold, so we'll modify it to accept [B, 1]
+        acoustic_temporal = self._cif_forward(fire_signal, alpha_cif, threshold_cif)  # [B, N, D_bi]
         N = acoustic_temporal.shape[1]
 
         # ── Step 4: Post-fire lookup for S0 and S1 (differentiable bilinear) ──────
         # Compute continuous fire positions so gradients flow back to alpha.
         #
-        # Fire n happens where cum crosses threshold n+1.  Between the frame just
-        # before the crossing (t_lo = fire_frame - 1) and the crossing frame
-        # (t_hi = fire_frame), the cumsum is linear in alpha, so the exact
-        # fractional crossing time is:
+        # Fire n happens where cum crosses threshold*n.  With dynamic threshold β,
+        # fires occur at β, 2β, 3β, ... instead of 1, 2, 3, ...
+        # Between the frame just before the crossing (t_lo = fire_frame - 1) and
+        # the crossing frame (t_hi = fire_frame), the cumsum is linear in alpha,
+        # so the exact fractional crossing time is:
         #
-        #   t_cont = t_lo + (threshold - cum[t_lo]) / alpha[t_hi]
+        #   t_cont = t_lo + (threshold*n - cum[t_lo]) / alpha[t_hi]
         #
         # This is differentiable w.r.t. alpha through cum and alpha[t_hi],
         # allowing gradients from acoustic_pitch to reach weight_proj.
         cum = alpha_cif.cumsum(dim=1)                                    # [B, T_bi]
+        # thresholds = [β, 2β, 3β, ...] or [1, 2, 3, ...] depending on dynamic flag
         thresholds = (torch.arange(1, N + 1, device=device, dtype=dtype)
-                      .unsqueeze(0).expand(B, -1))                       # [B, N]
+                      .unsqueeze(0).expand(B, -1)                        # [B, N]
+                      * threshold_cif)                                   # broadcast [B, 1]
         fire_frames = torch.searchsorted(
             cum.contiguous(), thresholds.contiguous()
         ).clamp(max=T_bi - 1)                                            # [B, N] int
@@ -315,25 +334,30 @@ class CIFModule(nn.Module):
         self,
         encoder_output: torch.Tensor,  # [B, T, D]
         alpha: torch.Tensor,           # [B, T]
-        threshold: float,
+        threshold: torch.Tensor,       # [B, 1] dynamic threshold per sample
     ) -> torch.Tensor:
         """Vectorized CIF via cumsum + scatter_add (no Python time loop).
 
         Key insight: the CIF integration window for token k spans frames where
-        cumsum(α) crosses the k-th integer boundary. Two scatter_add ops handle
+        cumsum(α) crosses the k*threshold boundary. Two scatter_add ops handle
         all cases in parallel across both batch and time dimensions.
+
+        With dynamic threshold β = Σα / ⌈Σα⌉, boundaries are at β, 2β, 3β, ...
+        To reuse the floor-based logic, we normalize: cum_norm = cum / β,
+        then boundaries are at 1, 2, 3, ... as before.
 
         For each frame t:
           cum_prev = Σ_{i<t} α_i,  cum = Σ_{i≤t} α_i
-          k_lo = floor(cum_prev)           — primary token index
-          k_hi = floor(cum)                — upper index (= k_lo + 1 if boundary crossed)
-          w_lo = min(cum, k_lo+1) - cum_prev  — weight for k_lo
-          w_hi = max(cum - (k_lo+1), 0)       — weight for k_hi (= α_t - w_lo)
+          cum_norm = cum / β,  cum_prev_norm = cum_prev / β
+          k_lo = floor(cum_prev_norm)       — primary token index
+          k_hi = floor(cum_norm)            — upper index (= k_lo + 1 if boundary crossed)
+          w_lo = min(cum_norm, k_lo+1) - cum_prev_norm  — weight for k_lo
+          w_hi = max(cum_norm - (k_lo+1), 0)            — weight for k_hi
 
         emb[k] = Σ_t w_t_k * h_t  (scatter_add over k_lo and k_hi)
 
-        Assumption: α_t < threshold for all t (guaranteed since α = sigmoid(·) < 1
-        and threshold = 1.0, so at most one boundary is crossed per frame).
+        Assumption: α_t < threshold for all t (with dynamic threshold, β ≈ 1.0,
+        so at most one boundary is crossed per frame).
 
         Complexity: O(T) parallel ops, O(1) Python overhead.
         Gradients flow through scatter_add into both alpha and encoder_output.
@@ -347,17 +371,27 @@ class CIFModule(nn.Module):
         cum = alpha.cumsum(dim=1)                                   # [B, T]
         cum_prev = F.pad(cum[:, :-1], (1, 0), value=0.0)           # [B, T]  (shifted by 1)
 
-        # Token indices each frame contributes to
-        k_lo = cum_prev.floor().long()                              # [B, T]
-        k_hi = cum.floor().long()                                   # [B, T]
+        # Normalize by threshold: cum_norm = cum / β
+        # threshold: [B, 1] → broadcast to [B, T]
+        cum_norm = cum / threshold.clamp(min=1e-8)                  # [B, T]
+        cum_prev_norm = cum_prev / threshold.clamp(min=1e-8)        # [B, T]
 
-        # Weights: w_lo + w_hi = α_t (always)
-        boundary = (k_lo.float() + 1.0)                            # [B, T]
-        w_lo = (torch.min(cum, boundary) - cum_prev).clamp(min=0)  # [B, T]
-        w_hi = (cum - boundary).clamp(min=0)                       # [B, T]
+        # Token indices each frame contributes to (using normalized cumsum)
+        k_lo = cum_prev_norm.floor().long()                         # [B, T]
+        k_hi = cum_norm.floor().long()                              # [B, T]
 
-        # Maximum number of fires across batch
-        n_max = int(cum[:, -1].max().item()) + 1   # round up for safety
+        # Weights: w_lo + w_hi = α_t / β (normalized)
+        # But we want unnormalized weights for actual integration, so scale back
+        boundary_norm = (k_lo.float() + 1.0)                       # [B, T]
+        w_lo_norm = (torch.min(cum_norm, boundary_norm) - cum_prev_norm).clamp(min=0)  # [B, T]
+        w_hi_norm = (cum_norm - boundary_norm).clamp(min=0)                             # [B, T]
+
+        # Scale back to unnormalized weights (multiply by β)
+        w_lo = w_lo_norm * threshold                                # [B, T]
+        w_hi = w_hi_norm * threshold                                # [B, T]
+
+        # Maximum number of fires across batch (using normalized cumsum)
+        n_max = int(cum_norm[:, -1].max().item()) + 1   # round up for safety
         n_max = max(n_max, 1)
 
         output = torch.zeros(B, n_max, D, device=device, dtype=dtype)
@@ -372,8 +406,8 @@ class CIFModule(nn.Module):
         idx_hi = k_hi_clamped.unsqueeze(-1).expand(-1, -1, D)      # [B, T, D]
         output.scatter_add_(1, idx_hi, encoder_output * w_hi.unsqueeze(-1))
 
-        # Trim trailing zeros: actual N per item = floor(cum[:, -1])
-        actual_n = int(cum[:, -1].floor().max().item())
+        # Trim trailing zeros: actual N per item = floor(cum_norm[:, -1])
+        actual_n = int(cum_norm[:, -1].floor().max().item())
         actual_n = max(actual_n, 1)
         return output[:, :actual_n]  # [B, N, D]
 

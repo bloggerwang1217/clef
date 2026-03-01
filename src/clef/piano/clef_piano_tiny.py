@@ -155,9 +155,10 @@ class ClefPianoTiny(nn.Module):
             cif_d_model=config.d_model,         # decoder d_model
             cif_threshold=getattr(config, 'cif_threshold', 1.0),
             cif_conv_kernel=getattr(config, 'cif_conv_kernel', 1),
-            cif_max_seq_len=getattr(config, 'cif_avg_fires', 128),
+            cif_target_fires=getattr(config, 'cif_avg_fires', 128),
             cif_encoder_len=getattr(config, 'chunk_frames', 3000),
             cif_scale_factor=getattr(config, 'cif_scale_factor', 4.0),  # Scaled sigmoid
+            cif_use_dynamic_threshold=getattr(config, 'cif_use_dynamic_threshold', True),
         )
 
 
@@ -318,21 +319,6 @@ class ClefPianoTiny(nn.Module):
         # Embed tokens
         tgt = self.token_embed(input_ids)  # [B, S] → [B, S, D]
 
-        pred_embs = None
-        if self.training and tf_ratio < 1.0:
-            with torch.no_grad():
-                _decoder_out = self.decoder(
-                    tgt, memory, spatial_shapes, level_start_index, valid_ratios,
-                    input_ids=input_ids,
-                    tf_ratio=1.0,
-                    fire_signal=feat_bimamba,
-                    acoustic_src=feat_swin_s0,
-                    acoustic_src_s1=feat_swin_s1,
-                )
-                _logits = self.output_projection(_decoder_out)
-                _preds = _logits.argmax(dim=-1)
-                pred_embs = self.token_embed(_preds)
-
         decoder_out = self.decoder(
             tgt,
             memory,
@@ -340,8 +326,6 @@ class ClefPianoTiny(nn.Module):
             level_start_index,
             valid_ratios,
             input_ids=input_ids,
-            tf_ratio=tf_ratio,
-            pred_embs=pred_embs,
             fire_signal=feat_bimamba,
             acoustic_src=feat_swin_s0,
             acoustic_src_s1=feat_swin_s1,
