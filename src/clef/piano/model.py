@@ -52,7 +52,7 @@ class ClefPianoBase(nn.Module):
             torch_dtype=torch.float32,  # Explicit dtype, no auto device
             low_cpu_mem_usage=True,     # Prevent GPU probing during loading
         )
-        if config.freeze_encoder:
+        if config.freeze_swin:
             self.swin.eval()
             for p in self.swin.parameters():
                 p.requires_grad = False
@@ -274,7 +274,7 @@ class ClefPianoBase(nn.Module):
     def train(self, mode: bool = True):
         """Override to keep Swin in eval mode (disable DropPath)."""
         super().train(mode)
-        if hasattr(self, 'swin') and getattr(self.config, 'freeze_encoder', True):
+        if hasattr(self, 'swin') and getattr(self.config, 'freeze_swin', True):
             self.swin.eval()
         return self
 
@@ -422,7 +422,7 @@ class ClefPianoBase(nn.Module):
         valid_ratio_w_s = orig_W_s / T_pad_s
 
         # Step 4: Run frozen Swin on pitch-space image
-        swin_fully_frozen = (self.config.freeze_encoder
+        swin_fully_frozen = (self.config.freeze_swin
                              and not getattr(self.config, 'swin_unfreeze', []))
         ctx = torch.no_grad() if swin_fully_frozen else nullcontext()
         with ctx:

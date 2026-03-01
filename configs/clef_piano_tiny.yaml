@@ -22,18 +22,24 @@ model:
   # NO Swin in Zeng-style design — BiMamba directly processes Flow output
   swin_model: "microsoft/swinv2-tiny-patch4-window8-256"  # Keep for compatibility
   swin_dims: []  # No Swin stages used
-  freeze_encoder: true
+  freeze_swin: true
   swin_start_stage: 0
   swin_pool_strides: []
 
-  # BiMamba Encoder (time-oriented, Zeng 2024 style)
-  use_bimamba_encoder: true
-  bimamba_input_dim: 128      # Flow output dimension (n_mels)
-  bimamba_d_model: 512        # Match decoder d_model
+  # BiMamba Encoder (temporal timing for CIF, 128→128 no projection)
+  # Learns onset timing from Flow [B, 3000, 128] @ 100fps
+  # Output: fire_signal [B, 3000, 128] for CIF alpha prediction
   bimamba_d_state: 128
   bimamba_d_conv: 4
   bimamba_num_layers: 1
   bimamba_dropout: 0.1
+
+  # Swin S0 Encoder (acoustic content for CIF, independent path)
+  # Extracts pitch-selective features from Flow [B, 3000, 128]
+  # Output: acoustic_src [B, 375, 192] @ 12.5fps (8x downsample: patch_embed 4x + downsample 2x)
+  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"
+  swin_unfreeze: []  # Empty list = finetune ALL S0 (pretrained init)
+  swin_lr_scale: 0.1  # Learning rate multiplier for S0
 
   # Octopus2D (onset detection)
   use_octopus: true
@@ -49,29 +55,28 @@ model:
   flow_pool_stride: 1  # No pooling (10ms resolution)
 
   # Attention config
-  d_model: 512
+  d_model: 384
   n_heads: 8
-  n_levels: 3                  # Octopus (L0) + Flow (L1) + BiMamba (L2)
-  ff_dim: 2048
+  n_levels: 2                  # Octopus (L0) + Flow (L1); BiMamba/Swin S0 are CIF-internal
+  ff_dim: 1536                 # 4 * d_model
   dropout: 0.1
 
   rope_base: 10000.0
 
   bridge_layers: 1
 
-  # Decoder: 2 layers (CA → Mamba)
-  #   L0: mamba_full_ca — Mamba + Window CA to BiMamba (level 2, 1D temporal)
-  #   L1: mamba_only    — sequential writing
+  # Decoder: 2 layers (CIF → Mamba)
+  #   L0: mamba_cif  — Mamba + CIF acoustic embeddings (no CA, CIF provides embeddings)
+  #   L1: mamba_only — sequential writing
   decoder_layer_types: ["mamba_cif", "mamba_only"]
-  # decoder_layer_types: ["mamba_window_ca", "mamba_only"]  # window CA variant
   decoder_layer_ca_levels:
-    - [2]       # L0: Full CA to BiMamba (level 2, temporal features)
+    - null      # L0: CIF provides acoustic_embs (no CA needed)
     - null      # L1: Mamba only
   decoder_layer_full_freq:
-    - true      # L0: BiMamba level 2 is H=1 (1D), full_freq is the only option
+    - null
     - null
   decoder_layer_cascade_com:
-    - false
+    - null
     - null
 
   # bar_token_id: <bar>=4 still needed for bar_mask detection (schema injection)
@@ -79,12 +84,13 @@ model:
   curriculum_warmup_steps: 0  # Disabled
 
   # CIF (Continuous Integrate-and-Fire) — replaces BarMamba
-  # Encoder frames → per-token acoustic embeddings, no CA needed in tiny model.
+  # Decoupled design: fire_signal (BiMamba) + acoustic_src (Swin S0)
   use_cif: true
   cif_threshold: 1.0
-  cif_conv_kernel: 3
-  cif_active_level: 2         # BiMamba level in memory (level index 2)
-  cif_quantity_loss_weight: 0.01   # |Σα - N_acoustic|, converges within 1-2 epochs
+  cif_conv_kernel: 1          # No temporal smoothing (BiMamba @ 100fps, Swin @ 25fps)
+  cif_scale_factor: 4.0       # Scaled sigmoid: α = 4.0 * sigmoid(x), allows α > 1
+  cif_quantity_loss_weight: 0.5    # |Σα - N_acoustic|; was 0.01 (qty_loss=440 * 0.01=4.4, negligible vs CE)
+  cif_avg_fires: 128               # avg <sos>+<nl> per 30s chunk (mean≈127, median≈115 from tokenizer stats)
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
   tf_anneal_steps: 100000
@@ -112,7 +118,7 @@ model:
   label_smoothing: 0.0
 
   # Gradient checkpointing
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   window_ca_use_checkpoint: false
 
   # No guided attention

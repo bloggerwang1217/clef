@@ -136,9 +136,11 @@ class Trainer:
         # Model
         self.model = model.to(self.device)
         if world_size > 1:
+            use_gc = getattr(config, 'gradient_checkpointing', False)
             self.model = DDP(
                 self.model, device_ids=[local_rank],
-                find_unused_parameters=True,
+                find_unused_parameters=not use_gc,
+                static_graph=use_gc,
             )
 
         # Data loaders

@@ -42,47 +42,81 @@ import torch.nn.functional as F
 STRUCTURAL_IDS = frozenset({0, 1, 2, 3, 5, 7, 8, 9})
 
 
+# Token IDs that trigger a CIF pointer advance (time step boundaries).
+# <bar>=4 triggers advance on every occurrence EXCEPT the first one per sequence.
+# <nl>=6 always triggers advance.
+SOS_TOKEN_ID = 1
+NL_TOKEN_ID  = 6
+
+
 def compute_acoustic_target_lengths(
     input_ids: torch.Tensor,  # [B, S]
 ) -> torch.Tensor:
-    """Compute per-batch acoustic token count (for CIF quantity loss).
+    """Compute per-batch CIF fire count target.
 
-    Counts non-structural, non-padding tokens in input_ids.
-    STRUCTURAL_IDS are excluded; everything else counts as one acoustic target.
+    Target = count(<sos>) + count(<nl>) = 1 + n_nl.
+    - <sos>: fires once, opening emb[0] as a neutral sentinel slot.
+    - <nl>: fires once per time step, advancing to the next emb.
+    - Everything else (<bar>, schema, notes, <coc>...): no fire.
 
     Returns: [B] float tensor of target fire counts.
     """
+    sos_counts = (input_ids == SOS_TOKEN_ID).sum(dim=1).float()
+    nl_counts  = (input_ids == NL_TOKEN_ID).sum(dim=1).float()
+    return sos_counts + nl_counts
+
+
+def build_cif_alignment(
+    input_ids: torch.Tensor,  # [B, S]
+) -> torch.Tensor:
+    """Build per-token CIF embedding index (scatter alignment).
+
+    Rules:
+      - ptr starts at 0.
+      - <sos>: assigned emb[0] THEN ptr advances to 1.
+      - <nl>: assigned emb[ptr] THEN ptr advances.
+      - All other tokens (<bar>, schema, notes, <coc>...): no advance.
+
+    emb[0]   = <sos> only (neutral sentinel; CIF learns a "before music" fire).
+    emb[1..N] = musical time steps (<bar> + schema + notes share one emb per step).
+
+    Returns: alignment [B, S] int64 — alignment[b, i] = emb index for token i.
+    """
     B, S = input_ids.shape
-    device = input_ids.device
-    # Build structural mask on device
-    max_id = int(input_ids.max().item()) + 1
-    is_structural = torch.zeros(max_id, dtype=torch.bool, device=device)
-    for sid in STRUCTURAL_IDS:
-        if sid < max_id:
-            is_structural[sid] = True
-    # Clamp for safety
-    ids_clamped = input_ids.clamp(0, max_id - 1)
-    acoustic_mask = ~is_structural[ids_clamped]  # [B, S]
-    return acoustic_mask.sum(dim=1).float()  # [B]
+    alignment = torch.zeros(B, S, dtype=torch.long, device=input_ids.device)
+    for b in range(B):
+        ptr = 0
+        for i in range(S):
+            alignment[b, i] = ptr
+            tid = input_ids[b, i].item()
+            if tid == SOS_TOKEN_ID or tid == NL_TOKEN_ID:
+                ptr += 1
+    return alignment
 
 
 class CIFModule(nn.Module):
     """Continuous Integrate-and-Fire: encoder frames → per-token acoustic embeddings.
 
-    Replaces BarMamba in the tiny model decoder. Provides one acoustic embedding
-    per output token via a soft-alignment learned from a scalar weight α_t per frame.
+    Decoupled dual-channel design with FiLM modulation:
+      - fire_signal (BiMamba @ 100fps): predicts α timing + provides temporal/duration features
+      - acoustic_src (Swin S0 @ 12.5fps): provides pitch/harmonic features (upsampled 8x)
+      - FiLM: temporal features modulate pitch features (γ * pitch + β)
+      - Both paths projected to d_model and summed
 
     Architecture:
-        1. Weight predictor:
-               x = encoder_1d.permute(0,2,1)         # [B, D, T]
-               x = DepthwiseConv1d(x)               # local temporal context
-               x = x.permute(0,2,1)                  # [B, T, D]
-               x = LayerNorm(x)
-               α  = sigmoid(Linear(x, 1)).squeeze()  # [B, T] ∈ (0, 1)
-        2. CIF integration (batched time loop):
-               Fire when cumulative α ≥ threshold=1.0.
-               Each fire produces one acoustic embedding ≈ weighted sum of frames.
-        3. Quantity loss: |Σα - N_acoustic| drives α to sum to the token count.
+        1. Weight predictor (from fire_signal):
+               α = scale_factor * sigmoid(Linear(LayerNorm(DepthwiseConv1d(fire_signal))))
+        2. Dual-channel CIF integration:
+               acoustic_temporal = CIF(fire_signal, α)  # [B, N, 128] duration/timing
+               acoustic_pitch = CIF(acoustic_src↑8x, α)  # [B, N, 192] pitch/harmonic
+        3. FiLM modulation:
+               γ, β = Linear(acoustic_temporal) → chunk(2)  # 128 → 384 (192*2)
+               acoustic_pitch_mod = γ * acoustic_pitch + β  # [B, N, 192]
+        4. Project and combine:
+               temporal_proj = Linear_128→512(acoustic_temporal)
+               pitch_proj = Linear_192→512(acoustic_pitch_mod)
+               out = temporal_proj + pitch_proj  # [B, N, 512]
+        5. Quantity loss: |Σα - N_acoustic| drives α to sum to the token count.
 
     forward() returns (acoustic_embs, alpha, quantity_loss).
     align_to_seq_len() pads/truncates acoustic_embs from [B, N, D] to [B, S, D]
@@ -91,67 +125,103 @@ class CIFModule(nn.Module):
 
     def __init__(
         self,
-        d_model: int,
+        fire_signal_dim: int = 128,     # BiMamba output dim (temporal timing)
+        acoustic_dim: int = 192,         # Swin S0 output dim (pitch content, after downsample)
+        beat_dim: int = 192,             # Swin S1 output dim (beat-aware, pre-downsample)
+        d_model: int = 512,              # Final acoustic embedding dim (decoder expects)
         threshold: float = 1.0,
-        conv_kernel: int = 3,
+        conv_kernel: int = 1,
         max_seq_len: int = 2048,
         encoder_len: int = 3000,
+        scale_factor: float = 4.0,       # Scaling factor for sigmoid (allow α > 1)
     ):
         super().__init__()
+        self.fire_signal_dim = fire_signal_dim
+        self.acoustic_dim = acoustic_dim
+        self.beat_dim = beat_dim
         self.d_model = d_model
         self.threshold = threshold
+        self.scale_factor = scale_factor
 
         padding = conv_kernel // 2
-        # Depthwise conv: captures local temporal context, no cross-channel mixing
+        # Depthwise conv on fire_signal: captures local temporal context for onset detection
         self.conv = nn.Conv1d(
-            d_model, d_model,
+            fire_signal_dim, fire_signal_dim,
             kernel_size=conv_kernel,
             padding=padding,
-            groups=d_model,
+            groups=fire_signal_dim,
             bias=False,
         )
-        self.weight_norm = nn.LayerNorm(d_model)
-        self.weight_proj = nn.Linear(d_model, 1, bias=True)
-        # Initialize bias so Σα ≈ max_seq_len at the start (upper-bound estimate).
-        # α_init = max_seq_len / encoder_len  → bias = logit(α_init)
-        # Quantity loss then converges Σα to the actual token count within 1-2 epochs.
-        alpha_init = min(max_seq_len / encoder_len, 0.99)
-        bias_init = math.log(alpha_init / (1.0 - alpha_init))
+        self.weight_norm = nn.LayerNorm(fire_signal_dim)
+        self.weight_proj = nn.Linear(fire_signal_dim, 1, bias=True)
+
+        # Initialize bias with scaled sigmoid: α = scale_factor * sigmoid(x)
+        # Want Σα ≈ max_seq_len at start → sigmoid should output ~(max_seq_len / encoder_len) / scale_factor
+        alpha_init = max_seq_len / encoder_len  # e.g., 2048/3000 = 0.68
+        alpha_init_sigmoid = min(alpha_init / scale_factor, 0.99)  # 0.68/4 = 0.17
+        bias_init = math.log(alpha_init_sigmoid / (1.0 - alpha_init_sigmoid))
         nn.init.constant_(self.weight_proj.bias, bias_init)
+
+        # === FiLM modulation (Perez et al. 2018): temporal (BiMamba) modulates each Swin stage ===
+        # Separate generators per stage — each stage has different semantics (per FiLM paper convention).
+
+        # S0 FiLM: temporal [B,N,128] → γ_s0, β_s0 [B,N,192] each
+        self.film_s0_generator = nn.Linear(fire_signal_dim, acoustic_dim * 2)  # 128 → 384
+
+        # S1 FiLM: temporal [B,N,128] → γ_s1, β_s1 [B,N,384] each
+        self.film_s1_generator = nn.Linear(fire_signal_dim, beat_dim * 2)       # 128 → 384
+
+        # Triple-channel projections to d_model
+        self.temporal_proj = nn.Linear(fire_signal_dim, d_model)  # 128 → d_model (timing)
+        self.acoustic_proj  = nn.Linear(acoustic_dim, d_model)    # 192 → d_model (pitch)
+        self.beat_proj      = nn.Linear(beat_dim, d_model)        # 192 → d_model (beat)
 
     def forward(
         self,
-        encoder_1d: torch.Tensor,                       # [B, T, D]
-        input_lengths: Optional[torch.Tensor] = None,   # [B] valid frame counts
-        target_lengths: Optional[torch.Tensor] = None,  # [B] acoustic token counts
+        fire_signal: torch.Tensor,                           # [B, T_bi, D_bi] BiMamba output (timing)
+        acoustic_src: torch.Tensor,                          # [B, T_sw, D_sw] Swin S0 output (pitch)
+        acoustic_src_s1: Optional[torch.Tensor] = None,     # [B, T_s1, D_s1] Swin S1 output (beat)
+        input_lengths: Optional[torch.Tensor] = None,        # [B] valid frame counts
+        target_lengths: Optional[torch.Tensor] = None,       # [B] acoustic token counts
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute CIF acoustic embeddings and quantity loss.
 
+        Triple-channel design with per-stage FiLM modulation (Perez et al. 2018):
+          - fire_signal (BiMamba, 100fps): predicts α + provides temporal embeddings
+          - acoustic_src (Swin S0, 12.5fps): pitch/harmonic features (upsample 8x)
+          - acoustic_src_s1 (Swin S1, 6.25fps): beat/rhythm features (upsample 16x, optional)
+          - Temporal modulates S0 via film_s0_generator (separate γ, β for each stage)
+          - Temporal modulates S1 via film_s1_generator (separate γ, β for each stage)
+
         Args:
-            encoder_1d: BiMamba output [B, T, D].
+            fire_signal: BiMamba output [B, T_bi, D_bi] for α prediction (100fps).
+            acoustic_src: Swin S0 output [B, T_sw, D_sw] for pitch content (12.5fps).
+            acoustic_src_s1: Swin S1 output [B, T_s1, D_s1] for beat content (6.25fps). Optional.
             input_lengths: Valid frame count per batch item (for padding mask).
-                           If None, all frames are considered valid.
             target_lengths: Target acoustic token count per item (for quantity loss).
-                            Typically computed via compute_acoustic_target_lengths().
 
         Returns:
-            acoustic_embs: [B, N_max, D] — one embedding per CIF fire.
-            alpha: [B, T] — frame weight sequence (Σα ≈ N_acoustic).
+            acoustic_embs: [B, N_max, d_model] — one embedding per CIF fire.
+            alpha: [B, T_bi] — frame weight sequence (Σα ≈ N_acoustic).
             quantity_loss: scalar — mean |Σα - N_target| over batch.
         """
-        B, T, D = encoder_1d.shape
-        device, dtype = encoder_1d.device, encoder_1d.dtype
+        B, T_bi, D_bi = fire_signal.shape
+        B_sw, T_sw, D_sw = acoustic_src.shape
+        device, dtype = fire_signal.device, fire_signal.dtype
 
-        # Weight predictor
-        x = encoder_1d.permute(0, 2, 1)   # [B, D, T]
-        x = self.conv(x)                   # [B, D, T] depthwise local context
-        x = x.permute(0, 2, 1)            # [B, T, D]
+        assert B == B_sw, f"Batch size mismatch: fire_signal={B}, acoustic_src={B_sw}"
+
+        # ── Step 1: Predict α from fire_signal (BiMamba) ──────────────────────
+        x = fire_signal.permute(0, 2, 1)   # [B, D_bi, T_bi]
+        x = self.conv(x)                   # [B, D_bi, T_bi] depthwise local context
+        x = x.permute(0, 2, 1)             # [B, T_bi, D_bi]
         x = self.weight_norm(x)
-        alpha = torch.sigmoid(self.weight_proj(x)).squeeze(-1)  # [B, T]
+        # Scaled sigmoid: α ∈ (0, scale_factor)
+        alpha = self.scale_factor * torch.sigmoid(self.weight_proj(x)).squeeze(-1)  # [B, T_bi]
 
         # Mask padding frames to zero weight
         if input_lengths is not None:
-            pad_mask = torch.arange(T, device=device).unsqueeze(0) >= input_lengths.unsqueeze(1)
+            pad_mask = torch.arange(T_bi, device=device).unsqueeze(0) >= input_lengths.unsqueeze(1)
             alpha = alpha.masked_fill(pad_mask, 0.0)
 
         # Quantity loss on raw α (before scaling) — supervises the raw prediction
@@ -160,21 +230,84 @@ class CIFModule(nn.Module):
         if target_lengths is not None:
             qty_loss = self.compute_quantity_loss(alpha, target_lengths.to(dtype))
 
-        # Scaling strategy (Dong & Xu 2020, Section 3.2):
+        # ── Step 2: Scaling strategy ────────────────────────────────────────────
         #   Training: scale α' = α * (target / Σα) so CIF fires exactly target times.
-        #             Every token position gets a valid acoustic embedding (no zero pad).
         #   Inference: use raw α; CIF fires round(Σα) times.
-        #             Quantity loss ensures Σα ≈ target after training converges,
-        #             keeping the training/inference gap small.
         if self.training and target_lengths is not None:
             sum_alpha = alpha.sum(dim=1, keepdim=True).clamp(min=1e-8)  # [B, 1]
             alpha_cif = alpha * (target_lengths.unsqueeze(1).to(dtype) / sum_alpha)
         else:
             alpha_cif = alpha
 
-        # CIF integration
-        acoustic_embs = self._cif_forward(encoder_1d, alpha_cif, self.threshold)
-        # [B, N_max, D]  (N_max ≈ target in training, ≈ round(Σα) in inference)
+        # ── Step 3: CIF integration on fire_signal only ─────────────────────────
+        # Only fire_signal goes through CIF integration — it determines fire positions.
+        # S0 and S1 use post-fire lookup (no upsample needed, much more memory-efficient).
+        acoustic_temporal = self._cif_forward(fire_signal, alpha_cif, self.threshold)  # [B, N, D_bi]
+        N = acoustic_temporal.shape[1]
+
+        # ── Step 4: Post-fire lookup for S0 and S1 (differentiable bilinear) ──────
+        # Compute continuous fire positions so gradients flow back to alpha.
+        #
+        # Fire n happens where cum crosses threshold n+1.  Between the frame just
+        # before the crossing (t_lo = fire_frame - 1) and the crossing frame
+        # (t_hi = fire_frame), the cumsum is linear in alpha, so the exact
+        # fractional crossing time is:
+        #
+        #   t_cont = t_lo + (threshold - cum[t_lo]) / alpha[t_hi]
+        #
+        # This is differentiable w.r.t. alpha through cum and alpha[t_hi],
+        # allowing gradients from acoustic_pitch to reach weight_proj.
+        cum = alpha_cif.cumsum(dim=1)                                    # [B, T_bi]
+        thresholds = (torch.arange(1, N + 1, device=device, dtype=dtype)
+                      .unsqueeze(0).expand(B, -1))                       # [B, N]
+        fire_frames = torch.searchsorted(
+            cum.contiguous(), thresholds.contiguous()
+        ).clamp(max=T_bi - 1)                                            # [B, N] int
+
+        # Continuous fire position (differentiable)
+        t_lo = (fire_frames - 1).clamp(min=0)                           # [B, N] int
+        cum_at_tlo = cum.gather(1, t_lo)                                 # [B, N]
+        alpha_at_thi = alpha_cif.gather(1, fire_frames)                  # [B, N]
+        t_continuous = (t_lo.float()
+                        + (thresholds - cum_at_tlo) / alpha_at_thi.clamp(min=1e-8))
+        t_continuous = t_continuous.clamp(0, T_bi - 1)                  # [B, N] float
+
+        # S0 bilinear lookup
+        T_sw = acoustic_src.shape[1]
+        D_sw = acoustic_src.shape[2]
+        t_s0 = t_continuous.mul(T_sw).div(T_bi)                         # [B, N] float, stays in tensor domain
+        t_s0_lo = t_s0.long().clamp(0, T_sw - 2)                        # [B, N] int
+        t_s0_hi = t_s0_lo + 1                                           # [B, N] int
+        w_s0 = (t_s0 - t_s0_lo.float()).unsqueeze(-1)                   # [B, N, 1]
+        pitch_lo = acoustic_src.gather(1, t_s0_lo.unsqueeze(-1).expand(B, N, D_sw))
+        pitch_hi = acoustic_src.gather(1, t_s0_hi.unsqueeze(-1).expand(B, N, D_sw))
+        acoustic_pitch = (1 - w_s0) * pitch_lo + w_s0 * pitch_hi       # [B, N, D_sw]
+
+        # ── Step 5: Per-stage FiLM modulation (Perez et al. 2018) ───────────────
+        # S0 FiLM: temporal → γ_s0, β_s0 → modulates pitch features
+        gamma_s0, beta_s0 = self.film_s0_generator(acoustic_temporal).chunk(2, dim=-1)
+        acoustic_pitch_mod = gamma_s0 * acoustic_pitch + beta_s0        # [B, N, D_sw]
+
+        # ── Step 6: Project and combine ─────────────────────────────────────────
+        temporal_proj = self.temporal_proj(acoustic_temporal)            # [B, N, d_model]
+        pitch_proj    = self.acoustic_proj(acoustic_pitch_mod)           # [B, N, d_model]
+        acoustic_embs = temporal_proj + pitch_proj                       # [B, N, d_model]
+
+        # ── Step 7: S1 FiLM (optional, bilinear) ────────────────────────────────
+        if acoustic_src_s1 is not None:
+            T_s1 = acoustic_src_s1.shape[1]
+            D_s1 = acoustic_src_s1.shape[2]
+            t_s1 = t_continuous.mul(T_s1).div(T_bi)                     # [B, N] float, stays in tensor domain
+            t_s1_lo = t_s1.long().clamp(0, T_s1 - 2)
+            t_s1_hi = t_s1_lo + 1
+            w_s1 = (t_s1 - t_s1_lo.float()).unsqueeze(-1)               # [B, N, 1]
+            beat_lo = acoustic_src_s1.gather(1, t_s1_lo.unsqueeze(-1).expand(B, N, D_s1))
+            beat_hi = acoustic_src_s1.gather(1, t_s1_hi.unsqueeze(-1).expand(B, N, D_s1))
+            acoustic_beat = (1 - w_s1) * beat_lo + w_s1 * beat_hi      # [B, N, D_s1]
+            # S1 FiLM: separate γ, β from S0 (different stage, different semantics)
+            gamma_s1, beta_s1 = self.film_s1_generator(acoustic_temporal).chunk(2, dim=-1)
+            acoustic_beat_mod = gamma_s1 * acoustic_beat + beta_s1      # [B, N, D_s1]
+            acoustic_embs = acoustic_embs + self.beat_proj(acoustic_beat_mod)  # [B, N, d_model]
 
         return acoustic_embs, alpha, qty_loss
 
@@ -261,21 +394,33 @@ class CIFModule(nn.Module):
         self,
         acoustic_embs: torch.Tensor,  # [B, N, D]
         seq_len: int,
+        input_ids: Optional[torch.Tensor] = None,  # [B, S] for scatter alignment
     ) -> torch.Tensor:
-        """Pad or truncate acoustic_embs [B, N, D] → [B, seq_len, D].
+        """Scatter acoustic_embs [B, N, D] → [B, seq_len, D] using CIF alignment.
 
-        In early training, N ≠ seq_len until quantity loss converges.
-          N < seq_len: pad with zeros (no acoustic signal for those positions)
-          N > seq_len: truncate (discard extra firings)
+        If input_ids is provided, uses build_cif_alignment() to assign each
+        token position the correct emb index (Option B: fire-at-start-of-next-step).
+
+        If N is too small (quantity loss not yet converged), clamps index to N-1
+        so later time steps gracefully reuse the last fire rather than crashing.
+
+        If input_ids is None, falls back to naive pad/truncate (backward compat).
         """
         B, N, D = acoustic_embs.shape
-        if N == seq_len:
-            return acoustic_embs
-        if N < seq_len:
-            pad = torch.zeros(
-                B, seq_len - N, D,
-                device=acoustic_embs.device,
-                dtype=acoustic_embs.dtype,
-            )
-            return torch.cat([acoustic_embs, pad], dim=1)
-        return acoustic_embs[:, :seq_len]
+
+        if input_ids is None:
+            # Fallback: naive pad/truncate (no structural awareness)
+            if N == seq_len:
+                return acoustic_embs
+            if N < seq_len:
+                pad = torch.zeros(B, seq_len - N, D,
+                                  device=acoustic_embs.device,
+                                  dtype=acoustic_embs.dtype)
+                return torch.cat([acoustic_embs, pad], dim=1)
+            return acoustic_embs[:, :seq_len]
+
+        # Scatter: each position gets the emb at its CIF pointer index
+        alignment = build_cif_alignment(input_ids)          # [B, S]
+        alignment = alignment.clamp(max=N - 1)              # guard if N < target
+        idx = alignment.unsqueeze(-1).expand(B, seq_len, D) # [B, S, D]
+        return acoustic_embs.gather(1, idx)                 # [B, S, D]

@@ -67,6 +67,7 @@ class ClefPianoConfig(ClefConfig):
     cif_conv_kernel: int = 3           # depthwise conv kernel for weight predictor
     cif_active_level: int = 2          # memory level index to extract encoder_1d (BiMamba)
     cif_quantity_loss_weight: float = 0.0  # weight for |Σα - N_acoustic| loss
+    cif_scale_factor: float = 1.0      # scaled sigmoid: α = scale_factor * sigmoid(x)
 
     # Gradient checkpointing (trades compute for memory)
     gradient_checkpointing: bool = False
@@ -86,12 +87,18 @@ class ClefPianoConfig(ClefConfig):
 
     # BiMamba Encoder (per-pitch-track temporal modeling, Zeng 2024 inspired)
     use_bimamba_encoder: bool = False
-    bimamba_input_dim: int = 192        # S0 output channels (Swin V2 Tiny)
+    bimamba_input_dim: int = 192        # S0 output channels (Swin V2 Tiny) or Flow output (128)
     bimamba_d_model: int = 512          # Match decoder d_model
     bimamba_d_state: int = 128
     bimamba_d_conv: int = 4
     bimamba_num_layers: int = 2
     bimamba_dropout: float = 0.1
+    # Optional: Use Swin S0 before BiMamba (frozen non-linear feature extractor)
+    # Replaces simple Linear(128→512) with Swin S0 (frozen) + adapters (trainable)
+    bimamba_use_swin: bool = False
+    bimamba_swin_model: str = "microsoft/swinv2-tiny-patch4-window8-256"
+    bimamba_swin_unfreeze: List[str] = None  # e.g., ["patch_embed", "downsample"]
+    bimamba_swin_lr_scale: float = 0.1
 
     # Training hyperparameters (read from YAML; single source of truth)
     learning_rate: float = 1e-4
@@ -140,7 +147,7 @@ class ClefPianoConfig(ClefConfig):
             # Swin
             swin_model=model_cfg.get("swin_model", defaults.swin_model),
             swin_dims=model_cfg.get("swin_dims", defaults.swin_dims),
-            freeze_encoder=model_cfg.get("freeze_encoder", defaults.freeze_encoder),
+            freeze_swin=model_cfg.get("freeze_swin", defaults.freeze_swin),
             swin_unfreeze=model_cfg.get("swin_unfreeze", defaults.swin_unfreeze),
             swin_lr_scale=model_cfg.get("swin_lr_scale", defaults.swin_lr_scale),
 
@@ -180,6 +187,10 @@ class ClefPianoConfig(ClefConfig):
             bimamba_d_conv=model_cfg.get("bimamba_d_conv", defaults.bimamba_d_conv),
             bimamba_num_layers=model_cfg.get("bimamba_num_layers", defaults.bimamba_num_layers),
             bimamba_dropout=model_cfg.get("bimamba_dropout", defaults.bimamba_dropout),
+            bimamba_use_swin=model_cfg.get("bimamba_use_swin", defaults.bimamba_use_swin),
+            bimamba_swin_model=model_cfg.get("bimamba_swin_model", defaults.bimamba_swin_model),
+            bimamba_swin_unfreeze=model_cfg.get("bimamba_swin_unfreeze", defaults.bimamba_swin_unfreeze),
+            bimamba_swin_lr_scale=model_cfg.get("bimamba_swin_lr_scale", defaults.bimamba_swin_lr_scale),
 
             # Bar attention
             bar_token_id=model_cfg.get("bar_token_id", defaults.bar_token_id),
@@ -224,6 +235,7 @@ class ClefPianoConfig(ClefConfig):
             cif_conv_kernel=model_cfg.get("cif_conv_kernel", defaults.cif_conv_kernel),
             cif_active_level=model_cfg.get("cif_active_level", defaults.cif_active_level),
             cif_quantity_loss_weight=model_cfg.get("cif_quantity_loss_weight", defaults.cif_quantity_loss_weight),
+            cif_scale_factor=model_cfg.get("cif_scale_factor", defaults.cif_scale_factor),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),

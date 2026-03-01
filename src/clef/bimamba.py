@@ -25,6 +25,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class BiMambaEncoder(nn.Module):
@@ -46,22 +47,19 @@ class BiMambaEncoder(nn.Module):
 
     def __init__(
         self,
-        input_dim: int,
-        d_model: int,
+        d_model: int = 128,  # Input and output dimension (Flow feature dim)
         d_state: int = 128,
         d_conv: int = 4,
-        num_layers: int = 2,
+        num_layers: int = 1,
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.input_dim = input_dim
         self.d_model = d_model
         self.num_layers = num_layers
 
-        # Frequency integration (like Zeng's Linear layer)
-        # Input: C (all frequency bins concatenated)
-        # Output: d_model (compact temporal features)
-        self.freq_proj = nn.Linear(input_dim, d_model)
+        # No projection needed: BiMamba learns temporal state space directly on Flow features
+        # Input: [B, T, 128] Flow features
+        # Output: [B, T, 128] temporally-enriched features
 
         # Bi-Mamba layers (temporal modeling)
         self.layers = nn.ModuleList([
@@ -78,19 +76,15 @@ class BiMambaEncoder(nn.Module):
         """Forward pass with time-oriented Bi-Mamba.
 
         Args:
-            x: [B, W, C] time-major input (like Zeng's Bi-GRU input)
+            x: [B, T, 128] Flow features (time-major)
 
         Returns:
-            [B, W, d_model] temporally encoded features
+            [B, T, 128] temporally-enriched features (fire signal for CIF)
         """
-        # Frequency integration (like Zeng's Linear projection)
-        x = self.freq_proj(x)
-        # [B, W, d_model] — frequencies integrated into compact features
-
         # Apply Bi-Mamba layers (temporal modeling)
+        # No projection needed: learn temporal state space directly on Flow features
         for layer in self.layers:
-            x = layer(x)
-        # [B, W, d_model]
+            x = layer(x)  # [B, T, 128]
 
         return x
 
@@ -178,7 +172,7 @@ class BiMambaLayer(nn.Module):
 
 def test_bimamba_encoder():
     """Test BiMambaEncoder with dummy data."""
-    print("Testing BiMambaEncoder (Zeng-style)...")
+    print("Testing BiMambaEncoder (simplified, 128→128)...")
 
     # Check CUDA availability
     if not torch.cuda.is_available():
@@ -189,28 +183,27 @@ def test_bimamba_encoder():
     device = torch.device("cuda")
 
     # Config
-    B, W, C = 2, 375, 128  # Flow output: time steps, 128 features (mel or pitch)
-    d_model = 512
+    B, T, D = 2, 3000, 128  # Flow output: 3000 time steps, 128 features
+    d_model = 128  # No projection: input_dim == d_model
 
     # Create encoder
     encoder = BiMambaEncoder(
-        input_dim=C,
         d_model=d_model,
         d_state=128,
         d_conv=4,
-        num_layers=2,
+        num_layers=1,
         dropout=0.1,
     ).to(device)
 
     # Test input (Flow output)
-    x = torch.randn(B, W, C, device=device)
-    print(f"Input (Flow): {x.shape} — (B, W, C)")
+    x = torch.randn(B, T, D, device=device)
+    print(f"Input (Flow): {x.shape} — (B, T, D)")
 
     # Forward
     output = encoder(x)
-    print(f"Output: {output.shape} — (B, W, d_model)")
+    print(f"Output: {output.shape} — (B, T, D) [fire signal for CIF]")
 
-    assert output.shape == (B, W, d_model), f"Expected (B={B}, W={W}, d_model={d_model}), got {output.shape}"
+    assert output.shape == (B, T, D), f"Expected (B={B}, T={T}, D={D}), got {output.shape}"
 
     print("✓ BiMambaEncoder test passed!")
 

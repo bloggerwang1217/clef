@@ -21,7 +21,7 @@ class ClefConfig:
     # === Swin V2 Encoder ===
     swin_model: str = "microsoft/swinv2-tiny-patch4-window8-256"
     swin_dims: List[int] = field(default_factory=lambda: [96, 192, 384, 768])
-    freeze_encoder: bool = True
+    freeze_swin: bool = True
     # Selective unfreeze: fine-tune specific Swin components while keeping attention frozen
     # Valid components: "patch_embed", "position_bias", "downsample"
     swin_unfreeze: List[str] = field(default_factory=list)
@@ -39,6 +39,7 @@ class ClefConfig:
     octopus_time_kernel: int = 3       # Time span (onset transient: 10-30ms)
     octopus_channels: int = 32         # Number of onset pattern detectors
     octopus_time_pool_stride: int = 2  # Temporal pool for Level 0 (T -> T/2, 20ms)
+    octopus_freq_pool_stride: int = 4  # Frequency pooling (128 → 32 bins)
 
     # === Swin Stage Selection ===
     swin_start_stage: int = 0  # Skip Swin stages before this index (0=use all, 1=skip S0)

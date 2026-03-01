@@ -97,15 +97,28 @@ class ChunkedDataset(Dataset):
         return Path(__file__).resolve().parent / f'chunk_list_unknown_{self.chunk_frames}.txt'
 
     def _load_or_create_chunks(self) -> List[Tuple[int, int, int]]:
-        """Load chunks from txt if it exists, otherwise build and save it."""
-        txt_path = self._chunk_list_path()
-        if txt_path.exists():
-            chunks = self._read_chunk_list_txt(txt_path)
-            logger.info(f"ChunkedDataset: loaded {len(chunks)} chunks from {txt_path.name}")
-            return chunks
+        """Load chunks from txt if it exists, otherwise build and save it.
 
-        chunks = self._create_chunks()
-        self._write_chunk_list_txt(chunks, txt_path)
+        In DDP training, only rank 0 builds the list; all other ranks wait at a
+        barrier before loading, preventing concurrent writes that corrupt the file.
+        """
+        import os
+        rank = int(os.environ.get('RANK', 0))
+        txt_path = self._chunk_list_path()
+
+        # Rank 0 is responsible for building if the file is missing.
+        if rank == 0 and not txt_path.exists():
+            chunks = self._create_chunks()
+            self._write_chunk_list_txt(chunks, txt_path)
+
+        # All DDP ranks synchronize here so non-zero ranks wait for rank 0 to finish.
+        if int(os.environ.get('WORLD_SIZE', 1)) > 1:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.barrier()
+
+        chunks = self._read_chunk_list_txt(txt_path)
+        logger.info(f"ChunkedDataset: loaded {len(chunks)} chunks from {txt_path.name}")
         return chunks
 
     def _write_chunk_list_txt(self, chunks: List[Tuple[int, int, int]], txt_path: Path):
@@ -514,14 +527,29 @@ class ManifestDataset(Dataset):
         return self.manifest_path.parent / p
 
     def get_mel_length(self, idx: int) -> int:
-        """Get mel length in frames without loading."""
+        """Get effective mel length in frames without loading.
+
+        Caps at the last audio_measure end so that synthesizer reverb tail
+        frames (which have no corresponding score tokens) are excluded from
+        chunk generation.  A 5-second buffer is added to avoid cutting off
+        the final note's natural decay.
+        """
         item = self.manifest[idx]
-        # Support both 'duration_frames' and 'n_frames'
         if 'n_frames' in item:
-            return item['n_frames']
-        if 'duration_frames' in item:
-            return item['duration_frames']
-        # Fallback: load and check
-        mel_path = self._resolve_path(item['mel_path'], self.mel_dir)
-        mel = torch.load(mel_path, weights_only=True)
-        return mel.shape[-1]
+            n_frames = item['n_frames']
+        elif 'duration_frames' in item:
+            n_frames = item['duration_frames']
+        else:
+            mel_path = self._resolve_path(item['mel_path'], self.mel_dir)
+            mel = torch.load(mel_path, weights_only=True)
+            n_frames = mel.shape[-1]
+
+        # Cap at last audio_measure end + buffer to exclude reverb tail
+        item_id = item.get('id', Path(item['mel_path']).stem)
+        aug_info = self.aug_meta.get(item_id, {})
+        audio_measures = aug_info.get('audio_measures') or []
+        if audio_measures:
+            last_end_frames = int(audio_measures[-1]['end_sec'] * 100) + 500  # +5s buffer
+            n_frames = min(n_frames, last_end_frames)
+
+        return n_frames

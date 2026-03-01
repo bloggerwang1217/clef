@@ -73,39 +73,51 @@ class ClefPianoTiny(nn.Module):
             init=getattr(config, 'flow_init', 'log'),
         )
 
-        # === BiMamba Encoder (time-oriented, Zeng-style) ===
-        self.use_bimamba = getattr(config, 'use_bimamba_encoder', True)  # Now default
-        if self.use_bimamba:
-            # Flow output: [B, T, 128] — 128 is total frequency features
-            # BiMamba: Linear(128 → d_model) + Bi-Mamba temporal modeling
-            self.bimamba_encoder = BiMambaEncoder(
-                input_dim=config.n_mels,  # 128 (Flow output dimension)
-                d_model=getattr(config, 'bimamba_d_model', config.d_model),
-                d_state=getattr(config, 'bimamba_d_state', 128),
-                d_conv=getattr(config, 'bimamba_d_conv', 4),
-                num_layers=getattr(config, 'bimamba_num_layers', 2),
-                dropout=getattr(config, 'bimamba_dropout', 0.1),
-            )
+        # === BiMamba Encoder (temporal timing for CIF) ===
+        # Learns onset timing from Flow features [B, 3000, 128] @ 100fps
+        # Output: fire_signal [B, 3000, 128] for CIF alpha prediction
+        from ..bimamba import BiMambaEncoder
+        self.bimamba_encoder = BiMambaEncoder(
+            d_model=config.n_mels,  # 128 (Flow dim, no projection needed)
+            d_state=getattr(config, 'bimamba_d_state', 128),
+            d_conv=getattr(config, 'bimamba_d_conv', 4),
+            num_layers=getattr(config, 'bimamba_num_layers', 1),
+            dropout=getattr(config, 'bimamba_dropout', 0.1),
+        )
+
+        # === Swin Encoder (S0+S1, acoustic content for CIF) ===
+        # S0: pitch/harmony features @ 12.5fps  [B, T/8, 192]
+        # S1: beat-aware features   @ 12.5fps  [B, T/8, 192]  (S1 blocks, no downsample)
+        from ..swin import SwinEncoder
+        self.swin = SwinEncoder(
+            input_dim=config.n_mels,  # 128
+            swin_model=getattr(config, 'swin_model', "microsoft/swinv2-tiny-patch4-window8-256"),
+            use_gradient_checkpointing=getattr(config, 'gradient_checkpointing', False),
+        )
 
         # === Bridge: minimal (1 layer) ===
-        # Input dimensions for each level (Zeng-style, 3 levels):
-        # Level 0: Octopus (32 channels)
-        # Level 1: Flow (128 dims)
-        # Level 2: BiMamba (d_model, output from time-oriented Mamba)
+        # Input dimensions for each level (2 levels, same as base):
+        # Level 0: Octopus (32 channels, 1500 frames @ 50fps)
+        # Level 1: Flow (128 dims, 3000 frames @ 100fps)
+        # BiMamba and Swin S0 are CIF-internal (not bridge levels)
         octopus_channels = getattr(config, 'octopus_channels', 32)
-        bimamba_d_model = getattr(config, 'bimamba_d_model', config.d_model)
-        input_dims = [octopus_channels, config.n_mels, bimamba_d_model]
+        input_dims = [octopus_channels, config.n_mels]  # Only Octopus + Flow
 
         self.bridge = MultiScaleBridge(
-            swin_dims=config.swin_dims,  # Keep original for compatibility
+            swin_dims=config.swin_dims,  # Empty for tiny model
             d_model=config.d_model,
             n_heads=config.n_heads,
-            n_levels=config.n_levels,  # 3: Octopus + Flow + S0
+            n_levels=config.n_levels,  # 2: Octopus + Flow only
             ff_dim=config.ff_dim,
             dropout=config.dropout,
             n_layers=getattr(config, 'bridge_layers', 1),
             input_dims=input_dims,  # Specify actual input dimensions
         )
+
+        # === CIF input dimensions (not bridge levels, but needed for decoder init) ===
+        swin_s0_dim = 192  # Swin S0 output channels (post-downsample)
+        swin_s1_dim = 192  # Swin S1 output channels (pre-downsample, beat-aware @ same resolution)
+        bimamba_dim = config.n_mels  # 128 (no projection)
 
         # === Decoder: 2 layers (SA+CA + Mamba) ===
         self.decoder = ClefDecoder(
@@ -135,13 +147,17 @@ class ClefPianoTiny(nn.Module):
             # bar_token_id: still needed for bar_mask derivation in decoder.forward()
             bar_token_id=getattr(config, 'bar_token_id', None),
             onset_1d_channels=getattr(config, 'octopus_channels', 32),
-            # CIF
+            # CIF (decoupled fire_signal and acoustic_src)
             use_cif=getattr(config, 'use_cif', False),
+            cif_fire_signal_dim=bimamba_dim,    # 128 (BiMamba output for α prediction)
+            cif_acoustic_dim=swin_s0_dim,       # 192 (Swin S0 output for pitch content)
+            cif_acoustic_s1_dim=swin_s1_dim,    # 384 (Swin S1 output for beat content)
+            cif_d_model=config.d_model,         # decoder d_model
             cif_threshold=getattr(config, 'cif_threshold', 1.0),
-            cif_conv_kernel=getattr(config, 'cif_conv_kernel', 3),
-            cif_active_level=getattr(config, 'cif_active_level', 2),
-            cif_max_seq_len=getattr(config, 'max_seq_len', 2048),
+            cif_conv_kernel=getattr(config, 'cif_conv_kernel', 1),
+            cif_max_seq_len=getattr(config, 'cif_avg_fires', 128),
             cif_encoder_len=getattr(config, 'chunk_frames', 3000),
+            cif_scale_factor=getattr(config, 'cif_scale_factor', 4.0),  # Scaled sigmoid
         )
 
 
@@ -232,23 +248,9 @@ class ClefPianoTiny(nn.Module):
         spatial_shapes_list.append((1, T_flow))
         valid_ratios_list.append([1.0, 1.0])
 
-        # === Step 3: BiMamba Encoder (Zeng-style, time-oriented) ===
-        # flow_with_onset: [B, T_flow, 128] — time-major, all frequencies visible
-        # This is exactly like Zeng's Bi-GRU input: (B, T, freq_features)
-
-        if self.use_bimamba:
-            # Apply time-oriented bidirectional Mamba (Zeng-style)
-            feat_bimamba = self.bimamba_encoder(flow_with_onset)
-            # feat_bimamba: [B, T_flow, d_model] — time-major output
-
-            # BiMamba output is [B, W, d_model], treat as spatial shape (1, W)
-            features.append(feat_bimamba)
-            spatial_shapes_list.append((1, T_flow))  # Time-only (1D sequence)
-            valid_ratios_list.append([1.0, 1.0])
-
-        # === Bridge fusion ===
+        # === Bridge fusion (Octopus + Flow only) ===
         # Convert valid ratios to tensor
-        n_levels_actual = len(features)  # 3 or 4 depending on use_bimamba
+        n_levels_actual = len(features)  # 2: Octopus + Flow
         level_valid_ratios = torch.tensor(
             valid_ratios_list,
             device=mel.device,
@@ -260,7 +262,25 @@ class ClefPianoTiny(nn.Module):
             features, spatial_shapes_list, level_valid_ratios
         )
 
-        return memory, spatial_shapes, level_start_index, valid_ratios
+        # === Step 3: Parallel CIF paths (outside bridge) ===
+        # BiMamba: learns onset timing (fire_signal)
+        # Swin S0: extracts pitch content (acoustic_src)
+
+        # Step 3a: BiMamba Encoder (fire_signal for CIF alpha prediction)
+        # flow_with_onset: [B, T_flow, 128] @ 100fps
+        feat_bimamba = self.bimamba_encoder(flow_with_onset)
+        # feat_bimamba: [B, T_flow, 128] — temporal timing signal
+
+        # Step 3b: SwinEncoder (S0+S1) — acoustic content for CIF
+        feat_swin_s0, feat_swin_s1 = self.swin(flow_with_onset)
+        # feat_swin_s0: [B, T/8,  192] pitch/harmony features @ 12.5fps
+        # feat_swin_s1: [B, T/16, 384] beat/rhythm features   @  6.25fps
+
+        # Return CIF sources explicitly (separate from bridge memory)
+        # feat_bimamba:  [B, T,    128] fire signal (timing) @ 100fps
+        # feat_swin_s0:  [B, T/8,  192] pitch content @ 12.5fps
+        # feat_swin_s1:  [B, T/16, 384] beat content  @ 6.25fps
+        return memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, feat_swin_s0, feat_swin_s1
 
     def forward(
         self,
@@ -293,28 +313,25 @@ class ClefPianoTiny(nn.Module):
             total_loss: Same as loss (for compatibility)
         """
         # Encode
-        memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
+        memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, feat_swin_s0, feat_swin_s1 = self.encode(mel)
 
         # Embed tokens
         tgt = self.token_embed(input_ids)  # [B, S] → [B, S, D]
 
-        # Decode
-        # If scheduled sampling (tf_ratio < 1.0) is active during training, we need
-        # the model's own predictions (pred_embs) to substitute masked bar embeddings.
         pred_embs = None
         if self.training and tf_ratio < 1.0:
             with torch.no_grad():
                 _decoder_out = self.decoder(
                     tgt, memory, spatial_shapes, level_start_index, valid_ratios,
                     input_ids=input_ids,
-                    tf_ratio=1.0,  # Pure TF for the first pass to get stable predictions
+                    tf_ratio=1.0,
+                    fire_signal=feat_bimamba,
+                    acoustic_src=feat_swin_s0,
+                    acoustic_src_s1=feat_swin_s1,
                 )
                 _logits = self.output_projection(_decoder_out)
-                # Greedy prediction → embedding
                 _preds = _logits.argmax(dim=-1)
                 pred_embs = self.token_embed(_preds)
-                # (Optional optimization: only compute pred_embs for <bar> positions if we care about speed,
-                # but computing for all is safer and mirrors standard scheduled sampling logic).
 
         decoder_out = self.decoder(
             tgt,
@@ -325,6 +342,9 @@ class ClefPianoTiny(nn.Module):
             input_ids=input_ids,
             tf_ratio=tf_ratio,
             pred_embs=pred_embs,
+            fire_signal=feat_bimamba,
+            acoustic_src=feat_swin_s0,
+            acoustic_src_s1=feat_swin_s1,
         )
         logits = self.output_projection(decoder_out)
 
@@ -383,20 +403,52 @@ class ClefPianoTiny(nn.Module):
         Returns:
             generated_ids: [B, S]
         """
+        from ..cif import BAR_TOKEN_ID, NL_TOKEN_ID
+
         B = mel.shape[0]
         device = mel.device
 
         # Encode once
-        memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
+        encode_out = self.encode(mel)
+        memory, spatial_shapes, level_start_index, valid_ratios = encode_out[:4]
+        feat_bimamba = encode_out[4]   # [B, T_bi, 128]
+        feat_swin_s0 = encode_out[5]   # [B, T_sw, 192]
+        feat_swin_s1 = encode_out[6]   # [B, T_sw/2, 384]
+
+        # Pre-compute all CIF acoustic embeddings from audio
+        acoustic_embs, _, _ = self.decoder.cif(
+            fire_signal=feat_bimamba,
+            acoustic_src=feat_swin_s0,
+            acoustic_src_s1=feat_swin_s1,
+            input_lengths=None,
+            target_lengths=None,
+        )  # [B, N, D]
+        N_fires = acoustic_embs.shape[1]
+
+        # CIF pointer: advances on <sos> (already generated as first token) and <nl>
+        # <sos> was already emitted before the loop, so ptr starts at 1
+        cif_ptr = torch.ones(B, dtype=torch.long, device=device)
 
         # Initialize with BOS
         generated = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
 
         for _ in range(max_len - 1):
+            # Build acoustic_emb_dense for this step: [B, S_so_far, D]
+            # Each position gets the emb at its current ptr (carry-forward style)
+            S_cur = generated.shape[1]
+            cur_ptr = cif_ptr.clamp(max=N_fires - 1)  # [B]
+            # Expand current ptr across the full sequence history
+            # (positions before the current step already have correct emb via past ptr)
+            # Simple approach: re-index the full generated sequence each step
+            from ..cif import build_cif_alignment
+            align = build_cif_alignment(generated).clamp(max=N_fires - 1)  # [B, S_cur]
+            idx = align.unsqueeze(-1).expand(B, S_cur, acoustic_embs.shape[-1])
+            acoustic_embs_dense = acoustic_embs.gather(1, idx)  # [B, S_cur, D]
+
             # Embed tokens
             tgt = self.token_embed(generated)
 
-            # Decode
+            # Decode with CIF acoustic embeddings injected
             decoder_out = self.decoder(
                 tgt,
                 memory,
@@ -404,6 +456,9 @@ class ClefPianoTiny(nn.Module):
                 level_start_index,
                 valid_ratios,
                 input_ids=generated,
+                fire_signal=feat_bimamba,
+                acoustic_src=feat_swin_s0,
+                acoustic_src_s1=feat_swin_s1,
             )
             if isinstance(decoder_out, tuple):
                 decoder_out = decoder_out[0]
@@ -411,6 +466,10 @@ class ClefPianoTiny(nn.Module):
             next_token = logits.argmax(dim=-1)  # [B, 1]
 
             generated = torch.cat([generated, next_token], dim=1)
+
+            # Advance pointer on <nl> only (<sos> already advanced at init)
+            is_nl = (next_token[:, 0] == NL_TOKEN_ID)
+            cif_ptr = (cif_ptr + is_nl.long()).clamp(max=N_fires - 1)
 
             # Check for EOS
             if (next_token == eos_token_id).all():

@@ -26,7 +26,7 @@ model:
   # Encoder: Swin V2 (frozen core, selective fine-tune)
   swin_model: "microsoft/swinv2-tiny-patch4-window8-256"
   swin_dims: [96, 192, 384, 768]
-  freeze_encoder: true
+  freeze_swin: true
   # Selective unfreeze: adapt input/merge/position to pitch space (~1.6M / 27.6M = 5.8%)
   # - patch_embed: Conv2d(3,96,4,4) learns to see pitch-space patches (4.9K)
   # - position_bias: Continuous relative position MLP learns harmonic intervals (89K)

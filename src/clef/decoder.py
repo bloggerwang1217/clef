@@ -663,13 +663,14 @@ class MambaCIFLayer(nn.Module):
     """Mamba + CIF sidechain decoder layer.
 
     Replaces MambaFullCALayer when CIF is active.
-    No CA weights — acoustic_emb_dense from CIF is used directly as ca_out,
-    saving the 1.31M parameters that would otherwise be dead weight.
+    No CA weights — acoustic_emb_dense from CIF is used directly, saving 1.31M params.
 
     Architecture:
       1. Mamba2 Block  (compresses token history → y)
-      2. Sidechain Compressor Fusion: fused = ducked_y + acoustic_emb
-         (identical gate to MambaFullCALayer; audio is the immutable base)
+      2. FiLM fusion: γ = sigmoid(Linear(y)), β = Linear(y)
+                      fused = γ * acoustic_emb + β
+         Ref: Perez et al. AAAI 2018 — per-channel scale+shift, linear readout sufficient.
+         No residual around audio; Mamba state carries semantic history forward.
     """
 
     def __init__(
@@ -695,10 +696,11 @@ class MambaCIFLayer(nn.Module):
         self._mamba_layer_idx_set = False
         self.dropout_mamba = nn.Dropout(dropout)
 
-        # 2. Sidechain Compressor (same as MambaFullCALayer)
-        # render_proj: project y → same space as acoustic_emb for cosine gate
-        self.render_proj = nn.Linear(d_model, d_model)
-        self.compressor_temp = nn.Parameter(torch.tensor(2.659))
+        # 2. FiLM: y linearly "reads" per-dim scale (γ) and shift (β) over acoustic_emb.
+        # f and h can be arbitrary functions; linear is sufficient when y is already rich.
+        # (Perez et al. 2018; BigGAN found no benefit from MLP over linear projection.)
+        self.film_gamma = nn.Linear(d_model, d_model)   # y → γ ∈ (0,1) via sigmoid
+        self.film_beta  = nn.Linear(d_model, d_model)   # y → β (unconstrained shift)
         self.dropout_ca = nn.Dropout(dropout)
 
     def forward(
@@ -723,19 +725,17 @@ class MambaCIFLayer(nn.Module):
         mamba_out = self.mamba(tgt_normed, inference_params=mamba_state)
         y = tgt + self.dropout_mamba(mamba_out)
 
-        # Step 2: Sidechain Compressor Fusion
-        # Audio (acoustic_emb) is the immutable base; token history gates itself.
+        # Step 2: FiLM fusion — acoustic_emb is the feature; y is the conditioning.
+        # y determines which acoustic dimensions matter for the current token position.
         if acoustic_emb_dense is not None:
             ca_out = self.dropout_ca(acoustic_emb_dense)
         else:
-            # Fallback for inference steps where CIF hasn't fired yet
+            # Fallback: no acoustic info available (e.g. before first CIF fire at inference)
             ca_out = torch.zeros_like(y)
 
-        y_rendered = self.render_proj(y)
-        cosine_sim = F.cosine_similarity(y_rendered, ca_out, dim=-1)
-        compressor_gate = torch.sigmoid(self.compressor_temp * cosine_sim)
-        ducked_y = y_rendered * compressor_gate.unsqueeze(-1)
-        fused = ducked_y + ca_out  # Audio is the immutable base
+        gamma = torch.sigmoid(self.film_gamma(y))   # [B, S, D] per-dim gate
+        beta  = self.film_beta(y)                   # [B, S, D] per-dim shift
+        fused = gamma * ca_out + beta               # FiLM(acoustic | γ, β)
 
         if use_cache:
             return fused, (None, mamba_state)
@@ -1415,12 +1415,16 @@ class ClefDecoder(nn.Module):
         # Exponential decay soft mask for window CA (sa_window_ca and mamba_window_ca only)
         window_exp_decay_lambda: float = 0.0,
         # CIF (Continuous Integrate-and-Fire) — replaces BarMamba for tiny model
-        use_cif: bool = False,            # if True, build CIFModule instead of BarMamba
-        cif_threshold: float = 1.0,       # CIF fire threshold
-        cif_conv_kernel: int = 3,         # depthwise conv kernel for weight predictor
-        cif_active_level: int = 2,        # memory level index to extract encoder_1d from
-        cif_max_seq_len: int = 2048,      # used for weight_proj bias init (N estimate)
-        cif_encoder_len: int = 3000,      # used for weight_proj bias init (T estimate = chunk_frames)
+        use_cif: bool = False,                   # if True, build CIFModule instead of BarMamba
+        cif_fire_signal_dim: int = 128,          # BiMamba output dim (for α prediction)
+        cif_acoustic_dim: int = 192,             # Swin S0 output dim (pitch content)
+        cif_acoustic_s1_dim: int = 384,          # Swin S1 output dim (beat content)
+        cif_d_model: int = 512,                  # Final acoustic embedding dim (decoder d_model)
+        cif_threshold: float = 1.0,              # CIF fire threshold
+        cif_conv_kernel: int = 1,                # depthwise conv kernel for weight predictor
+        cif_max_seq_len: int = 2048,             # used for weight_proj bias init (N estimate)
+        cif_encoder_len: int = 3000,             # used for weight_proj bias init (T estimate)
+        cif_scale_factor: float = 4.0,           # Scaled sigmoid (allow α > 1)
     ):
         super().__init__()
 
@@ -1452,14 +1456,16 @@ class ClefDecoder(nn.Module):
         if bar_token_id is not None:
             if use_cif:
                 self.cif = CIFModule(
-                    d_model=d_model,
+                    fire_signal_dim=cif_fire_signal_dim,   # BiMamba output dim
+                    acoustic_dim=cif_acoustic_dim,          # Swin S0 output dim (pitch)
+                    beat_dim=cif_acoustic_s1_dim,           # Swin S1 output dim (beat)
+                    d_model=cif_d_model,                    # Final embedding dim
                     threshold=cif_threshold,
                     conv_kernel=cif_conv_kernel,
                     max_seq_len=cif_max_seq_len,
                     encoder_len=cif_encoder_len,
+                    scale_factor=cif_scale_factor,
                 )
-                # Store which memory level CIF should extract from (BiMamba output)
-                self._cif_active_level = cif_active_level
             else:
                 self.bar_mamba = BarMamba(
                     d_model=d_model,
@@ -1619,6 +1625,9 @@ class ClefDecoder(nn.Module):
         input_ids: Optional[torch.Tensor] = None,        # [B, S] int token IDs
         tf_ratio: float = 1.0,                            # teacher-forcing ratio for note_gru
         pred_embs: Optional[torch.Tensor] = None,        # [B, S, D] predicted embeddings for TF
+        fire_signal: Optional[torch.Tensor] = None,      # [B, T_bi, D_bi] BiMamba output (timing)
+        acoustic_src: Optional[torch.Tensor] = None,     # [B, T_sw, D_sw] Swin S0 output (pitch)
+        acoustic_src_s1: Optional[torch.Tensor] = None,  # [B, T_s1, D_s1] Swin S1 output (beat)
     ):
         """Forward through all decoder layers.
 
@@ -1668,28 +1677,28 @@ class ClefDecoder(nn.Module):
 
         if self.cif is not None and memory is not None:
             # ── CIF path (tiny model) ─────────────────────────────────────────
-            # Extract encoder_1d from memory at the CIF active level.
-            lvl = self._cif_active_level
-            n_lvls = spatial_shapes.shape[0]
-            cif_start = level_start_index[lvl].item()
-            cif_end = (level_start_index[lvl + 1].item()
-                       if lvl < n_lvls - 1 else memory.shape[1])
-            encoder_1d = memory[:, cif_start:cif_end]  # [B, T_bimamba, D]
+            # Decoupled sources:
+            #   fire_signal (BiMamba): onset timing @ 100fps
+            #   acoustic_src (Swin S0): pitch content @ 25fps
 
-            # Target = non-padding token count: one CIF firing per token position.
-            # Aligns with Dong & Xu 2020: S̃ = target sequence length (every non-pad
-            # token gets one acoustic embedding regardless of structural vs. acoustic).
+            if fire_signal is None or acoustic_src is None:
+                raise ValueError("CIF requires both fire_signal and acoustic_src")
+
+            # Target = non-padding token count
             target_lengths = None
             if input_ids is not None:
                 target_lengths = (input_ids != 0).sum(dim=1).float()  # [B]
 
+            # CIF forward with decoupled sources
             acoustic_embs, alpha, qty_loss = self.cif(
-                encoder_1d,
-                input_lengths=None,  # valid_ratios=1.0, no padding mask needed
+                fire_signal=fire_signal,           # [B, T_bi, D_bi] BiMamba timing
+                acoustic_src=acoustic_src,          # [B, T_sw, D_sw] Swin S0 pitch
+                acoustic_src_s1=acoustic_src_s1,    # [B, T_s1, D_s1] Swin S1 beat (optional)
+                input_lengths=None,                 # No padding mask needed
                 target_lengths=target_lengths,
             )
-            # [B, N_max, D] → align to [B, S, D] for teacher-forcing
-            acoustic_embs_dense = self.cif.align_to_seq_len(acoustic_embs, S)
+            # [B, N_max, d_model] → scatter to [B, S, d_model] using bar/nl alignment
+            acoustic_embs_dense = self.cif.align_to_seq_len(acoustic_embs, S, input_ids=input_ids)
             self._cif_quantity_loss = qty_loss
 
         elif (hasattr(self, 'bar_mamba')
@@ -1851,7 +1860,7 @@ class ClefDecoder(nn.Module):
                 output = grad_checkpoint(_layer_fn, output, memory,
                                         _guidance, layer_window_center, _freq_in,
                                         _tgt_query, _acoustic,
-                                        use_reentrant=False)
+                                        use_reentrant=True)
             else:
                 layer_kwargs = dict(
                     tgt_pos=tgt_pos,
