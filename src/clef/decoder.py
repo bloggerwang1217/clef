@@ -663,14 +663,13 @@ class MambaCIFLayer(nn.Module):
     """Mamba + CIF sidechain decoder layer.
 
     Replaces MambaFullCALayer when CIF is active.
-    No CA weights — acoustic_emb_dense from CIF is used directly, saving 1.31M params.
+    No CA weights — acoustic_emb_dense from CIF is used directly, saving params.
 
-    Architecture:
+    Architecture (Zeng-style):
       1. Mamba2 Block  (compresses token history → y)
-      2. FiLM fusion: γ = sigmoid(Linear(y)), β = Linear(y)
-                      fused = γ * acoustic_emb + β
-         Ref: Perez et al. AAAI 2018 — per-channel scale+shift, linear readout sufficient.
-         No residual around audio; Mamba state carries semantic history forward.
+      2. Concatenation fusion: fused = Linear(cat[y, acoustic_emb])
+         Ref: Zeng et al. 2024 line 399 — concat GRU output with audio context
+         Like Zeng: out = Linear(cat[gru_out, context])
     """
 
     def __init__(
@@ -696,11 +695,9 @@ class MambaCIFLayer(nn.Module):
         self._mamba_layer_idx_set = False
         self.dropout_mamba = nn.Dropout(dropout)
 
-        # 2. FiLM: y linearly "reads" per-dim scale (γ) and shift (β) over acoustic_emb.
-        # f and h can be arbitrary functions; linear is sufficient when y is already rich.
-        # (Perez et al. 2018; BigGAN found no benefit from MLP over linear projection.)
-        self.film_gamma = nn.Linear(d_model, d_model)   # y → γ ∈ (0,1) via sigmoid
-        self.film_beta  = nn.Linear(d_model, d_model)   # y → β (unconstrained shift)
+        # 2. Zeng-style concatenation fusion (line 397-400)
+        # Concat [y, acoustic_emb], then project (like Zeng's cat[gru_out, context])
+        self.fusion_proj = nn.Linear(d_model * 2, d_model)  # [y, acoustic] → d_model
         self.dropout_ca = nn.Dropout(dropout)
 
     def forward(
@@ -725,17 +722,16 @@ class MambaCIFLayer(nn.Module):
         mamba_out = self.mamba(tgt_normed, inference_params=mamba_state)
         y = tgt + self.dropout_mamba(mamba_out)
 
-        # Step 2: FiLM fusion — acoustic_emb is the feature; y is the conditioning.
-        # y determines which acoustic dimensions matter for the current token position.
+        # Step 2: Zeng-style concatenation fusion (line 399)
+        # Concat [y (Mamba output), acoustic_emb], then project
         if acoustic_emb_dense is not None:
             ca_out = self.dropout_ca(acoustic_emb_dense)
         else:
             # Fallback: no acoustic info available (e.g. before first CIF fire at inference)
             ca_out = torch.zeros_like(y)
 
-        gamma = torch.sigmoid(self.film_gamma(y))   # [B, S, D] per-dim gate
-        beta  = self.film_beta(y)                   # [B, S, D] per-dim shift
-        fused = gamma * ca_out + beta               # FiLM(acoustic | γ, β)
+        combined = torch.cat([y, ca_out], dim=-1)   # [B, S, d_model*2] like Zeng line 399
+        fused = self.fusion_proj(combined)          # [B, S, d_model] project back
 
         if use_cache:
             return fused, (None, mamba_state)

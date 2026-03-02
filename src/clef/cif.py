@@ -26,7 +26,6 @@ Sidechain compressor semantics:
     Tiny model: acoustic_emb replaces full CA entirely (no WindowCrossAttention needed).
 """
 
-import math
 from typing import Optional, Tuple
 
 import torch
@@ -135,6 +134,7 @@ class CIFModule(nn.Module):
         encoder_len: int = 3000,
         scale_factor: float = 4.0,       # Scaling factor for sigmoid (allow α > 1)
         use_dynamic_threshold: bool = True,  # Paraformer dynamic threshold: β = Σα / ⌈Σα⌉
+        noise_threshold: float = 0.05,   # Soft thresholding (FunASR design): blocks gradient for non-onset frames
     ):
         super().__init__()
         self.fire_signal_dim = fire_signal_dim
@@ -144,6 +144,7 @@ class CIFModule(nn.Module):
         self.threshold = threshold
         self.scale_factor = scale_factor
         self.use_dynamic_threshold = use_dynamic_threshold
+        self.noise_threshold = noise_threshold
 
         padding = conv_kernel // 2
         # Depthwise conv on fire_signal: captures local temporal context for onset detection
@@ -157,27 +158,19 @@ class CIFModule(nn.Module):
         self.weight_norm = nn.LayerNorm(fire_signal_dim)
         self.weight_proj = nn.Linear(fire_signal_dim, 1, bias=True)
 
-        # Initialize bias with scaled sigmoid: α = scale_factor * sigmoid(x)
-        # Want Σα ≈ target_fires at start → sigmoid should output ~(target_fires / encoder_len) / scale_factor
-        alpha_init = target_fires / encoder_len  # e.g., 128/3000 = 0.043
-        alpha_init_sigmoid = min(alpha_init / scale_factor, 0.99)  # 0.043/4 = 0.011
-        bias_init = math.log(alpha_init_sigmoid / (1.0 - alpha_init_sigmoid))
-        nn.init.constant_(self.weight_proj.bias, bias_init)
-        nn.init.zeros_(self.weight_proj.weight)  # init Σα ≈ target_fires at start
+        # Use PyTorch defaults: Kaiming uniform for weight, zeros for bias.
+        # Kaiming init allows weight_proj to immediately discriminate onset vs non-onset
+        # frames from BiMamba features, rather than starting uniform (zeros would push
+        # quantity loss gradient uniformly across all frames).
 
-        # === FiLM modulation (Perez et al. 2018): temporal (BiMamba) modulates each Swin stage ===
-        # Separate generators per stage — each stage has different semantics (per FiLM paper convention).
-
-        # S0 FiLM: temporal [B,N,128] → γ_s0, β_s0 [B,N,192] each
-        self.film_s0_generator = nn.Linear(fire_signal_dim, acoustic_dim * 2)  # 128 → 384
-
-        # S1 FiLM: temporal [B,N,128] → γ_s1, β_s1 [B,N,384] each
-        self.film_s1_generator = nn.Linear(fire_signal_dim, beat_dim * 2)       # 128 → 384
-
-        # Triple-channel projections to d_model
-        self.temporal_proj = nn.Linear(fire_signal_dim, d_model)  # 128 → d_model (timing)
-        self.acoustic_proj  = nn.Linear(acoustic_dim, d_model)    # 192 → d_model (pitch)
-        self.beat_proj      = nn.Linear(beat_dim, d_model)        # 192 → d_model (beat)
+        # === Zeng-style concatenation (no FiLM) ===
+        # Concat temporal + pitch (+ beat), then project (like Zeng line 397-400)
+        # Without S1: 128 + 192 = 320 → d_model
+        # With S1:    128 + 192 + 192 = 512 → d_model
+        self.combined_proj = nn.Linear(fire_signal_dim + acoustic_dim, d_model)  # 320 → d_model
+        self.combined_proj_with_beat = nn.Linear(
+            fire_signal_dim + acoustic_dim + beat_dim, d_model
+        )  # 512 → d_model
 
     def forward(
         self,
@@ -189,12 +182,17 @@ class CIFModule(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute CIF acoustic embeddings and quantity loss.
 
-        Triple-channel design with per-stage FiLM modulation (Perez et al. 2018):
+        Triple-channel design with Zeng-style concatenation (no FiLM):
           - fire_signal (BiMamba, 100fps): predicts α + provides temporal embeddings
-          - acoustic_src (Swin S0, 12.5fps): pitch/harmonic features (upsample 8x)
-          - acoustic_src_s1 (Swin S1, 6.25fps): beat/rhythm features (upsample 16x, optional)
-          - Temporal modulates S0 via film_s0_generator (separate γ, β for each stage)
-          - Temporal modulates S1 via film_s1_generator (separate γ, β for each stage)
+          - acoustic_src (Swin S0, 12.5fps): pitch/harmonic features (integer lookup at fire positions)
+          - acoustic_src_s1 (Swin S1, 6.25fps): beat/rhythm features (integer lookup at fire positions, optional)
+          - Concat [temporal, pitch, beat] → project to d_model (like Zeng line 397-400)
+
+        Gradient flow:
+          - CE loss → combined_proj → acoustic_src/acoustic_src_s1 (encoder gets gradient) ✓
+          - CE loss -X-> acoustic_temporal (detached) -X-> α / weight_proj (blocked)
+          - CE loss -X-> fire_frames (integer indices block gradient to α)
+          - Only qty_loss supervises α / weight_proj (decoupled training)
 
         Args:
             fire_signal: BiMamba output [B, T_bi, D_bi] for α prediction (100fps).
@@ -219,8 +217,12 @@ class CIFModule(nn.Module):
         x = self.conv(x)                   # [B, D_bi, T_bi] depthwise local context
         x = x.permute(0, 2, 1)             # [B, T_bi, D_bi]
         x = self.weight_norm(x)
-        # Scaled sigmoid: α ∈ (0, scale_factor)
-        alpha = self.scale_factor * torch.sigmoid(self.weight_proj(x)).squeeze(-1)  # [B, T_bi]
+        # Soft thresholding (FunASR design): relu(scale_factor * sigmoid(x) - noise_threshold)
+        # Blocks gradient for non-onset frames (logit too small), encourages sparsity.
+        # scale_factor=2.0 allows single-frame firing (alpha > threshold=1.0 in one frame).
+        alpha = torch.relu(
+            self.scale_factor * torch.sigmoid(self.weight_proj(x)).squeeze(-1) - self.noise_threshold
+        )  # [B, T_bi], range [0, scale_factor - noise_threshold]
 
         # Mask padding frames to zero weight
         if input_lengths is not None:
@@ -261,6 +263,10 @@ class CIFModule(nn.Module):
         acoustic_temporal = self._cif_forward(fire_signal, alpha_cif, threshold_cif)  # [B, N, D_bi]
         N = acoustic_temporal.shape[1]
 
+        # Detach acoustic_temporal to block CE → alpha gradient path
+        # CE can still train encoder (Swin/BiMamba) and combined_proj weights
+        acoustic_temporal_for_proj = acoustic_temporal.detach()
+
         # ── Step 4: Post-fire lookup for S0 and S1 (differentiable bilinear) ──────
         # Compute continuous fire positions so gradients flow back to alpha.
         #
@@ -283,50 +289,44 @@ class CIFModule(nn.Module):
             cum.contiguous(), thresholds.contiguous()
         ).clamp(max=T_bi - 1)                                            # [B, N] int
 
-        # Continuous fire position (differentiable)
-        t_lo = (fire_frames - 1).clamp(min=0)                           # [B, N] int
-        cum_at_tlo = cum.gather(1, t_lo)                                 # [B, N]
-        alpha_at_thi = alpha_cif.gather(1, fire_frames)                  # [B, N]
-        t_continuous = (t_lo.float()
-                        + (thresholds - cum_at_tlo) / alpha_at_thi.clamp(min=1e-8))
-        t_continuous = t_continuous.clamp(0, T_bi - 1)                  # [B, N] float
+        # Integer fire position (non-differentiable lookup to block CE gradient to alpha)
+        # CE gradient stops at acoustic_src values, cannot flow back to fire timing.
+        # Only qty_loss supervises alpha / weight_proj.
 
-        # S0 bilinear lookup
+        # S0 integer lookup (downsampled from BiMamba 100fps to S0 12.5fps)
         T_sw = acoustic_src.shape[1]
         D_sw = acoustic_src.shape[2]
-        t_s0 = t_continuous.mul(T_sw).div(T_bi)                         # [B, N] float, stays in tensor domain
-        t_s0_lo = t_s0.long().clamp(0, T_sw - 2)                        # [B, N] int
-        t_s0_hi = t_s0_lo + 1                                           # [B, N] int
-        w_s0 = (t_s0 - t_s0_lo.float()).unsqueeze(-1)                   # [B, N, 1]
-        pitch_lo = acoustic_src.gather(1, t_s0_lo.unsqueeze(-1).expand(B, N, D_sw))
-        pitch_hi = acoustic_src.gather(1, t_s0_hi.unsqueeze(-1).expand(B, N, D_sw))
-        acoustic_pitch = (1 - w_s0) * pitch_lo + w_s0 * pitch_hi       # [B, N, D_sw]
+        fire_frames_s0 = (fire_frames.float() * T_sw / T_bi).long().clamp(0, T_sw - 1)  # [B, N] int
+        acoustic_pitch = acoustic_src.gather(
+            1, fire_frames_s0.unsqueeze(-1).expand(B, N, D_sw)
+        )  # [B, N, D_sw] — gradient flows to acoustic_src, NOT to fire_frames_s0
 
-        # ── Step 5: Per-stage FiLM modulation (Perez et al. 2018) ───────────────
-        # S0 FiLM: temporal → γ_s0, β_s0 → modulates pitch features
-        gamma_s0, beta_s0 = self.film_s0_generator(acoustic_temporal).chunk(2, dim=-1)
-        acoustic_pitch_mod = gamma_s0 * acoustic_pitch + beta_s0        # [B, N, D_sw]
+        # ── Step 5: Zeng-style concatenation (line 397-400) ─────────────────────
+        # Concat temporal (detached) + pitch (+ beat), then project
+        # Gradient: CE → combined_proj weights ✓, CE -X-> alpha (blocked by detach)
 
-        # ── Step 6: Project and combine ─────────────────────────────────────────
-        temporal_proj = self.temporal_proj(acoustic_temporal)            # [B, N, d_model]
-        pitch_proj    = self.acoustic_proj(acoustic_pitch_mod)           # [B, N, d_model]
-        acoustic_embs = temporal_proj + pitch_proj                       # [B, N, d_model]
-
-        # ── Step 7: S1 FiLM (optional, bilinear) ────────────────────────────────
         if acoustic_src_s1 is not None:
+            # With S1: concat all three channels
             T_s1 = acoustic_src_s1.shape[1]
             D_s1 = acoustic_src_s1.shape[2]
-            t_s1 = t_continuous.mul(T_s1).div(T_bi)                     # [B, N] float, stays in tensor domain
-            t_s1_lo = t_s1.long().clamp(0, T_s1 - 2)
-            t_s1_hi = t_s1_lo + 1
-            w_s1 = (t_s1 - t_s1_lo.float()).unsqueeze(-1)               # [B, N, 1]
-            beat_lo = acoustic_src_s1.gather(1, t_s1_lo.unsqueeze(-1).expand(B, N, D_s1))
-            beat_hi = acoustic_src_s1.gather(1, t_s1_hi.unsqueeze(-1).expand(B, N, D_s1))
-            acoustic_beat = (1 - w_s1) * beat_lo + w_s1 * beat_hi      # [B, N, D_s1]
-            # S1 FiLM: separate γ, β from S0 (different stage, different semantics)
-            gamma_s1, beta_s1 = self.film_s1_generator(acoustic_temporal).chunk(2, dim=-1)
-            acoustic_beat_mod = gamma_s1 * acoustic_beat + beta_s1      # [B, N, D_s1]
-            acoustic_embs = acoustic_embs + self.beat_proj(acoustic_beat_mod)  # [B, N, d_model]
+            fire_frames_s1 = (fire_frames.float() * T_s1 / T_bi).long().clamp(0, T_s1 - 1)
+            acoustic_beat = acoustic_src_s1.gather(
+                1, fire_frames_s1.unsqueeze(-1).expand(B, N, D_s1)
+            )  # [B, N, D_s1] — gradient blocked at indices
+
+            acoustic_cat = torch.cat([
+                acoustic_temporal_for_proj,  # [B, N, 128] detached
+                acoustic_pitch,              # [B, N, 192]
+                acoustic_beat,               # [B, N, 192]
+            ], dim=-1)  # [B, N, 512]
+            acoustic_embs = self.combined_proj_with_beat(acoustic_cat)  # [B, N, d_model]
+        else:
+            # Without S1: concat temporal + pitch only
+            acoustic_cat = torch.cat([
+                acoustic_temporal_for_proj,  # [B, N, 128] detached
+                acoustic_pitch,              # [B, N, 192]
+            ], dim=-1)  # [B, N, 320]
+            acoustic_embs = self.combined_proj(acoustic_cat)  # [B, N, d_model]
 
         return acoustic_embs, alpha, qty_loss
 

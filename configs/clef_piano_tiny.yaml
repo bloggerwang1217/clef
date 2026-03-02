@@ -89,8 +89,8 @@ model:
   cif_threshold: 1.0          # Base threshold (overridden by dynamic if enabled)
   cif_use_dynamic_threshold: true  # Paraformer dynamic threshold: β = Σα / ⌈Σα⌉ (reduces train/inference mismatch)
   cif_conv_kernel: 1          # No temporal smoothing (BiMamba @ 100fps, Swin @ 25fps)
-  cif_scale_factor: 1.0       # No scaling (α ∈ [0,1]): only fire at time-advance tokens (<sos>, <nl>), 1 onset = 1 token
-  cif_quantity_loss_weight: 1.0    # |Σα - N_acoustic|; balanced with CE (was 5.0, caused grad explosion)
+  cif_scale_factor: 1.0       # Standard CIF (Dong & Xu 2020): α ∈ (0,1), accumulate frames to reach threshold=1.0
+  cif_quantity_loss_weight: 0.05    # |Σα - N_acoustic|; balanced with CE
   cif_avg_fires: 128               # avg <sos>+<nl> per 30s chunk (mean≈127, median≈115 from tokenizer stats)
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
