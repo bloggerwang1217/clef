@@ -44,8 +44,8 @@ STRUCTURAL_IDS = frozenset({0, 1, 2, 3, 5, 7, 8, 9})
 # Token IDs that trigger a CIF pointer advance (time step boundaries).
 # <bar>=4 triggers advance on every occurrence EXCEPT the first one per sequence.
 # <nl>=6 always triggers advance.
-SOS_TOKEN_ID = 1
 NL_TOKEN_ID  = 6
+BAR_TOKEN_ID = 4
 
 
 def compute_acoustic_target_lengths(
@@ -53,16 +53,15 @@ def compute_acoustic_target_lengths(
 ) -> torch.Tensor:
     """Compute per-batch CIF fire count target.
 
-    Target = count(<sos>) + count(<nl>) = 1 + n_nl.
-    - <sos>: fires once, opening emb[0] as a neutral sentinel slot.
+    Target = count(<bar>) + count(<nl>).
+    - <bar>: fires at each barline (measure boundary).
     - <nl>: fires once per time step, advancing to the next emb.
-    - Everything else (<bar>, schema, notes, <coc>...): no fire.
 
     Returns: [B] float tensor of target fire counts.
     """
-    sos_counts = (input_ids == SOS_TOKEN_ID).sum(dim=1).float()
+    bar_counts = (input_ids == BAR_TOKEN_ID).sum(dim=1).float()
     nl_counts  = (input_ids == NL_TOKEN_ID).sum(dim=1).float()
-    return sos_counts + nl_counts
+    return bar_counts + nl_counts
 
 
 def build_cif_alignment(
@@ -72,12 +71,11 @@ def build_cif_alignment(
 
     Rules:
       - ptr starts at 0.
-      - <sos>: assigned emb[0] THEN ptr advances to 1.
       - <nl>: assigned emb[ptr] THEN ptr advances.
-      - All other tokens (<bar>, schema, notes, <coc>...): no advance.
+      - <bar>: assigned emb[ptr] THEN ptr advances.
+      - All other tokens (<sos>, schema, notes, <coc>...): no advance.
 
-    emb[0]   = <sos> only (neutral sentinel; CIF learns a "before music" fire).
-    emb[1..N] = musical time steps (<bar> + schema + notes share one emb per step).
+    emb[0..N] = musical time steps (<nl> and <bar> positions).
 
     Returns: alignment [B, S] int64 — alignment[b, i] = emb index for token i.
     """
@@ -88,7 +86,7 @@ def build_cif_alignment(
         for i in range(S):
             alignment[b, i] = ptr
             tid = input_ids[b, i].item()
-            if tid == SOS_TOKEN_ID or tid == NL_TOKEN_ID:
+            if tid == NL_TOKEN_ID or tid == BAR_TOKEN_ID:
                 ptr += 1
     return alignment
 
@@ -96,26 +94,23 @@ def build_cif_alignment(
 class CIFModule(nn.Module):
     """Continuous Integrate-and-Fire: encoder frames → per-token acoustic embeddings.
 
-    Decoupled dual-channel design with FiLM modulation:
+    Decoupled dual-channel design (no FiLM, direct concatenation):
       - fire_signal (BiMamba @ 100fps): predicts α timing + provides temporal/duration features
       - acoustic_src (Swin S0 @ 12.5fps): provides pitch/harmonic features (upsampled 8x)
-      - FiLM: temporal features modulate pitch features (γ * pitch + β)
-      - Both paths projected to d_model and summed
+      - Both concatenated and projected to d_model
 
     Architecture:
         1. Weight predictor (from fire_signal):
-               α = scale_factor * sigmoid(Linear(LayerNorm(DepthwiseConv1d(fire_signal))))
+               α = sigmoid(Linear(LayerNorm(DepthwiseConv1d(fire_signal))))  # α ∈ (0, 1)
         2. Dual-channel CIF integration:
                acoustic_temporal = CIF(fire_signal, α)  # [B, N, 128] duration/timing
                acoustic_pitch = CIF(acoustic_src↑8x, α)  # [B, N, 192] pitch/harmonic
-        3. FiLM modulation:
-               γ, β = Linear(acoustic_temporal) → chunk(2)  # 128 → 384 (192*2)
-               acoustic_pitch_mod = γ * acoustic_pitch + β  # [B, N, 192]
-        4. Project and combine:
-               temporal_proj = Linear_128→512(acoustic_temporal)
-               pitch_proj = Linear_192→512(acoustic_pitch_mod)
-               out = temporal_proj + pitch_proj  # [B, N, 512]
-        5. Quantity loss: |Σα - N_acoustic| drives α to sum to the token count.
+        3. Concatenation:
+               acoustic_cat = [acoustic_temporal, acoustic_pitch]  # [B, N, 320]
+               (if S1 exists: [temporal, pitch, beat] → [B, N, 512])
+        4. Project to d_model:
+               out = Linear(concat_dim → d_model)(acoustic_cat)  # [B, N, d_model]
+        5. Quantity loss: |Σα - N_structural| where N_structural = count(<bar>) + count(<nl>).
 
     forward() returns (acoustic_embs, alpha, quantity_loss).
     align_to_seq_len() pads/truncates acoustic_embs from [B, N, D] to [B, S, D]
@@ -132,9 +127,7 @@ class CIFModule(nn.Module):
         conv_kernel: int = 1,
         target_fires: int = 128,         # Target fire count (avg structural tokens per chunk)
         encoder_len: int = 3000,
-        scale_factor: float = 4.0,       # Scaling factor for sigmoid (allow α > 1)
         use_dynamic_threshold: bool = True,  # Paraformer dynamic threshold: β = Σα / ⌈Σα⌉
-        noise_threshold: float = 0.05,   # Soft thresholding (FunASR design): blocks gradient for non-onset frames
     ):
         super().__init__()
         self.fire_signal_dim = fire_signal_dim
@@ -142,9 +135,7 @@ class CIFModule(nn.Module):
         self.beat_dim = beat_dim
         self.d_model = d_model
         self.threshold = threshold
-        self.scale_factor = scale_factor
         self.use_dynamic_threshold = use_dynamic_threshold
-        self.noise_threshold = noise_threshold
 
         padding = conv_kernel // 2
         # Depthwise conv on fire_signal: captures local temporal context for onset detection
@@ -217,12 +208,8 @@ class CIFModule(nn.Module):
         x = self.conv(x)                   # [B, D_bi, T_bi] depthwise local context
         x = x.permute(0, 2, 1)             # [B, T_bi, D_bi]
         x = self.weight_norm(x)
-        # Soft thresholding (FunASR design): relu(scale_factor * sigmoid(x) - noise_threshold)
-        # Blocks gradient for non-onset frames (logit too small), encourages sparsity.
-        # scale_factor=2.0 allows single-frame firing (alpha > threshold=1.0 in one frame).
-        alpha = torch.relu(
-            self.scale_factor * torch.sigmoid(self.weight_proj(x)).squeeze(-1) - self.noise_threshold
-        )  # [B, T_bi], range [0, scale_factor - noise_threshold]
+        # Simple sigmoid: alpha ∈ (0, 1). CIF fires when cumulative alpha reaches threshold=1.0.
+        alpha = torch.sigmoid(self.weight_proj(x)).squeeze(-1)  # [B, T_bi]
 
         # Mask padding frames to zero weight
         if input_lengths is not None:

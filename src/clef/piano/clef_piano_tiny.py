@@ -157,7 +157,6 @@ class ClefPianoTiny(nn.Module):
             cif_conv_kernel=getattr(config, 'cif_conv_kernel', 1),
             cif_target_fires=getattr(config, 'cif_avg_fires', 128),
             cif_encoder_len=getattr(config, 'chunk_frames', 3000),
-            cif_scale_factor=getattr(config, 'cif_scale_factor', 4.0),  # Scaled sigmoid
             cif_use_dynamic_threshold=getattr(config, 'cif_use_dynamic_threshold', True),
         )
 

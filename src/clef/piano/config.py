@@ -67,7 +67,6 @@ class ClefPianoConfig(ClefConfig):
     cif_conv_kernel: int = 3           # depthwise conv kernel for weight predictor
     cif_active_level: int = 2          # memory level index to extract encoder_1d (BiMamba)
     cif_quantity_loss_weight: float = 0.0  # weight for |Σα - N_acoustic| loss
-    cif_scale_factor: float = 1.0      # scaled sigmoid: α = scale_factor * sigmoid(x)
 
     # Gradient checkpointing (trades compute for memory)
     gradient_checkpointing: bool = False
@@ -235,7 +234,6 @@ class ClefPianoConfig(ClefConfig):
             cif_conv_kernel=model_cfg.get("cif_conv_kernel", defaults.cif_conv_kernel),
             cif_active_level=model_cfg.get("cif_active_level", defaults.cif_active_level),
             cif_quantity_loss_weight=model_cfg.get("cif_quantity_loss_weight", defaults.cif_quantity_loss_weight),
-            cif_scale_factor=model_cfg.get("cif_scale_factor", defaults.cif_scale_factor),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),

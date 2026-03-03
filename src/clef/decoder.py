@@ -1420,7 +1420,6 @@ class ClefDecoder(nn.Module):
         cif_conv_kernel: int = 1,                # depthwise conv kernel for weight predictor
         cif_target_fires: int = 128,             # Target fire count (avg structural tokens per chunk)
         cif_encoder_len: int = 3000,             # Encoder length (used for weight_proj bias init)
-        cif_scale_factor: float = 4.0,           # Scaled sigmoid (allow α > 1)
         cif_use_dynamic_threshold: bool = True,  # Paraformer dynamic threshold: β = Σα / ⌈Σα⌉
     ):
         super().__init__()
@@ -1461,7 +1460,6 @@ class ClefDecoder(nn.Module):
                     conv_kernel=cif_conv_kernel,
                     target_fires=cif_target_fires,
                     encoder_len=cif_encoder_len,
-                    scale_factor=cif_scale_factor,
                     use_dynamic_threshold=cif_use_dynamic_threshold,
                 )
             else:
