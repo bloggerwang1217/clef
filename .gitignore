@@ -71,6 +71,7 @@ poetry.toml
 
 # AI instructions
 CLAUDE.md
+AGENTS.md
 .agents/
 .claude/
 
