@@ -98,57 +98,57 @@ def build_cif_alignment(
 
 
 class CIFModule(nn.Module):
-    """Continuous Integrate-and-Fire: encoder frames → per-token acoustic embeddings.
+    """Continuous Integrate-and-Fire: encoder frames → per-fire acoustic token sequences.
 
-    Decoupled dual-channel design (no FiLM, direct concatenation):
-      - fire_signal (BiMamba @ 100fps): predicts α timing + provides temporal/duration features
-      - acoustic_src (Swin S0 @ 12.5fps): provides pitch/harmonic features (upsampled 8x)
-      - Both concatenated and projected to d_model
+    Polyphonic design (v3):
+      Each fire slot exposes a SEQUENCE of frequency tokens (not one vector), so the
+      decoder can attend selectively to individual notes within a polyphonic onset.
 
-    Architecture:
-        1. Weight predictor (from fire_signal):
-               α = softplus(Linear(ReLU(Linear(LayerNorm(DepthwiseConv1d(fire_signal))))))  # α ∈ (0, ∞)
-        2. Onset probability via Soft Schmitt Trigger (no trainable weights):
-               P = σ((α − threshold) / temperature)  # P ∈ (0, 1)
-        3. Dual-channel CIF integration (raw α, peak-detection, no accumulation):
-               acoustic_temporal = CIF(fire_signal, α)  # [B, N, D_bi] fires at α > threshold
-               acoustic_pitch = lookup(acoustic_src, fire_frames)  # [B, N, 192] S0 at fire positions
-        4. Concatenation:
-               acoustic_cat = [acoustic_temporal, acoustic_pitch]  # [B, N, 320]
-               (if S1 exists: [temporal, pitch, beat] → [B, N, 512])
-        5. Project to d_model:
-               out = Linear(concat_dim → d_model)(acoustic_cat)  # [B, N, d_model]
-        6. Quantity loss: |sum(P) - N_structural| where N_structural = count(<bar>) + count(<nl>).
+      Sources:
+        - fire_signal (Octopus onset_1d @ 100fps): predicts α timing ONLY
+        - pitch_tokens (PitchSA @ fire positions): [B, N, P, d_pitch] pitch-bin tokens
+        - swin_2d (SwinEncoder 2D @ 12.5fps): [B, H, W, D_sw] freq×time spatial grid
 
-    forward() returns (acoustic_embs, alpha, quantity_loss).
-    align_to_seq_len() pads/truncates acoustic_embs from [B, N, D] to [B, S, D]
-    for teacher-forcing.
+      At each fire slot n:
+        - Gather Swin freq slice: swin_2d[:, :, w_n, :] → [B, H, D_sw]
+        - Use PitchSA tokens:     pitch_tokens[:, n, :, :] → [B, P, d_pitch]
+        - Project both to d_model, concat → [B, L_freq, d_model] where L_freq = P + H
+
+      Returns (acoustic_token_seqs, alpha, qty_loss):
+        acoustic_token_seqs: [B, N, L_freq, d_model]  — decoder CAs over L_freq per slot
+        alpha:               [B, T_fire] energy envelope
+        qty_loss:            scalar quantity loss
+
+    forward() returns (acoustic_token_seqs, alpha, qty_loss).
+    align_to_seq_len() maps [B, N, L, D] → [B, S, L, D] for teacher-forcing.
     """
 
     def __init__(
         self,
-        fire_signal_dim: int = 128,     # BiMamba output dim (temporal timing)
-        acoustic_dim: int = 192,         # Swin S0 output dim (pitch content, after downsample)
-        beat_dim: int = 192,             # Swin S1 output dim (beat-aware, pre-downsample)
-        d_model: int = 512,              # Final acoustic embedding dim (decoder expects)
-        threshold: float = 1.0,          # CIF fire threshold (fixed)
+        fire_signal_dim: int = 32,       # Octopus onset_1d channels (for α prediction)
+        pitch_token_dim: int = 32,        # PitchSA d_pitch (each pitch bin feature dim)
+        n_pitch: int = 128,               # number of pitch bins (Flow output dim)
+        swin_dim: int = 192,              # SwinEncoder output dim per spatial position
+        d_model: int = 512,               # Decoder d_model
+        threshold: float = 1.0,           # CIF fire threshold
         conv_kernel: int = 3,
-        cif_hidden_dim: int = 128,       # hidden dim for weight predictor Dense layer
-        target_fires: int = 128,         # Target fire count (avg structural tokens per chunk)
+        cif_hidden_dim: int = 128,
+        target_fires: int = 128,
         encoder_len: int = 3000,
-        schmitt_temp: float = 0.1,       # Soft Schmitt Trigger temperature: smaller = sharper onset gate
+        schmitt_temp: float = 0.1,
     ):
         super().__init__()
         self.fire_signal_dim = fire_signal_dim
-        self.acoustic_dim = acoustic_dim
-        self.beat_dim = beat_dim
+        self.n_pitch = n_pitch
+        self.pitch_token_dim = pitch_token_dim
+        self.swin_dim = swin_dim
         self.d_model = d_model
         self.threshold = threshold
         self.cif_hidden_dim = cif_hidden_dim
         self.schmitt_temp = schmitt_temp
 
+        # α predictor: depthwise conv + 2-layer MLP + Softplus
         padding = conv_kernel // 2
-        # Depthwise conv on fire_signal: captures local temporal context for onset detection
         self.conv = nn.Conv1d(
             fire_signal_dim, fire_signal_dim,
             kernel_size=conv_kernel,
@@ -157,172 +157,104 @@ class CIFModule(nn.Module):
             bias=False,
         )
         self.weight_norm = nn.LayerNorm(fire_signal_dim)
-        # Dense layer for weight prediction (matches original CIF design: 128 → 128 → 1)
         self.weight_dense = nn.Linear(fire_signal_dim, cif_hidden_dim)
         self.weight_proj = nn.Linear(cif_hidden_dim, 1, bias=True)
 
-        # Use PyTorch defaults: Kaiming uniform for weight, zeros for bias.
-        # Kaiming init allows weight_proj to immediately discriminate onset vs non-onset
-        # frames from BiMamba features, rather than starting uniform (zeros would push
-        # quantity loss gradient uniformly across all frames).
+        # Project pitch tokens (from PitchSA) → d_model
+        self.pitch_proj = nn.Linear(pitch_token_dim, d_model)
 
-        # === Zeng-style concatenation (no FiLM) ===
-        # Concat temporal + pitch (+ beat), then project (like Zeng line 397-400)
-        # Without S1: 128 + 192 = 320 → d_model
-        # With S1:    128 + 192 + 192 = 512 → d_model
-        self.combined_proj = nn.Linear(fire_signal_dim + acoustic_dim, d_model)  # 320 → d_model
-        self.combined_proj_with_beat = nn.Linear(
-            fire_signal_dim + acoustic_dim + beat_dim, d_model
-        )  # 512 → d_model
+        # Project Swin freq-slice tokens → d_model
+        self.swin_proj = nn.Linear(swin_dim, d_model)
+
+    def compute_fires(
+        self,
+        fire_signal: torch.Tensor,                 # [B, T_fire, D_fire] Octopus onset_1d
+        input_lengths: Optional[torch.Tensor] = None,
+        target_lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Alpha prediction + peak-detection → fire_frames (no token projection).
+
+        Separated from token assembly so PitchSA can run between compute_fires()
+        and forward(), ensuring exactly ONE pass through the learnable layers
+        (pitch_proj, swin_proj) — required for correct DDP gradient reduction.
+
+        Returns:
+          fire_frames: [B, N]      integer fire positions
+          alpha:       [B, T_fire] Softplus energy
+          qty_loss:    scalar
+        """
+        B, T_fire, _ = fire_signal.shape
+        device, dtype = fire_signal.device, fire_signal.dtype
+
+        # α prediction via depthwise conv + dense
+        context = fire_signal.permute(0, 2, 1)
+        memory  = self.conv(context)
+        x = (memory + context).permute(0, 2, 1)
+        x = F.relu(self.weight_dense(self.weight_norm(x)))
+        alpha = F.softplus(self.weight_proj(x)).squeeze(-1)  # [B, T_fire]
+
+        # Soft Schmitt Trigger + quantity loss
+        onset_prob = torch.sigmoid((alpha - self.threshold) / self.schmitt_temp)
+        if input_lengths is not None:
+            pad_mask = torch.arange(T_fire, device=device).unsqueeze(0) >= input_lengths.unsqueeze(1)
+            alpha      = alpha.masked_fill(pad_mask, 0.0)
+            onset_prob = onset_prob.masked_fill(pad_mask, 0.0)
+
+        qty_loss = torch.zeros(1, device=device, dtype=dtype).squeeze()
+        if target_lengths is not None:
+            qty_loss = (onset_prob.sum(dim=1) - target_lengths.to(dtype)).abs().mean()
+
+        # Peak-detection → fire_frames
+        fire_mask   = alpha > self.threshold
+        fire_cumsum = fire_mask.long().cumsum(dim=1)
+        N = max(int(fire_cumsum[:, -1].max().item()), 1)
+
+        slot_targets = torch.arange(1, N + 1, device=device).unsqueeze(0).expand(B, -1)
+        fire_frames  = torch.searchsorted(
+            fire_cumsum.contiguous(), slot_targets.contiguous()
+        ).clamp(max=T_fire - 1)                               # [B, N] int
+
+        return fire_frames, alpha, qty_loss
 
     def forward(
         self,
-        fire_signal: torch.Tensor,                           # [B, T_bi, D_bi] BiMamba output (timing)
-        acoustic_src: torch.Tensor,                          # [B, T_sw, D_sw] Swin S0 output (pitch)
-        acoustic_src_s1: Optional[torch.Tensor] = None,     # [B, T_s1, D_s1] Swin S1 output (beat)
-        input_lengths: Optional[torch.Tensor] = None,        # [B] valid frame counts
-        target_lengths: Optional[torch.Tensor] = None,       # [B] acoustic token counts
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute CIF acoustic embeddings and quantity loss.
+        fire_signal: torch.Tensor,                           # [B, T_fire, D_fire]
+        swin_2d: torch.Tensor,                               # [B, H_freq, W_time, D_sw]
+        fire_frames: torch.Tensor,                           # [B, N]  from compute_fires()
+        pitch_tokens: Optional[torch.Tensor] = None,         # [B, N, P, d_pitch]
+    ) -> torch.Tensor:
+        """Assemble acoustic token sequences — single pass through learnable layers.
 
-        Triple-channel design with Zeng-style concatenation (no FiLM):
-          - fire_signal (BiMamba, 100fps): predicts α + provides temporal embeddings
-          - acoustic_src (Swin S0, 12.5fps): pitch/harmonic features (integer lookup at fire positions)
-          - acoustic_src_s1 (Swin S1, 6.25fps): beat/rhythm features (integer lookup at fire positions, optional)
-          - Concat [temporal, pitch, beat] → project to d_model (like Zeng line 397-400)
-
-        Cascaded Energy-Probability design (no rescaling):
-          - α (Softplus): unbounded energy envelope; α > 1 fires the CIF
-          - P (Soft Schmitt Trigger): P = σ((α − threshold) / 0.1); quantity loss on sum(P)
-          - No rescaling of α: true energy decides fire timing; scaling would corrupt peaks
-
-        Gradient flow (FunASR-style):
-          - CE loss → combined_proj → acoustic_src/acoustic_src_s1 (encoder gets gradient) ✓
-          - CE loss -X-> acoustic_temporal (detached) -X-> α / weight_proj (blocked)
-          - CE loss -X-> fire_frames (integer indices block gradient to α)
-          - Qty loss → onset_prob → α → weight_proj → fire_signal → BiMamba ✓
-          - BiMamba receives gradients from both CE and quantity loss (co-optimization)
-
-        Args:
-            fire_signal: BiMamba output [B, T_bi, D_bi] for α prediction (100fps).
-            acoustic_src: Swin S0 output [B, T_sw, D_sw] for pitch content (12.5fps).
-            acoustic_src_s1: Swin S1 output [B, T_s1, D_s1] for beat content (6.25fps). Optional.
-            input_lengths: Valid frame count per batch item (for padding mask).
-            target_lengths: Target acoustic token count per item (for quantity loss).
+        Call compute_fires() first, then optionally PitchSA(flow_feat, fire_frames),
+        then call forward() once.  Never call forward() twice in one step.
 
         Returns:
-            acoustic_embs: [B, N_max, d_model] — one embedding per CIF fire.
-            alpha: [B, T_bi] — energy envelope (Softplus; α > 1 fires the CIF).
-            quantity_loss: scalar — mean |sum(P_onset) - N_target| over batch.
+          acoustic_token_seqs: [B, N, L_freq, d_model]  (L_freq = P + H_freq)
         """
-        B, T_bi, D_bi = fire_signal.shape
-        B_sw, T_sw, D_sw = acoustic_src.shape
-        device, dtype = fire_signal.device, fire_signal.dtype
+        B, N = fire_frames.shape
+        T_fire = fire_signal.shape[1]
+        H_freq, W_time, D_sw = swin_2d.shape[1], swin_2d.shape[2], swin_2d.shape[3]
+        device, dtype = fire_frames.device, swin_2d.dtype
 
-        assert B == B_sw, f"Batch size mismatch: fire_signal={B}, acoustic_src={B_sw}"
+        # Swin freq-slice tokens at fire positions
+        fire_w = (fire_frames.float() * W_time / T_fire).long().clamp(0, W_time - 1)
+        swin_t        = swin_2d.permute(0, 1, 3, 2)                           # [B, H, D, W]
+        fw_idx        = fire_w.unsqueeze(1).unsqueeze(2).expand(B, H_freq, D_sw, N)
+        swin_at_fires = swin_t.gather(3, fw_idx).permute(0, 3, 1, 2)         # [B, N, H, D_sw]
+        swin_tokens   = self.swin_proj(swin_at_fires)                         # [B, N, H_freq, d_model]
 
-        # ── Step 1: Predict α from fire_signal (BiMamba) ──────────────────────
-        # Cascaded Energy-Probability: α is the raw acoustic energy envelope.
-        # Softplus (instead of Sigmoid) keeps α unbounded — α > 1 fires the CIF.
-        # Gradient from qty_loss flows: onset_prob → α → weight_proj → BiMamba.
-        context = fire_signal.permute(0, 2, 1)      # [B, D_bi, T_bi]
-        memory = self.conv(context)                 # [B, D_bi, T_bi] depthwise conv with temporal context
-        x = memory + context                        # Residual connection (preserves onset features)
-        x = x.permute(0, 2, 1)                      # [B, T_bi, D_bi]
-        x = self.weight_norm(x)                     # LayerNorm for stability
-        x = self.weight_dense(x)                    # Dense layer: D_bi → cif_hidden_dim
-        x = F.relu(x)                               # Non-linearity after Dense
-        alpha = F.softplus(self.weight_proj(x)).squeeze(-1)  # [B, T_bi] α ∈ (0, ∞)
-
-        # ── Step 1.5: Onset Probability via Soft Schmitt Trigger ──────────────
-        # Fixed (no trainable weights): P = σ((α − threshold) / temperature).
-        # Small temperature forces P to strictly reflect whether α crosses threshold.
-        # Quantity loss on sum(P) drives α to form real energy peaks > threshold.
-        onset_prob = torch.sigmoid((alpha - self.threshold) / self.schmitt_temp)  # [B, T_bi]
-
-        # Mask padding frames to zero weight and zero probability
-        if input_lengths is not None:
-            pad_mask = torch.arange(T_bi, device=device).unsqueeze(0) >= input_lengths.unsqueeze(1)
-            alpha = alpha.masked_fill(pad_mask, 0.0)
-            onset_prob = onset_prob.masked_fill(pad_mask, 0.0)
-
-        # Quantity loss on onset_prob: supervises expected fire count (not α directly).
-        # sum(P) = expected number of frames where α > threshold = expected fire count.
-        qty_loss = torch.zeros(1, device=device, dtype=dtype).squeeze()
-        if target_lengths is not None:
-            N_pred = onset_prob.sum(dim=1)  # [B]
-            qty_loss = (N_pred - target_lengths.to(dtype)).abs().mean()
-
-        # ── Step 2: CIF integration — raw α, no rescaling ──────────────────────
-        # α represents true acoustic energy. Rescaling would corrupt energy peaks:
-        # e.g. forcing sum(α)=129 might inflate background noise 0.1 → 1.0 (false fires)
-        # or deflate real peaks. The Hard Reset mechanism handles count implicitly:
-        # qty_loss trains α to have enough peaks > 1.0 to reach the target count.
-        alpha_cif = alpha  # use raw energy directly
-
-        # ── Step 3: Peak-detection CIF on fire_signal ───────────────────────────
-        # Fire wherever α > threshold; each fired frame emits encoder_output[t] directly.
-        # S0 and S1 use post-fire lookup (integer index, no upsample needed).
-        acoustic_temporal = self._cif_forward(fire_signal, alpha_cif, self.threshold)  # [B, N, D_bi]
-        N = acoustic_temporal.shape[1]
-
-        # Detach acoustic_temporal to block CE → alpha gradient path
-        # CE can still train encoder (Swin/BiMamba) and combined_proj weights
-        acoustic_temporal_for_proj = acoustic_temporal
-
-        # ── Step 4: Post-fire lookup for S0 and S1 (integer index) ──────
-        # fire_frames[b, n] = frame index of the n-th fire in batch item b.
-        # New mechanism: fires at frames where α > threshold (not cumsum crossing).
-        # Use nonzero positions of fire_mask, padded to uniform shape [B, N].
-        #
-        # Integer index lookup blocks CE gradient to alpha (only qty_loss trains α).
-        fire_mask = alpha_cif > self.threshold                                       # [B, T_bi] bool
-        # cumsum gives each fired frame its 1-based slot; subtract 1 for 0-based.
-        fire_cumsum = fire_mask.long().cumsum(dim=1)                                 # [B, T_bi]
-        # For each slot n (0-based), find the first frame where cumsum == n+1.
-        # searchsorted on fire_cumsum finds that frame efficiently.
-        slot_targets = torch.arange(1, N + 1, device=device, dtype=torch.long
-                       ).unsqueeze(0).expand(B, -1)                                  # [B, N]
-        fire_frames = torch.searchsorted(
-            fire_cumsum.contiguous(), slot_targets.contiguous()
-        ).clamp(max=T_bi - 1)                                                        # [B, N] int
-
-        # S0 integer lookup (downsampled from BiMamba 100fps to S0 12.5fps)
-        T_sw = acoustic_src.shape[1]
-        D_sw = acoustic_src.shape[2]
-        fire_frames_s0 = (fire_frames.float() * T_sw / T_bi).long().clamp(0, T_sw - 1)  # [B, N] int
-        acoustic_pitch = acoustic_src.gather(
-            1, fire_frames_s0.unsqueeze(-1).expand(B, N, D_sw)
-        )  # [B, N, D_sw] — gradient flows to acoustic_src, NOT to fire_frames_s0
-
-        # ── Step 5: Zeng-style concatenation (line 397-400) ─────────────────────
-        # Concat temporal (detached) + pitch (+ beat), then project
-        # Gradient: CE → combined_proj weights ✓, CE -X-> alpha (blocked by detach)
-
-        if acoustic_src_s1 is not None:
-            # With S1: concat all three channels
-            T_s1 = acoustic_src_s1.shape[1]
-            D_s1 = acoustic_src_s1.shape[2]
-            fire_frames_s1 = (fire_frames.float() * T_s1 / T_bi).long().clamp(0, T_s1 - 1)
-            acoustic_beat = acoustic_src_s1.gather(
-                1, fire_frames_s1.unsqueeze(-1).expand(B, N, D_s1)
-            )  # [B, N, D_s1] — gradient blocked at indices
-
-            acoustic_cat = torch.cat([
-                acoustic_temporal_for_proj,  # [B, N, 128] detached
-                acoustic_pitch,              # [B, N, 192]
-                acoustic_beat,               # [B, N, 192]
-            ], dim=-1)  # [B, N, 512]
-            acoustic_embs = self.combined_proj_with_beat(acoustic_cat)  # [B, N, d_model]
+        # Pitch tokens — always pass through pitch_proj (DDP: params must participate every step)
+        if pitch_tokens is not None:
+            pitch_toks = self.pitch_proj(pitch_tokens)                         # [B, N, P, d_model]
         else:
-            # Without S1: concat temporal + pitch only
-            acoustic_cat = torch.cat([
-                acoustic_temporal_for_proj,  # [B, N, 128] detached
-                acoustic_pitch,              # [B, N, 192]
-            ], dim=-1)  # [B, N, 320]
-            acoustic_embs = self.combined_proj(acoustic_cat)  # [B, N, d_model]
+            # Zero dummy so pitch_proj gets zero gradient — safe for DDP (grad = 0, not missing)
+            dummy = torch.zeros(B, N, 1, self.pitch_token_dim, device=device, dtype=dtype)
+            pitch_toks = self.pitch_proj(dummy)                                # [B, N, 1, d_model]
 
-        return acoustic_embs, alpha, qty_loss
+        return torch.cat([pitch_toks, swin_tokens], dim=2)                    # [B, N, P+H, d_model]
+
+
+
 
     def _cif_forward(
         self,
@@ -393,35 +325,47 @@ class CIFModule(nn.Module):
 
     def align_to_seq_len(
         self,
-        acoustic_embs: torch.Tensor,  # [B, N, D]
+        acoustic_embs: torch.Tensor,  # [B, N, D] or [B, N, L, D]
         seq_len: int,
-        input_ids: Optional[torch.Tensor] = None,  # [B, S] for scatter alignment
+        input_ids: Optional[torch.Tensor] = None,  # [B, S]
     ) -> torch.Tensor:
-        """Scatter acoustic_embs [B, N, D] → [B, seq_len, D] using CIF alignment.
+        """Scatter acoustic_embs [B, N, ...] → [B, seq_len, ...] using CIF alignment.
 
-        If input_ids is provided, uses build_cif_alignment() to assign each
-        token position the correct emb index (Option B: fire-at-start-of-next-step).
+        Supports both:
+          - [B, N, D]    (legacy single-vector)
+          - [B, N, L, D] (new polyphonic freq-token sequences)
 
-        If N is too small (quantity loss not yet converged), clamps index to N-1
-        so later time steps gracefully reuse the last fire rather than crashing.
-
-        If input_ids is None, falls back to naive pad/truncate (backward compat).
+        Returns tensor of same shape except dim 1 = seq_len.
         """
-        B, N, D = acoustic_embs.shape
+        shape = acoustic_embs.shape   # [B, N, ...extra]
+        B, N = shape[0], shape[1]
+        extra = shape[2:]             # () or (L, D) or (D,)
 
         if input_ids is None:
-            # Fallback: naive pad/truncate (no structural awareness)
+            # Fallback: naive pad/truncate
             if N == seq_len:
                 return acoustic_embs
             if N < seq_len:
-                pad = torch.zeros(B, seq_len - N, D,
+                pad = torch.zeros(B, seq_len - N, *extra,
                                   device=acoustic_embs.device,
                                   dtype=acoustic_embs.dtype)
                 return torch.cat([acoustic_embs, pad], dim=1)
             return acoustic_embs[:, :seq_len]
 
-        # Scatter: each position gets the emb at its CIF pointer index
+        # Build per-token pointer into CIF fire slots
         alignment = build_cif_alignment(input_ids)          # [B, S]
         alignment = alignment.clamp(max=N - 1)              # guard if N < target
-        idx = alignment.unsqueeze(-1).expand(B, seq_len, D) # [B, S, D]
-        return acoustic_embs.gather(1, idx)                 # [B, S, D]
+
+        if acoustic_embs.dim() == 3:
+            # [B, N, D] → [B, S, D]
+            D = extra[0]
+            idx = alignment.unsqueeze(-1).expand(B, seq_len, D)
+            return acoustic_embs.gather(1, idx)             # [B, S, D]
+        elif acoustic_embs.dim() == 4:
+            # [B, N, L, D] → [B, S, L, D]
+            L, D = extra[0], extra[1]
+            idx = alignment.unsqueeze(-1).unsqueeze(-1).expand(B, seq_len, L, D)
+            return acoustic_embs.gather(1, idx)             # [B, S, L, D]
+        else:
+            raise ValueError(f"acoustic_embs must be 3D or 4D, got {acoustic_embs.dim()}D")
+

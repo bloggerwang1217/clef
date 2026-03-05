@@ -139,8 +139,9 @@ class Trainer:
             use_gc = getattr(config, 'gradient_checkpointing', False)
             self.model = DDP(
                 self.model, device_ids=[local_rank],
-                find_unused_parameters=not use_gc,
-                static_graph=use_gc,
+                find_unused_parameters=True,
+                # static_graph disabled: model has conditional branches (CIF/PitchSA)
+                # that produce different computation graphs per step.
             )
 
         # Data loaders

@@ -91,9 +91,8 @@ model:
   cif_quantity_loss_weight: 0.01    # |sum(P_onset) - N_acoustic|; gradient only trains CIF (fire_signal detached)
                                      # Loss stages: init ~100 → mid ~30 → converged ~10
                                      # Gradient: 0.03×100=3.0 → 0.03×30=0.9 → 0.03×10=0.3 (stable)
-  cif_schmitt_temp: 0.5             # Soft Schmitt Trigger temperature for onset_prob = σ((α−threshold)/temp)
-                                     # 0.5: gentle gradient across alpha range (0.3-1.5), good for training
-                                     # 0.1: sharp step function (only use after alpha peaks reach >1.0)
+  cif_schmitt_temp: 0.1             # Soft Schmitt Trigger temperature for onset_prob = σ((α−threshold)/temp)
+                                     # 0.1: sharp step function, prevents quantity loss lower-bound trap at 100fps
   cif_avg_fires: 128               # avg <bar>+<nl> per 30s chunk
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
@@ -160,8 +159,8 @@ data:
 # Training
 # =============================================================================
 training:
-  batch_size: 32
-  gradient_accumulation_steps: 1
+  batch_size: 8
+  gradient_accumulation_steps: 4
   gradient_clip: 5.0
 
   learning_rate: 2.0e-4

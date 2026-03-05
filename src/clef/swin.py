@@ -105,6 +105,10 @@ class SwinEncoder(nn.Module):
                 .permute(0, 2, 1, 3)  # [B, W, H, dim]
                 .mean(dim=2))         # [B, W, dim]
 
+    def _to_2d(self, x: torch.Tensor, H: int, W: int, dim: int) -> torch.Tensor:
+        """Reshape [B, H*W, dim] → [B, H, W, dim] (preserves freq axis)."""
+        return x.view(x.shape[0], H, W, dim)  # [B, H_freq, W_time, dim]
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward through Swin S0+S1.
 
@@ -112,8 +116,10 @@ class SwinEncoder(nn.Module):
             x: [B, T, C=128] time-major Flow output
 
         Returns:
-            feat_s0: [B, T/8, 192] S0 post-downsample (pitch/harmony)
-            feat_s1: [B, T/8, 192] S1 pre-downsample  (beat-aware, same resolution)
+            feat_s0: [B, H_freq, W_time, 192] S0 post-downsample (pitch/harmony)
+                     2D spatial — freq axis preserved for decoder polyphonic CA.
+                     H_freq = C//8 (freq patches), W_time = T//8 (time patches)
+            feat_s1: [B, H_freq, W_time, 192] S1 pre-downsample (beat-aware, same shape)
         """
         B, T, C = x.shape
 
@@ -134,11 +140,15 @@ class SwinEncoder(nn.Module):
         x = self.s0_downsample(x, (H_pe, W_pe))
         H_s0, W_s0 = (H_pe + 1) // 2, (W_pe + 1) // 2
 
-        feat_s0 = self._to_1d(x, H_s0, W_s0, self.output_dim)  # [B, T/8, 192]
+        # Store H_s0/W_s0 for CIF to compute fire_frame_swin indices
+        self.last_H_s0 = H_s0
+        self.last_W_s0 = W_s0
+
+        # Return 2D: [B, H_freq, W_time, 192]  — preserves freq axis!
+        feat_s0 = self._to_2d(x, H_s0, W_s0, self.output_dim)
 
         # S1 blocks (no downsample) → beat-aware features at same resolution
         x = self._run_blocks(x, self.s1_blocks, H_s0, W_s0)
-
-        feat_s1 = self._to_1d(x, H_s0, W_s0, self.output_dim)  # [B, T/8, 192]
+        feat_s1 = self._to_2d(x, H_s0, W_s0, self.output_dim)
 
         return feat_s0, feat_s1

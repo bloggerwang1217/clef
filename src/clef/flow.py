@@ -232,7 +232,12 @@ class Octopus2D(nn.Module):
             padding=(freq_kernel // 2, time_kernel // 2),
         )
 
-    def forward(self, mel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Learned frequency aggregation: 128 mel bins → C onset patterns
+        # Learns which mel bins contribute to each onset pattern.
+        # Semantics: like a learned mel-filterbank optimised for onset detection.
+        self.freq_pool_proj = nn.Linear(128, channels)
+
+    def forward(self, mel: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Detect cross-frequency onsets.
 
         IC harmonic neurons eat CN stellate output (= raw mel magnitude),
@@ -244,9 +249,11 @@ class Octopus2D(nn.Module):
         Returns:
             onset_level: [B, H*W, C] onset features with 2D spatial info (for Level 0)
                          H = 128 // freq_pool_stride (default 32)
-                         W = T // time_pool_stride
+                         W = T // time_pool_stride (with time_pool_stride=1 → 100fps)
             onset_raw: [B, C, 128, T] pre-pooling onset activations (reused by
                        onset_to_pitch projection to avoid recomputing conv)
+            onset_1d: [B, T, C] pure onset timing signal (learned freq aggregation).
+                      Used directly as CIF fire signal — no pitch contamination.
         """
         # Cross-frequency onset detection
         onset = F.gelu(self.conv(mel))  # [B, C, 128, T]
@@ -263,7 +270,108 @@ class Octopus2D(nn.Module):
         # Flatten spatial dims: [B, C, H, W] -> [B, H*W, C]
         onset_level = onset_pooled.permute(0, 2, 3, 1).reshape(B, H * W, C)
 
-        return onset_level, onset
+        # onset_1d: learned aggregation of 128 mel freq → C onset patterns
+        # onset: [B, C, 128, T] → mean over C → [B, 128, T] → project → [B, T, C]
+        onset_avg = onset.mean(dim=1)                             # [B, 128, T]
+        onset_1d = self.freq_pool_proj(onset_avg.permute(0, 2, 1))  # [B, T, C]
+
+        return onset_level, onset, onset_1d
+
+
+class PitchSA(nn.Module):
+    """Intra-frame self-attention across pitch bins at CIF fire positions.
+
+    At each onset (fire) position, multiple notes sound simultaneously (polyphonic).
+    Standard CIF collapses these into one vector, making decoder CA meaningless.
+    PitchSA keeps the frequency axis intact: each pitch bin gets a d_pitch-dim
+    feature vector, and they attend to each other within the same time frame.
+
+    This runs ONLY at fire positions (not all T frames) to keep cost manageable.
+    e.g. T=3000 frames but only N~128 fires → 128 × (128×128) attention ops.
+
+    Architecture:
+        1. Embed scalar pitch activations → d_pitch feature vectors
+        2. Add pitch positional embedding (which semitone am I?)
+        3. Multi-head SA over 128 pitch positions within each fire frame
+        4. Output: [B, N_fires, 128, d_pitch] — 128 pitch tokens per fire slot
+
+    Decoder CA can then:
+        Q = tgt hidden state  (e.g. "I just generated C4")
+        K/V = 128 pitch tokens at fire_n  (C4 has high activation, G4 has high too)
+        → attend to the specific note being transcribed
+    """
+
+    def __init__(
+        self,
+        n_pitch: int = 128,     # number of pitch bins (mel bins from Flow)
+        d_pitch: int = 32,      # feature dim per pitch token
+        n_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n_pitch = n_pitch
+        self.d_pitch = d_pitch
+
+        # Embed scalar pitch activations → d_pitch vectors
+        # Each pitch bin (a scalar energy value) gets projected to a feature vector.
+        self.pitch_embed = nn.Linear(1, d_pitch)
+
+        # Learnable pitch positional embedding (which of the 128 pitch bins am I?)
+        self.pitch_pos_embed = nn.Embedding(n_pitch, d_pitch)
+
+        # Self-attention within a single time frame (128 pitch bins attend each other)
+        self.sa = nn.MultiheadAttention(
+            d_pitch, n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(d_pitch)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        flow_feat: torch.Tensor,   # [B, T, n_pitch] pitch activations (Flow output)
+        fire_frames: torch.Tensor, # [B, N] int64, frame indices of CIF fires
+    ) -> torch.Tensor:
+        """Compute pitch token sequences at each fire position.
+
+        Args:
+            flow_feat:   [B, T, n_pitch] per-frame pitch activations from Flow
+            fire_frames: [B, N] integer frame indices where CIF fires
+
+        Returns:
+            pitch_tokens: [B, N, n_pitch, d_pitch]
+                          For each fire slot n, a sequence of n_pitch pitch tokens.
+                          Decoder CAs over the n_pitch tokens to find its note.
+        """
+        B, T, P = flow_feat.shape
+        N = fire_frames.shape[1]
+        device = flow_feat.device
+
+        # ── Step 1: Gather pitch activations at fire frames ──────────────────────
+        # fire_idx expanded: [B, N, P]
+        idx = fire_frames.unsqueeze(-1).expand(B, N, P)  # [B, N, P]
+        fire_pitch = flow_feat.gather(1, idx)             # [B, N, P] scalar per pitch
+
+        # ── Step 2: Embed scalars → d_pitch feature vectors ──────────────────────
+        # [B, N, P, 1] → Linear(1, d_pitch) → [B, N, P, d_pitch]
+        x = self.pitch_embed(fire_pitch.unsqueeze(-1))    # [B, N, P, d_pitch]
+
+        # ── Step 3: Add pitch positional embedding ────────────────────────────────
+        pos = torch.arange(P, device=device)              # [P]
+        pos_emb = self.pitch_pos_embed(pos)               # [P, d_pitch]
+        x = x + pos_emb.unsqueeze(0).unsqueeze(0)        # broadcast [B, N, P, d_pitch]
+
+        # ── Step 4: Self-attention over P pitch bins (within each fire frame) ─────
+        # Flatten [B, N, P, d_pitch] → [B*N, P, d_pitch] for batch SA
+        BN = B * N
+        x_flat = x.view(BN, P, self.d_pitch)             # [B*N, P, d_pitch]
+        sa_out, _ = self.sa(x_flat, x_flat, x_flat)      # [B*N, P, d_pitch]
+        x_flat = self.norm(x_flat + self.dropout(sa_out)) # residual + norm
+
+        # ── Step 5: Reshape back ─────────────────────────────────────────────────
+        pitch_tokens = x_flat.view(B, N, P, self.d_pitch) # [B, N, P, d_pitch]
+        return pitch_tokens
 
 
 class TemporalCNN(nn.Module):

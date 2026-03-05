@@ -28,7 +28,7 @@ from .config import ClefPianoConfig
 from ..bimamba import BiMambaEncoder
 from ..bridge import MultiScaleBridge
 from ..decoder import ClefDecoder
-from ..flow import HarmonizingFlow, Octopus2D
+from ..flow import HarmonizingFlow, Octopus2D, PitchSA
 
 
 class ClefPianoTiny(nn.Module):
@@ -73,15 +73,23 @@ class ClefPianoTiny(nn.Module):
             init=getattr(config, 'flow_init', 'log'),
         )
 
-        # === BiMamba Encoder (temporal timing for CIF) ===
-        # Learns onset timing from Flow features [B, 3000, 128] @ 100fps
-        # Output: fire_signal [B, 3000, 128] for CIF alpha prediction
+        # === BiMamba Encoder (temporal timing for CIF, on Flow+Onset) ===
         from ..bimamba import BiMambaEncoder
         self.bimamba_encoder = BiMambaEncoder(
             d_model=config.n_mels,  # 128 (Flow dim, no projection needed)
             d_state=getattr(config, 'bimamba_d_state', 128),
             d_conv=getattr(config, 'bimamba_d_conv', 4),
             num_layers=getattr(config, 'bimamba_num_layers', 1),
+            dropout=getattr(config, 'bimamba_dropout', 0.1),
+        )
+
+        # === PitchSA: intra-frame SA at fire positions for polyphonic retrieval ===
+        # Gives 128 pitch-bin tokens per fire slot; decoder CAs over them.
+        pitch_sa_dim = getattr(config, 'pitch_sa_dim', 32)
+        self.pitch_sa = PitchSA(
+            n_pitch=config.n_mels,          # 128 pitch bins (Flow output dim)
+            d_pitch=pitch_sa_dim,            # feature dim per pitch token
+            n_heads=getattr(config, 'pitch_sa_heads', 4),
             dropout=getattr(config, 'bimamba_dropout', 0.1),
         )
 
@@ -114,45 +122,44 @@ class ClefPianoTiny(nn.Module):
             input_dims=input_dims,  # Specify actual input dimensions
         )
 
-        # === CIF input dimensions (not bridge levels, but needed for decoder init) ===
-        swin_s0_dim = 192  # Swin S0 output channels (post-downsample)
-        swin_s1_dim = 192  # Swin S1 output channels (pre-downsample, beat-aware @ same resolution)
-        bimamba_dim = config.n_mels  # 128 (no projection)
+        # === CIF dimensions (v3 polyphonic architecture) ===
+        # fire_signal: Octopus onset_1d [B, T, 32]
+        # acoustic_src: Swin 2D [B, H_freq, W_time, 192]
+        # pitch_tokens: PitchSA [B, N, 128, d_pitch] at fire positions
+        octopus_channels_val = getattr(config, 'octopus_channels', 32)
+        pitch_sa_dim_val = getattr(config, 'pitch_sa_dim', 32)
+        swin_out_dim = 192  # Swin output dim per spatial position
 
-        # === Decoder: 2 layers (SA+CA + Mamba) ===
         self.decoder = ClefDecoder(
             d_model=config.d_model,
             n_heads=config.n_heads,
-            n_layers=config.decoder_layers,  # 2 (legacy fallback, ignored)
-            n_levels=config.n_levels,  # 3
+            n_layers=config.decoder_layers,
+            n_levels=config.n_levels,
             ff_dim=config.ff_dim,
             dropout=config.dropout,
             rope_base=config.rope_base,
-            # Window CA params
             window_time_frames=config.window_time_frames,
             window_freq_bins=config.window_freq_bins,
             window_seq_chunk_size=getattr(config, 'window_seq_chunk_size', 10000),
             window_ca_use_checkpoint=getattr(config, 'window_ca_use_checkpoint', True),
-            # Layer config (CRITICAL: correct parameter names!)
-            decoder_layer_types=config.decoder_layer_types,  # ✅ decoder_layer_types not layer_types
-            decoder_layer_ca_levels=config.decoder_layer_ca_levels,  # ✅ decoder_layer_ca_levels
+            decoder_layer_types=config.decoder_layer_types,
+            decoder_layer_ca_levels=config.decoder_layer_ca_levels,
             decoder_layer_full_freq=getattr(config, 'decoder_layer_full_freq', None),
             decoder_layer_cascade_com=getattr(config, 'decoder_layer_cascade_com', None),
-            # Mamba config
             d_state=config.mamba_d_state,
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
-            # Position encoding
             use_rope=True,
-            # bar_token_id: still needed for bar_mask derivation in decoder.forward()
             bar_token_id=getattr(config, 'bar_token_id', None),
-            onset_1d_channels=getattr(config, 'octopus_channels', 32),
-            # CIF (decoupled fire_signal and acoustic_src)
+            onset_1d_channels=octopus_channels_val,
             use_cif=getattr(config, 'use_cif', False),
-            cif_fire_signal_dim=bimamba_dim,    # 128 (BiMamba output for α prediction)
-            cif_acoustic_dim=swin_s0_dim,       # 192 (Swin S0 output for pitch content)
-            cif_acoustic_s1_dim=swin_s1_dim,    # 384 (Swin S1 output for beat content)
-            cif_d_model=config.d_model,         # decoder d_model
+            # CIF fire signal = BiMamba (temporal context in Pitch Space, tied to n_mels)
+            cif_fire_signal_dim=config.n_mels,
+            # CIF acoustic = Swin 2D tokens (freq slices) + PitchSA tokens
+            # The actual token dim is d_model (after projection in CIFModule)
+            cif_acoustic_dim=swin_out_dim,      # kept for compat; CIFModule uses swin_dim
+            cif_acoustic_s1_dim=0,              # not used (Swin 2D replaces S1 separate path)
+            cif_d_model=config.d_model,
             cif_threshold=getattr(config, 'cif_threshold', 1.0),
             cif_conv_kernel=getattr(config, 'cif_conv_kernel', 1),
             cif_target_fires=getattr(config, 'cif_avg_fires', 128),
@@ -207,13 +214,14 @@ class ClefPianoTiny(nn.Module):
         spatial_shapes_list = []
         valid_ratios_list = []
 
-        # === Step 1: Octopus2D (onset detection) ===
-        onset_level, onset_raw = self.octopus(mel)
-        # onset_level: [B, H*W, C] where H=32, W=T//2
-        # onset_raw: [B, C, 128, T]
+        # === Step 1: Octopus2D (onset detection) → onset_1d for CIF fire signal ===
+        onset_level, onset_raw, onset_1d = self.octopus(mel)
+        # onset_level: [B, H*W, C]  for Bridge Level 0
+        # onset_raw:   [B, C, 128, T]
+        # onset_1d:    [B, T, C=32]  pure onset signal (CIF fire signal)
 
         freq_pool = getattr(self.config, 'octopus_freq_pool_stride', 4)
-        time_pool = getattr(self.config, 'octopus_time_pool_stride', 2)
+        time_pool = getattr(self.config, 'octopus_time_pool_stride', 1)  # 1 = 100fps
         H_onset = 128 // freq_pool  # 32
         W_onset = T // time_pool
 
@@ -249,7 +257,6 @@ class ClefPianoTiny(nn.Module):
         valid_ratios_list.append([1.0, 1.0])
 
         # === Bridge fusion (Octopus + Flow only) ===
-        # Convert valid ratios to tensor
         n_levels_actual = len(features)  # 2: Octopus + Flow
         level_valid_ratios = torch.tensor(
             valid_ratios_list,
@@ -257,30 +264,29 @@ class ClefPianoTiny(nn.Module):
             dtype=torch.float32
         ).unsqueeze(0).expand(B, -1, -1)  # [B, n_levels, 2]
 
-        # Bridge will handle projection and concatenation
         memory, spatial_shapes, level_start_index, valid_ratios = self.bridge(
             features, spatial_shapes_list, level_valid_ratios
         )
 
-        # === Step 3: Parallel CIF paths (outside bridge) ===
-        # BiMamba: learns onset timing (fire_signal)
-        # Swin S0: extracts pitch content (acoustic_src)
+        # === Step 3: CIF sources ===
+        # onset_1d [B, T, 32] = CIF fire signal (from Octopus, already computed above)
 
-        # Step 3a: BiMamba Encoder (fire_signal for CIF alpha prediction)
-        # flow_with_onset: [B, T_flow, 128] @ 100fps
-        feat_bimamba = self.bimamba_encoder(flow_with_onset)
-        # feat_bimamba: [B, T_flow, 128] — temporal timing signal
+        # Step 3a: BiMamba Encoder — kept as acoustic context (not fire signal)
+        # (Still useful for pitch temporal context, gradient flows to encoder)
+        feat_bimamba = self.bimamba_encoder(flow_with_onset)  # [B, T_flow, 128]
 
-        # Step 3b: SwinEncoder (S0+S1) — acoustic content for CIF
+        # Step 3b: SwinEncoder: returns 2D spatial [B, H_freq, W_time, 192]
         feat_swin_s0, feat_swin_s1 = self.swin(flow_with_onset)
-        # feat_swin_s0: [B, T/8,  192] pitch/harmony features @ 12.5fps
-        # feat_swin_s1: [B, T/16, 384] beat/rhythm features   @  6.25fps
+        # feat_swin_s0: [B, H_freq, W_time, 192]  2D spatial (freq×time)
+        # feat_swin_s1: [B, H_freq, W_time, 192]  2D spatial (beat-aware)
+        # Use S0 as swin_2d for CIF (S1 can be added later for multi-source)
+        swin_2d = feat_swin_s0  # [B, H_freq, W_time, 192]
 
-        # Return CIF sources explicitly (separate from bridge memory)
-        # feat_bimamba:  [B, T,    128] fire signal (timing) @ 100fps
-        # feat_swin_s0:  [B, T/8,  192] pitch content @ 12.5fps
-        # feat_swin_s1:  [B, T/16, 384] beat content  @ 6.25fps
-        return memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, feat_swin_s0, feat_swin_s1
+        # Return all sources:
+        # feat_bimamba: CIF fire signal (has full temporal sequence context)
+        # swin_2d:  Swin 2D for CIF freq slice lookup
+        # flow_with_onset: needed by PitchSA in forward() (after fire frames known)
+        return memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, swin_2d, flow_with_onset
 
     def forward(
         self,
@@ -313,7 +319,7 @@ class ClefPianoTiny(nn.Module):
             total_loss: Same as loss (for compatibility)
         """
         # Encode
-        memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, feat_swin_s0, feat_swin_s1 = self.encode(mel)
+        memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, swin_2d, flow_with_onset = self.encode(mel)
 
         # Embed tokens
         tgt = self.token_embed(input_ids)  # [B, S] → [B, S, D]
@@ -325,9 +331,11 @@ class ClefPianoTiny(nn.Module):
             level_start_index,
             valid_ratios,
             input_ids=input_ids,
-            fire_signal=feat_bimamba,
-            acoustic_src=feat_swin_s0,
-            acoustic_src_s1=feat_swin_s1,
+            fire_signal=feat_bimamba,      # BiMamba [B,T_flow,128] — temporal context
+            acoustic_src=swin_2d,          # Swin 2D [B,H,W,192] — freq slices for CA
+            acoustic_src_s1=None,          # not used (Swin 2D carries both)
+            flow_feat=flow_with_onset,     # [B, T_flow, 128] for PitchSA
+            pitch_sa_module=self.pitch_sa, # PitchSA module — called at fire positions
         )
         logits = self.output_projection(decoder_out)
 
