@@ -157,7 +157,7 @@ class ClefPianoTiny(nn.Module):
             cif_conv_kernel=getattr(config, 'cif_conv_kernel', 1),
             cif_target_fires=getattr(config, 'cif_avg_fires', 128),
             cif_encoder_len=getattr(config, 'chunk_frames', 3000),
-            cif_use_dynamic_threshold=getattr(config, 'cif_use_dynamic_threshold', True),
+            cif_schmitt_temp=getattr(config, 'cif_schmitt_temp', 0.1),
         )
 
 
@@ -354,10 +354,15 @@ class ClefPianoTiny(nn.Module):
         # CIF quantity loss: drives Σα → N_acoustic
         total_loss = loss
         cif_qty_loss = getattr(self.decoder, '_cif_quantity_loss', None)
-        if cif_qty_loss is not None and loss is not None and self.training:
+        if cif_qty_loss is not None and loss is not None:
             cif_weight = getattr(self.config, 'cif_quantity_loss_weight', 0.0)
-            if cif_weight > 0.0:
+            if cif_weight > 0.0 and self.training:
+                # Only add to total_loss during training
                 total_loss = loss + cif_weight * cif_qty_loss
+
+        # Store cif_qty_loss for validation logging (even if not added to total_loss)
+        # This allows monitoring Σα convergence during validation
+        self._cif_qty_loss = cif_qty_loss if cif_qty_loss is not None else torch.tensor(0.0, device=loss.device if loss is not None else 'cpu')
 
         return logits, loss, total_loss
 

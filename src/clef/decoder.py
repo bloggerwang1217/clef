@@ -1417,10 +1417,11 @@ class ClefDecoder(nn.Module):
         cif_acoustic_s1_dim: int = 384,          # Swin S1 output dim (beat content)
         cif_d_model: int = 512,                  # Final acoustic embedding dim (decoder d_model)
         cif_threshold: float = 1.0,              # CIF fire threshold (base, overridden by dynamic)
-        cif_conv_kernel: int = 1,                # depthwise conv kernel for weight predictor
+        cif_conv_kernel: int = 3,                # depthwise conv kernel for weight predictor
+        cif_hidden_dim: int = 128,               # hidden dim for weight predictor Dense layer
         cif_target_fires: int = 128,             # Target fire count (avg structural tokens per chunk)
         cif_encoder_len: int = 3000,             # Encoder length (used for weight_proj bias init)
-        cif_use_dynamic_threshold: bool = True,  # Paraformer dynamic threshold: β = Σα / ⌈Σα⌉
+        cif_schmitt_temp: float = 0.1,           # Soft Schmitt Trigger temperature for onset_prob
     ):
         super().__init__()
 
@@ -1458,9 +1459,10 @@ class ClefDecoder(nn.Module):
                     d_model=cif_d_model,                    # Final embedding dim
                     threshold=cif_threshold,
                     conv_kernel=cif_conv_kernel,
+                    cif_hidden_dim=cif_hidden_dim,         # hidden dim for Dense layer
                     target_fires=cif_target_fires,
                     encoder_len=cif_encoder_len,
-                    use_dynamic_threshold=cif_use_dynamic_threshold,
+                    schmitt_temp=cif_schmitt_temp,
                 )
             else:
                 self.bar_mamba = BarMamba(

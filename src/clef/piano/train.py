@@ -604,6 +604,10 @@ class Trainer:
                             log_dict['train/cif_sum_alpha'] = cif_sum_alpha
                         if cif_target is not None:
                             log_dict['train/cif_target'] = cif_target
+                        # Log CIF bias to monitor training progress
+                        if decoder.cif is not None:
+                            cif_bias = decoder.cif.weight_proj.bias.item()
+                            log_dict['train/cif_bias'] = cif_bias
                     log_dict['train/tf_ratio'] = current_tf_ratio
 
                     if len(last_lrs) > 1:
@@ -632,6 +636,15 @@ class Trainer:
                         logger.info(f'Step {self.global_step}: valid_loss={valid_metrics["valid_loss"]:.4f}')
                         if self.use_wandb:
                             valid_log = {'valid/loss': valid_metrics['valid_loss']}
+                            # Add quantity loss if available
+                            if 'quantity_loss' in valid_metrics:
+                                valid_log['valid/quantity_loss'] = valid_metrics['quantity_loss']
+                            # Add CIF bias
+                            decoder = getattr(self.model.module if hasattr(self.model, 'module')
+                                              else self.model, 'decoder', None)
+                            if decoder is not None and decoder.cif is not None:
+                                cif_bias = decoder.cif.weight_proj.bias.item()
+                                valid_log['valid/cif_bias'] = cif_bias
                             for k in ('loss_pitch', 'loss_duration', 'loss_struct', 'loss_schema'):
                                 if k in valid_metrics:
                                     valid_log[f'valid/{k}'] = valid_metrics[k]
@@ -651,6 +664,7 @@ class Trainer:
         self.model.eval()
 
         total_loss = 0.0
+        total_qty_loss = 0.0  # CIF quantity loss accumulator
         num_batches = 0
         # Accumulators for per-type loss breakdown
         type_loss_sums = {'loss_pitch': 0.0, 'loss_duration': 0.0, 'loss_struct': 0.0, 'loss_schema': 0.0}
@@ -687,6 +701,12 @@ class Trainer:
             total_loss += ce_loss.item()
             num_batches += 1
 
+            # Accumulate CIF quantity loss (if available)
+            model_unwrapped = self.model.module if isinstance(self.model, DDP) else self.model
+            cif_qty_loss = getattr(model_unwrapped, '_cif_qty_loss', None)
+            if cif_qty_loss is not None:
+                total_qty_loss += cif_qty_loss.item()
+
             # Accumulate per-type losses
             breakdown = self._compute_loss_breakdown(logits, labels)
             for k, v in breakdown.items():
@@ -694,8 +714,9 @@ class Trainer:
                 type_loss_counts[k] += 1
 
         avg_loss = total_loss / max(num_batches, 1)
+        avg_qty_loss = total_qty_loss / max(num_batches, 1)
 
-        result = {'valid_loss': avg_loss}
+        result = {'valid_loss': avg_loss, 'quantity_loss': avg_qty_loss}
         for k in type_loss_sums:
             if type_loss_counts[k] > 0:
                 result[k] = type_loss_sums[k] / type_loss_counts[k]

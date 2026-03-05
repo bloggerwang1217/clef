@@ -66,7 +66,8 @@ class ClefPianoConfig(ClefConfig):
     cif_threshold: float = 1.0         # fire threshold (standard = 1.0)
     cif_conv_kernel: int = 3           # depthwise conv kernel for weight predictor
     cif_active_level: int = 2          # memory level index to extract encoder_1d (BiMamba)
-    cif_quantity_loss_weight: float = 0.0  # weight for |Σα - N_acoustic| loss
+    cif_quantity_loss_weight: float = 0.0  # weight for |sum(P_onset) - N_acoustic| loss
+    cif_schmitt_temp: float = 0.1          # Soft Schmitt Trigger temperature; smaller = sharper onset gate
 
     # Gradient checkpointing (trades compute for memory)
     gradient_checkpointing: bool = False
@@ -234,6 +235,7 @@ class ClefPianoConfig(ClefConfig):
             cif_conv_kernel=model_cfg.get("cif_conv_kernel", defaults.cif_conv_kernel),
             cif_active_level=model_cfg.get("cif_active_level", defaults.cif_active_level),
             cif_quantity_loss_weight=model_cfg.get("cif_quantity_loss_weight", defaults.cif_quantity_loss_weight),
+            cif_schmitt_temp=model_cfg.get("cif_schmitt_temp", defaults.cif_schmitt_temp),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),

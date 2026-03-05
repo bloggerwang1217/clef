@@ -8,14 +8,20 @@ References:
     Dong & Xu 2020, "CIF: Continuous Integrate-and-Fire for End-to-End
     Speech Recognition", ICASSP 2020.
 
-Design:
-    Weight predictor:
-        DepthwiseConv1d(kernel=3, groups=d_model) → LayerNorm → Linear(d_model, 1) → Sigmoid
-        Each frame outputs α ∈ (0, 1) = "how much of a token's info does this frame carry"
+Design (Cascaded Energy-Probability Architecture):
+    Layer 1 — Energy Envelope (α):
+        DepthwiseConv1d(kernel=3, groups=d_model) → LayerNorm → Linear(d_model, 1) → Softplus
+        Softplus produces α ∈ (0, ∞): unbounded acoustic energy per frame.
+        α > threshold fires the CIF; α < threshold stays silent.
 
-    CIF integration:
-        Accumulate α * h_t. When accumulator ≥ threshold=1.0, fire and emit
-        one acoustic embedding. Remainder carries over to the next integration.
+    Layer 2 — Onset Probability (P) via Soft Schmitt Trigger:
+        P = σ((α − threshold) / temperature)  — fixed, no trainable weights.
+        Small temperature (0.1) forces P to strictly reflect whether α crosses threshold.
+        Quantity loss supervises sum(P) ≈ N_target, driving α to form real peaks.
+
+    CIF integration (Hard Reset, no rescaling):
+        Accumulate α * h_t. When accumulator ≥ threshold=1.0, fire and reset to 0.
+        No rescaling: α represents true acoustic energy; rescaling would corrupt peaks.
 
     Training: batch mode (all frames available, teacher-forcing)
     Inference: run once on full encoder output → cache acoustic_embs → AR decodes sequentially
@@ -101,16 +107,18 @@ class CIFModule(nn.Module):
 
     Architecture:
         1. Weight predictor (from fire_signal):
-               α = sigmoid(Linear(LayerNorm(DepthwiseConv1d(fire_signal))))  # α ∈ (0, 1)
-        2. Dual-channel CIF integration:
-               acoustic_temporal = CIF(fire_signal, α)  # [B, N, 128] duration/timing
-               acoustic_pitch = CIF(acoustic_src↑8x, α)  # [B, N, 192] pitch/harmonic
-        3. Concatenation:
+               α = softplus(Linear(ReLU(Linear(LayerNorm(DepthwiseConv1d(fire_signal))))))  # α ∈ (0, ∞)
+        2. Onset probability via Soft Schmitt Trigger (no trainable weights):
+               P = σ((α − threshold) / temperature)  # P ∈ (0, 1)
+        3. Dual-channel CIF integration (raw α, peak-detection, no accumulation):
+               acoustic_temporal = CIF(fire_signal, α)  # [B, N, D_bi] fires at α > threshold
+               acoustic_pitch = lookup(acoustic_src, fire_frames)  # [B, N, 192] S0 at fire positions
+        4. Concatenation:
                acoustic_cat = [acoustic_temporal, acoustic_pitch]  # [B, N, 320]
                (if S1 exists: [temporal, pitch, beat] → [B, N, 512])
-        4. Project to d_model:
+        5. Project to d_model:
                out = Linear(concat_dim → d_model)(acoustic_cat)  # [B, N, d_model]
-        5. Quantity loss: |Σα - N_structural| where N_structural = count(<bar>) + count(<nl>).
+        6. Quantity loss: |sum(P) - N_structural| where N_structural = count(<bar>) + count(<nl>).
 
     forward() returns (acoustic_embs, alpha, quantity_loss).
     align_to_seq_len() pads/truncates acoustic_embs from [B, N, D] to [B, S, D]
@@ -123,11 +131,12 @@ class CIFModule(nn.Module):
         acoustic_dim: int = 192,         # Swin S0 output dim (pitch content, after downsample)
         beat_dim: int = 192,             # Swin S1 output dim (beat-aware, pre-downsample)
         d_model: int = 512,              # Final acoustic embedding dim (decoder expects)
-        threshold: float = 1.0,          # Base threshold (overridden by dynamic if enabled)
-        conv_kernel: int = 1,
+        threshold: float = 1.0,          # CIF fire threshold (fixed)
+        conv_kernel: int = 3,
+        cif_hidden_dim: int = 128,       # hidden dim for weight predictor Dense layer
         target_fires: int = 128,         # Target fire count (avg structural tokens per chunk)
         encoder_len: int = 3000,
-        use_dynamic_threshold: bool = True,  # Paraformer dynamic threshold: β = Σα / ⌈Σα⌉
+        schmitt_temp: float = 0.1,       # Soft Schmitt Trigger temperature: smaller = sharper onset gate
     ):
         super().__init__()
         self.fire_signal_dim = fire_signal_dim
@@ -135,7 +144,8 @@ class CIFModule(nn.Module):
         self.beat_dim = beat_dim
         self.d_model = d_model
         self.threshold = threshold
-        self.use_dynamic_threshold = use_dynamic_threshold
+        self.cif_hidden_dim = cif_hidden_dim
+        self.schmitt_temp = schmitt_temp
 
         padding = conv_kernel // 2
         # Depthwise conv on fire_signal: captures local temporal context for onset detection
@@ -147,7 +157,9 @@ class CIFModule(nn.Module):
             bias=False,
         )
         self.weight_norm = nn.LayerNorm(fire_signal_dim)
-        self.weight_proj = nn.Linear(fire_signal_dim, 1, bias=True)
+        # Dense layer for weight prediction (matches original CIF design: 128 → 128 → 1)
+        self.weight_dense = nn.Linear(fire_signal_dim, cif_hidden_dim)
+        self.weight_proj = nn.Linear(cif_hidden_dim, 1, bias=True)
 
         # Use PyTorch defaults: Kaiming uniform for weight, zeros for bias.
         # Kaiming init allows weight_proj to immediately discriminate onset vs non-onset
@@ -179,11 +191,17 @@ class CIFModule(nn.Module):
           - acoustic_src_s1 (Swin S1, 6.25fps): beat/rhythm features (integer lookup at fire positions, optional)
           - Concat [temporal, pitch, beat] → project to d_model (like Zeng line 397-400)
 
-        Gradient flow:
+        Cascaded Energy-Probability design (no rescaling):
+          - α (Softplus): unbounded energy envelope; α > 1 fires the CIF
+          - P (Soft Schmitt Trigger): P = σ((α − threshold) / 0.1); quantity loss on sum(P)
+          - No rescaling of α: true energy decides fire timing; scaling would corrupt peaks
+
+        Gradient flow (FunASR-style):
           - CE loss → combined_proj → acoustic_src/acoustic_src_s1 (encoder gets gradient) ✓
           - CE loss -X-> acoustic_temporal (detached) -X-> α / weight_proj (blocked)
           - CE loss -X-> fire_frames (integer indices block gradient to α)
-          - Only qty_loss supervises α / weight_proj (decoupled training)
+          - Qty loss → onset_prob → α → weight_proj → fire_signal → BiMamba ✓
+          - BiMamba receives gradients from both CE and quantity loss (co-optimization)
 
         Args:
             fire_signal: BiMamba output [B, T_bi, D_bi] for α prediction (100fps).
@@ -194,8 +212,8 @@ class CIFModule(nn.Module):
 
         Returns:
             acoustic_embs: [B, N_max, d_model] — one embedding per CIF fire.
-            alpha: [B, T_bi] — frame weight sequence (Σα ≈ N_acoustic).
-            quantity_loss: scalar — mean |Σα - N_target| over batch.
+            alpha: [B, T_bi] — energy envelope (Softplus; α > 1 fires the CIF).
+            quantity_loss: scalar — mean |sum(P_onset) - N_target| over batch.
         """
         B, T_bi, D_bi = fire_signal.shape
         B_sw, T_sw, D_sw = acoustic_src.shape
@@ -204,81 +222,70 @@ class CIFModule(nn.Module):
         assert B == B_sw, f"Batch size mismatch: fire_signal={B}, acoustic_src={B_sw}"
 
         # ── Step 1: Predict α from fire_signal (BiMamba) ──────────────────────
-        x = fire_signal.permute(0, 2, 1)   # [B, D_bi, T_bi]
-        x = self.conv(x)                   # [B, D_bi, T_bi] depthwise local context
-        x = x.permute(0, 2, 1)             # [B, T_bi, D_bi]
-        x = self.weight_norm(x)
-        # Simple sigmoid: alpha ∈ (0, 1). CIF fires when cumulative alpha reaches threshold=1.0.
-        alpha = torch.sigmoid(self.weight_proj(x)).squeeze(-1)  # [B, T_bi]
+        # Cascaded Energy-Probability: α is the raw acoustic energy envelope.
+        # Softplus (instead of Sigmoid) keeps α unbounded — α > 1 fires the CIF.
+        # Gradient from qty_loss flows: onset_prob → α → weight_proj → BiMamba.
+        context = fire_signal.permute(0, 2, 1)      # [B, D_bi, T_bi]
+        memory = self.conv(context)                 # [B, D_bi, T_bi] depthwise conv with temporal context
+        x = memory + context                        # Residual connection (preserves onset features)
+        x = x.permute(0, 2, 1)                      # [B, T_bi, D_bi]
+        x = self.weight_norm(x)                     # LayerNorm for stability
+        x = self.weight_dense(x)                    # Dense layer: D_bi → cif_hidden_dim
+        x = F.relu(x)                               # Non-linearity after Dense
+        alpha = F.softplus(self.weight_proj(x)).squeeze(-1)  # [B, T_bi] α ∈ (0, ∞)
 
-        # Mask padding frames to zero weight
+        # ── Step 1.5: Onset Probability via Soft Schmitt Trigger ──────────────
+        # Fixed (no trainable weights): P = σ((α − threshold) / temperature).
+        # Small temperature forces P to strictly reflect whether α crosses threshold.
+        # Quantity loss on sum(P) drives α to form real energy peaks > threshold.
+        onset_prob = torch.sigmoid((alpha - self.threshold) / self.schmitt_temp)  # [B, T_bi]
+
+        # Mask padding frames to zero weight and zero probability
         if input_lengths is not None:
             pad_mask = torch.arange(T_bi, device=device).unsqueeze(0) >= input_lengths.unsqueeze(1)
             alpha = alpha.masked_fill(pad_mask, 0.0)
+            onset_prob = onset_prob.masked_fill(pad_mask, 0.0)
 
-        # Quantity loss on raw α (before scaling) — supervises the raw prediction
-        # so that Σα ≈ target at inference (where no scaling is applied).
+        # Quantity loss on onset_prob: supervises expected fire count (not α directly).
+        # sum(P) = expected number of frames where α > threshold = expected fire count.
         qty_loss = torch.zeros(1, device=device, dtype=dtype).squeeze()
         if target_lengths is not None:
-            qty_loss = self.compute_quantity_loss(alpha, target_lengths.to(dtype))
+            N_pred = onset_prob.sum(dim=1)  # [B]
+            qty_loss = (N_pred - target_lengths.to(dtype)).abs().mean()
 
-        # ── Step 2: Scaling strategy ────────────────────────────────────────────
-        #   Training: scale α' = α * (target / Σα) so CIF fires exactly target times.
-        #   Inference: use raw α; CIF fires round(Σα) times.
-        if self.training and target_lengths is not None:
-            sum_alpha = alpha.sum(dim=1, keepdim=True).clamp(min=1e-8)  # [B, 1]
-            alpha_cif = alpha * (target_lengths.unsqueeze(1).to(dtype) / sum_alpha)
-        else:
-            alpha_cif = alpha
+        # ── Step 2: CIF integration — raw α, no rescaling ──────────────────────
+        # α represents true acoustic energy. Rescaling would corrupt energy peaks:
+        # e.g. forcing sum(α)=129 might inflate background noise 0.1 → 1.0 (false fires)
+        # or deflate real peaks. The Hard Reset mechanism handles count implicitly:
+        # qty_loss trains α to have enough peaks > 1.0 to reach the target count.
+        alpha_cif = alpha  # use raw energy directly
 
-        # ── Step 2.5: Dynamic threshold (Paraformer) ─────────────────────────────
-        # β = Σα / ⌈Σα⌉ reduces training/inference mismatch without changing alpha.
-        if self.use_dynamic_threshold:
-            sum_alpha_cif = alpha_cif.sum(dim=1)  # [B]
-            # ⌈Σα⌉ per batch sample (detach to avoid gradient through ceil)
-            ceil_sum = torch.ceil(sum_alpha_cif).clamp(min=1.0).detach()
-            # β = Σα / ⌈Σα⌉ (gradient flows through sum_alpha_cif, not ceil_sum)
-            beta = (sum_alpha_cif / ceil_sum).unsqueeze(1)  # [B, 1]
-            threshold_cif = beta  # dynamic threshold per sample
-        else:
-            threshold_cif = torch.full((B, 1), self.threshold, device=device, dtype=dtype)
-
-        # ── Step 3: CIF integration on fire_signal only ─────────────────────────
-        # Only fire_signal goes through CIF integration — it determines fire positions.
-        # S0 and S1 use post-fire lookup (no upsample needed, much more memory-efficient).
-        # Note: _cif_forward expects scalar threshold, so we'll modify it to accept [B, 1]
-        acoustic_temporal = self._cif_forward(fire_signal, alpha_cif, threshold_cif)  # [B, N, D_bi]
+        # ── Step 3: Peak-detection CIF on fire_signal ───────────────────────────
+        # Fire wherever α > threshold; each fired frame emits encoder_output[t] directly.
+        # S0 and S1 use post-fire lookup (integer index, no upsample needed).
+        acoustic_temporal = self._cif_forward(fire_signal, alpha_cif, self.threshold)  # [B, N, D_bi]
         N = acoustic_temporal.shape[1]
 
         # Detach acoustic_temporal to block CE → alpha gradient path
         # CE can still train encoder (Swin/BiMamba) and combined_proj weights
-        acoustic_temporal_for_proj = acoustic_temporal.detach()
+        acoustic_temporal_for_proj = acoustic_temporal
 
-        # ── Step 4: Post-fire lookup for S0 and S1 (differentiable bilinear) ──────
-        # Compute continuous fire positions so gradients flow back to alpha.
+        # ── Step 4: Post-fire lookup for S0 and S1 (integer index) ──────
+        # fire_frames[b, n] = frame index of the n-th fire in batch item b.
+        # New mechanism: fires at frames where α > threshold (not cumsum crossing).
+        # Use nonzero positions of fire_mask, padded to uniform shape [B, N].
         #
-        # Fire n happens where cum crosses threshold*n.  With dynamic threshold β,
-        # fires occur at β, 2β, 3β, ... instead of 1, 2, 3, ...
-        # Between the frame just before the crossing (t_lo = fire_frame - 1) and
-        # the crossing frame (t_hi = fire_frame), the cumsum is linear in alpha,
-        # so the exact fractional crossing time is:
-        #
-        #   t_cont = t_lo + (threshold*n - cum[t_lo]) / alpha[t_hi]
-        #
-        # This is differentiable w.r.t. alpha through cum and alpha[t_hi],
-        # allowing gradients from acoustic_pitch to reach weight_proj.
-        cum = alpha_cif.cumsum(dim=1)                                    # [B, T_bi]
-        # thresholds = [β, 2β, 3β, ...] or [1, 2, 3, ...] depending on dynamic flag
-        thresholds = (torch.arange(1, N + 1, device=device, dtype=dtype)
-                      .unsqueeze(0).expand(B, -1)                        # [B, N]
-                      * threshold_cif)                                   # broadcast [B, 1]
+        # Integer index lookup blocks CE gradient to alpha (only qty_loss trains α).
+        fire_mask = alpha_cif > self.threshold                                       # [B, T_bi] bool
+        # cumsum gives each fired frame its 1-based slot; subtract 1 for 0-based.
+        fire_cumsum = fire_mask.long().cumsum(dim=1)                                 # [B, T_bi]
+        # For each slot n (0-based), find the first frame where cumsum == n+1.
+        # searchsorted on fire_cumsum finds that frame efficiently.
+        slot_targets = torch.arange(1, N + 1, device=device, dtype=torch.long
+                       ).unsqueeze(0).expand(B, -1)                                  # [B, N]
         fire_frames = torch.searchsorted(
-            cum.contiguous(), thresholds.contiguous()
-        ).clamp(max=T_bi - 1)                                            # [B, N] int
-
-        # Integer fire position (non-differentiable lookup to block CE gradient to alpha)
-        # CE gradient stops at acoustic_src values, cannot flow back to fire timing.
-        # Only qty_loss supervises alpha / weight_proj.
+            fire_cumsum.contiguous(), slot_targets.contiguous()
+        ).clamp(max=T_bi - 1)                                                        # [B, N] int
 
         # S0 integer lookup (downsampled from BiMamba 100fps to S0 12.5fps)
         T_sw = acoustic_src.shape[1]
@@ -320,96 +327,69 @@ class CIFModule(nn.Module):
     def _cif_forward(
         self,
         encoder_output: torch.Tensor,  # [B, T, D]
-        alpha: torch.Tensor,           # [B, T]
-        threshold: torch.Tensor,       # [B, 1] dynamic threshold per sample
+        alpha: torch.Tensor,           # [B, T]  Softplus energy, unbounded
+        threshold: float,              # Fire threshold (1.0)
     ) -> torch.Tensor:
-        """Vectorized CIF via cumsum + scatter_add (no Python time loop).
+        """Peak-detection CIF: fire wherever α > threshold (no accumulation).
 
-        Key insight: the CIF integration window for token k spans frames where
-        cumsum(α) crosses the k*threshold boundary. Two scatter_add ops handle
-        all cases in parallel across both batch and time dimensions.
+        New semantics (Cascaded Energy-Probability Architecture):
+            Each frame fires independently if α[t] > threshold.
+            The fired embedding is encoder_output[t] itself — no weighted integration.
 
-        With dynamic threshold β = Σα / ⌈Σα⌉, boundaries are at β, 2β, 3β, ...
-        To reuse the floor-based logic, we normalize: cum_norm = cum / β,
-        then boundaries are at 1, 2, 3, ... as before.
+        This replaces the old cumsum-based accumulation, which assumed α ∈ (0, 1)
+        and required sum(α) fires total.  With Softplus α can exceed 1.0 on a single
+        frame, so accumulation would fire multiple times per frame — wrong.
 
-        For each frame t:
-          cum_prev = Σ_{i<t} α_i,  cum = Σ_{i≤t} α_i
-          cum_norm = cum / β,  cum_prev_norm = cum_prev / β
-          k_lo = floor(cum_prev_norm)       — primary token index
-          k_hi = floor(cum_norm)            — upper index (= k_lo + 1 if boundary crossed)
-          w_lo = min(cum_norm, k_lo+1) - cum_prev_norm  — weight for k_lo
-          w_hi = max(cum_norm - (k_lo+1), 0)            — weight for k_hi
-
-        emb[k] = Σ_t w_t_k * h_t  (scatter_add over k_lo and k_hi)
-
-        Assumption: α_t < threshold for all t (with dynamic threshold, β ≈ 1.0,
-        so at most one boundary is crossed per frame).
+        Implementation:
+            fire_mask[b, t] = (alpha[b, t] > threshold)          # bool [B, T]
+            slot[b, t]      = cumsum(fire_mask, dim=1)[b, t] - 1  # 0-based index of this fire
+            scatter_add encoder_output[b, t] → output[b, slot[b,t]]  only where fire_mask
 
         Complexity: O(T) parallel ops, O(1) Python overhead.
-        Gradients flow through scatter_add into both alpha and encoder_output.
+        Gradients: encoder_output gets CE gradient via scatter_add;
+                   alpha gradient flows from qty_loss only (fire_mask is non-differentiable).
 
-        Returns: [B, N_max, D] where N_max is max fire count across batch.
+        Returns: [B, N_max, D] where N_max = max fires across batch.
         """
         B, T, D = encoder_output.shape
         device, dtype = encoder_output.device, encoder_output.dtype
 
-        # Cumulative sum of α: cum[b, t] = Σ_{i≤t} α[b,i]
-        cum = alpha.cumsum(dim=1)                                   # [B, T]
-        cum_prev = F.pad(cum[:, :-1], (1, 0), value=0.0)           # [B, T]  (shifted by 1)
+        # Boolean fire mask: fire wherever energy exceeds threshold
+        fire_mask = alpha > threshold                               # [B, T] bool
 
-        # Normalize by threshold: cum_norm = cum / β
-        # threshold: [B, 1] → broadcast to [B, T]
-        cum_norm = cum / threshold.clamp(min=1e-8)                  # [B, T]
-        cum_prev_norm = cum_prev / threshold.clamp(min=1e-8)        # [B, T]
+        # Cumulative fire count: slot index for each fired frame (0-based)
+        fire_cumsum = fire_mask.long().cumsum(dim=1)               # [B, T] int
+        slot = (fire_cumsum - 1).clamp(min=0)                      # [B, T] int, 0-based slot
 
-        # Token indices each frame contributes to (using normalized cumsum)
-        k_lo = cum_prev_norm.floor().long()                         # [B, T]
-        k_hi = cum_norm.floor().long()                              # [B, T]
-
-        # Weights: w_lo + w_hi = α_t / β (normalized)
-        # But we want unnormalized weights for actual integration, so scale back
-        boundary_norm = (k_lo.float() + 1.0)                       # [B, T]
-        w_lo_norm = (torch.min(cum_norm, boundary_norm) - cum_prev_norm).clamp(min=0)  # [B, T]
-        w_hi_norm = (cum_norm - boundary_norm).clamp(min=0)                             # [B, T]
-
-        # Scale back to unnormalized weights (multiply by β)
-        w_lo = w_lo_norm * threshold                                # [B, T]
-        w_hi = w_hi_norm * threshold                                # [B, T]
-
-        # Maximum number of fires across batch (using normalized cumsum)
-        n_max = int(cum_norm[:, -1].max().item()) + 1   # round up for safety
+        # Max fires across batch (determines output size)
+        n_max = int(fire_cumsum[:, -1].max().item())
         n_max = max(n_max, 1)
 
         output = torch.zeros(B, n_max, D, device=device, dtype=dtype)
 
-        # Primary scatter: w_lo * h_t → token k_lo
-        k_lo_clamped = k_lo.clamp(0, n_max - 1)                    # [B, T]
-        idx_lo = k_lo_clamped.unsqueeze(-1).expand(-1, -1, D)      # [B, T, D]
-        output.scatter_add_(1, idx_lo, encoder_output * w_lo.unsqueeze(-1))
+        # Scatter: fired frames write encoder_output[t] into the corresponding slot
+        idx = slot.unsqueeze(-1).expand(-1, -1, D)                 # [B, T, D]
+        fire_mask_expanded = fire_mask.unsqueeze(-1).expand(-1, -1, D)  # [B, T, D]
+        output.scatter_add_(1, idx, encoder_output * fire_mask_expanded.to(dtype))
 
-        # Overflow scatter: w_hi * h_t → token k_hi (only when k_hi > k_lo)
-        k_hi_clamped = k_hi.clamp(0, n_max - 1)                    # [B, T]
-        idx_hi = k_hi_clamped.unsqueeze(-1).expand(-1, -1, D)      # [B, T, D]
-        output.scatter_add_(1, idx_hi, encoder_output * w_hi.unsqueeze(-1))
-
-        # Trim trailing zeros: actual N per item = floor(cum_norm[:, -1])
-        actual_n = int(cum_norm[:, -1].floor().max().item())
+        # Trim to actual number of fires (= max slot used + 1)
+        actual_n = int(fire_cumsum[:, -1].max().item())
         actual_n = max(actual_n, 1)
         return output[:, :actual_n]  # [B, N, D]
 
     def compute_quantity_loss(
         self,
-        alpha: torch.Tensor,          # [B, T]
-        target_lengths: torch.Tensor, # [B] float
+        onset_prob: torch.Tensor,     # [B, T] onset probability per frame
+        target_lengths: torch.Tensor  # [B]
     ) -> torch.Tensor:
-        """Quantity loss: mean |Σα_i - N_acoustic_i| over batch.
+        """Compute L1 loss between expected fire count and target count.
 
-        Drives α to sum to the number of acoustic tokens, ensuring CIF
-        fires approximately the right number of times per sequence.
+        Args:
+            onset_prob: Probability of onset at each frame.
+            target_lengths: Target number of fires.
         """
-        sum_alpha = alpha.sum(dim=1)  # [B]
-        return (sum_alpha - target_lengths).abs().mean()
+        N_pred = onset_prob.sum(dim=1)
+        return (N_pred - target_lengths).abs().mean()
 
     def align_to_seq_len(
         self,
