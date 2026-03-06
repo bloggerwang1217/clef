@@ -125,29 +125,31 @@ class CIFModule(nn.Module):
 
     def __init__(
         self,
-        fire_signal_dim: int = 32,       # Octopus onset_1d channels (for α prediction)
+        fire_signal_dim: int = 128,       # BiMamba/Octopus output dim (for α prediction)
         pitch_token_dim: int = 32,        # PitchSA d_pitch (each pitch bin feature dim)
-        n_pitch: int = 128,               # number of pitch bins (Flow output dim)
-        swin_dim: int = 192,              # SwinEncoder output dim per spatial position
-        d_model: int = 512,               # Decoder d_model
-        threshold: float = 1.0,           # CIF fire threshold
+        n_pitch: int = 128,              # number of pitch bins (Flow output dim)
+        swin_dim: int = 192,             # SwinEncoder S0 output dim per spatial position
+        swin_s1_dim: int = 192,          # SwinEncoder S1 output dim (same as S0)
+        d_model: int = 384,              # Decoder d_model (matches config.d_model)
+        threshold: float = 0.5,          # CIF probability threshold
         conv_kernel: int = 3,
         cif_hidden_dim: int = 128,
         target_fires: int = 128,
         encoder_len: int = 3000,
-        schmitt_temp: float = 0.1,
+        perceiver_m: int = 8,            # Number of Perceiver summary tokens per fire slot
     ):
         super().__init__()
         self.fire_signal_dim = fire_signal_dim
         self.n_pitch = n_pitch
         self.pitch_token_dim = pitch_token_dim
         self.swin_dim = swin_dim
+        self.swin_s1_dim = swin_s1_dim
         self.d_model = d_model
         self.threshold = threshold
         self.cif_hidden_dim = cif_hidden_dim
-        self.schmitt_temp = schmitt_temp
+        self.perceiver_m = perceiver_m
 
-        # α predictor: depthwise conv + 2-layer MLP + Softplus
+        # Prob predictor: depthwise conv + 2-layer MLP + Sigmoid
         padding = conv_kernel // 2
         self.conv = nn.Conv1d(
             fire_signal_dim, fire_signal_dim,
@@ -163,8 +165,22 @@ class CIFModule(nn.Module):
         # Project pitch tokens (from PitchSA) → d_model
         self.pitch_proj = nn.Linear(pitch_token_dim, d_model)
 
-        # Project Swin freq-slice tokens → d_model
+        # Project Swin S0 freq-slice tokens → d_model
         self.swin_proj = nn.Linear(swin_dim, d_model)
+
+        # Project Swin S1 freq-slice tokens → d_model
+        self.swin_s1_proj = nn.Linear(swin_s1_dim, d_model)
+
+        # Perceiver Compressor: [B, N, L, D] → [B, N, M, D]
+        # Shared learned queries compress each fire slot's freq tokens into M summary tokens.
+        # Used by MambaSALayer for windowed CA-based CIF pointer calibration.
+        self.perceiver_queries = nn.Parameter(torch.randn(perceiver_m, d_model) * 0.02)
+        self.perceiver_norm_q  = nn.LayerNorm(d_model)
+        self.perceiver_norm_kv = nn.LayerNorm(d_model)
+        self.perceiver_q_proj  = nn.Linear(d_model, d_model)
+        self.perceiver_k_proj  = nn.Linear(d_model, d_model)
+        self.perceiver_v_proj  = nn.Linear(d_model, d_model)
+        self.perceiver_out     = nn.Linear(d_model, d_model)
 
     def compute_fires(
         self,
@@ -186,18 +202,18 @@ class CIFModule(nn.Module):
         B, T_fire, _ = fire_signal.shape
         device, dtype = fire_signal.device, fire_signal.dtype
 
-        # α prediction via depthwise conv + dense
+        # Onset Prob prediction
         context = fire_signal.permute(0, 2, 1)
         memory  = self.conv(context)
         x = (memory + context).permute(0, 2, 1)
         x = F.relu(self.weight_dense(self.weight_norm(x)))
-        alpha = F.softplus(self.weight_proj(x)).squeeze(-1)  # [B, T_fire]
+        logits = self.weight_proj(x).squeeze(-1)  # [B, T_fire]
+        
+        # Pure Probability prediction
+        onset_prob = torch.sigmoid(logits)
 
-        # Soft Schmitt Trigger + quantity loss
-        onset_prob = torch.sigmoid((alpha - self.threshold) / self.schmitt_temp)
         if input_lengths is not None:
             pad_mask = torch.arange(T_fire, device=device).unsqueeze(0) >= input_lengths.unsqueeze(1)
-            alpha      = alpha.masked_fill(pad_mask, 0.0)
             onset_prob = onset_prob.masked_fill(pad_mask, 0.0)
 
         qty_loss = torch.zeros(1, device=device, dtype=dtype).squeeze()
@@ -205,23 +221,29 @@ class CIFModule(nn.Module):
             qty_loss = (onset_prob.sum(dim=1) - target_lengths.to(dtype)).abs().mean()
 
         # Peak-detection → fire_frames
-        fire_mask   = alpha > self.threshold
+        fire_mask   = onset_prob >= self.threshold
         fire_cumsum = fire_mask.long().cumsum(dim=1)
         N = max(int(fire_cumsum[:, -1].max().item()), 1)
 
-        slot_targets = torch.arange(1, N + 1, device=device).unsqueeze(0).expand(B, -1)
-        fire_frames  = torch.searchsorted(
-            fire_cumsum.contiguous(), slot_targets.contiguous()
-        ).clamp(max=T_fire - 1)                               # [B, N] int
+        # Fallback: if no onsets detected, force one at frame 0 (start of audio)
+        if N == 0:
+            fire_frames = torch.zeros(B, 1, dtype=torch.long, device=device)
+        else:
+            slot_targets = torch.arange(1, N + 1, device=device).unsqueeze(0).expand(B, -1)
+            fire_frames = torch.searchsorted(
+                fire_cumsum.contiguous(), slot_targets.contiguous()
+            ).clamp(max=T_fire - 1)  # [B, N] int
 
-        return fire_frames, alpha, qty_loss
+        # Return onset_prob instead of alpha descriptor
+        return fire_frames, onset_prob, qty_loss
 
     def forward(
         self,
         fire_signal: torch.Tensor,                           # [B, T_fire, D_fire]
-        swin_2d: torch.Tensor,                               # [B, H_freq, W_time, D_sw]
+        swin_2d: torch.Tensor,                               # [B, H_freq, W_time, D_sw] S0
         fire_frames: torch.Tensor,                           # [B, N]  from compute_fires()
         pitch_tokens: Optional[torch.Tensor] = None,         # [B, N, P, d_pitch]
+        swin_2d_s1: Optional[torch.Tensor] = None,          # [B, H_freq, W_time, D_sw] S1 (optional)
     ) -> torch.Tensor:
         """Assemble acoustic token sequences — single pass through learnable layers.
 
@@ -229,19 +251,29 @@ class CIFModule(nn.Module):
         then call forward() once.  Never call forward() twice in one step.
 
         Returns:
-          acoustic_token_seqs: [B, N, L_freq, d_model]  (L_freq = P + H_freq)
+          acoustic_token_seqs: [B, N, L_freq, d_model]  (L_freq = P + H_s0 + H_s1)
         """
         B, N = fire_frames.shape
         T_fire = fire_signal.shape[1]
         H_freq, W_time, D_sw = swin_2d.shape[1], swin_2d.shape[2], swin_2d.shape[3]
         device, dtype = fire_frames.device, swin_2d.dtype
 
-        # Swin freq-slice tokens at fire positions
+        # Swin S0 freq-slice tokens at fire positions
         fire_w = (fire_frames.float() * W_time / T_fire).long().clamp(0, W_time - 1)
         swin_t        = swin_2d.permute(0, 1, 3, 2)                           # [B, H, D, W]
         fw_idx        = fire_w.unsqueeze(1).unsqueeze(2).expand(B, H_freq, D_sw, N)
         swin_at_fires = swin_t.gather(3, fw_idx).permute(0, 3, 1, 2)         # [B, N, H, D_sw]
         swin_tokens   = self.swin_proj(swin_at_fires)                         # [B, N, H_freq, d_model]
+
+        # Swin S1 freq-slice tokens at fire positions (same logic as S0)
+        if swin_2d_s1 is not None:
+            D_sw_s1 = swin_2d_s1.shape[3]
+            swin_t_s1 = swin_2d_s1.permute(0, 1, 3, 2)                       # [B, H, D, W]
+            fw_idx_s1 = fire_w.unsqueeze(1).unsqueeze(2).expand(B, H_freq, D_sw_s1, N)
+            swin_at_fires_s1 = swin_t_s1.gather(3, fw_idx_s1).permute(0, 3, 1, 2)  # [B, N, H, D_sw_s1]
+            swin_s1_tokens = self.swin_s1_proj(swin_at_fires_s1)              # [B, N, H_freq, d_model]
+        else:
+            swin_s1_tokens = torch.zeros(B, N, H_freq, self.d_model, device=device, dtype=dtype)
 
         # Pitch tokens — always pass through pitch_proj (DDP: params must participate every step)
         if pitch_tokens is not None:
@@ -251,63 +283,28 @@ class CIFModule(nn.Module):
             dummy = torch.zeros(B, N, 1, self.pitch_token_dim, device=device, dtype=dtype)
             pitch_toks = self.pitch_proj(dummy)                                # [B, N, 1, d_model]
 
-        return torch.cat([pitch_toks, swin_tokens], dim=2)                    # [B, N, P+H, d_model]
+        full_tokens = torch.cat([pitch_toks, swin_tokens, swin_s1_tokens], dim=2)  # [B, N, L, d_model]
+
+        # Perceiver Compressor: [B, N, L, D] → [B, N, M, D]
+        # Shared queries attend over each fire slot's L freq tokens independently.
+        BN = B * N
+        L = full_tokens.shape[2]
+        kv = full_tokens.reshape(BN, L, self.d_model)                          # [B*N, L, D]
+        q  = self.perceiver_queries.unsqueeze(0).expand(BN, -1, -1)            # [B*N, M, D]
+
+        q_n  = self.perceiver_q_proj(self.perceiver_norm_q(q))                 # [B*N, M, D]
+        kv_n = self.perceiver_norm_kv(kv)
+        k_n  = self.perceiver_k_proj(kv_n)                                     # [B*N, L, D]
+        v_n  = self.perceiver_v_proj(kv_n)                                     # [B*N, L, D]
+
+        attn = F.scaled_dot_product_attention(q_n, k_n, v_n)                   # [B*N, M, D]
+        attn = self.perceiver_out(attn)                                        # [B*N, M, D]
+        summary_tokens = (q + attn).reshape(B, N, self.perceiver_m, self.d_model)  # [B, N, M, D] w/ residual
+
+        return full_tokens, summary_tokens  # [B, N, L, D], [B, N, M, D]
 
 
 
-
-    def _cif_forward(
-        self,
-        encoder_output: torch.Tensor,  # [B, T, D]
-        alpha: torch.Tensor,           # [B, T]  Softplus energy, unbounded
-        threshold: float,              # Fire threshold (1.0)
-    ) -> torch.Tensor:
-        """Peak-detection CIF: fire wherever α > threshold (no accumulation).
-
-        New semantics (Cascaded Energy-Probability Architecture):
-            Each frame fires independently if α[t] > threshold.
-            The fired embedding is encoder_output[t] itself — no weighted integration.
-
-        This replaces the old cumsum-based accumulation, which assumed α ∈ (0, 1)
-        and required sum(α) fires total.  With Softplus α can exceed 1.0 on a single
-        frame, so accumulation would fire multiple times per frame — wrong.
-
-        Implementation:
-            fire_mask[b, t] = (alpha[b, t] > threshold)          # bool [B, T]
-            slot[b, t]      = cumsum(fire_mask, dim=1)[b, t] - 1  # 0-based index of this fire
-            scatter_add encoder_output[b, t] → output[b, slot[b,t]]  only where fire_mask
-
-        Complexity: O(T) parallel ops, O(1) Python overhead.
-        Gradients: encoder_output gets CE gradient via scatter_add;
-                   alpha gradient flows from qty_loss only (fire_mask is non-differentiable).
-
-        Returns: [B, N_max, D] where N_max = max fires across batch.
-        """
-        B, T, D = encoder_output.shape
-        device, dtype = encoder_output.device, encoder_output.dtype
-
-        # Boolean fire mask: fire wherever energy exceeds threshold
-        fire_mask = alpha > threshold                               # [B, T] bool
-
-        # Cumulative fire count: slot index for each fired frame (0-based)
-        fire_cumsum = fire_mask.long().cumsum(dim=1)               # [B, T] int
-        slot = (fire_cumsum - 1).clamp(min=0)                      # [B, T] int, 0-based slot
-
-        # Max fires across batch (determines output size)
-        n_max = int(fire_cumsum[:, -1].max().item())
-        n_max = max(n_max, 1)
-
-        output = torch.zeros(B, n_max, D, device=device, dtype=dtype)
-
-        # Scatter: fired frames write encoder_output[t] into the corresponding slot
-        idx = slot.unsqueeze(-1).expand(-1, -1, D)                 # [B, T, D]
-        fire_mask_expanded = fire_mask.unsqueeze(-1).expand(-1, -1, D)  # [B, T, D]
-        output.scatter_add_(1, idx, encoder_output * fire_mask_expanded.to(dtype))
-
-        # Trim to actual number of fires (= max slot used + 1)
-        actual_n = int(fire_cumsum[:, -1].max().item())
-        actual_n = max(actual_n, 1)
-        return output[:, :actual_n]  # [B, N, D]
 
     def compute_quantity_loss(
         self,

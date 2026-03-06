@@ -65,18 +65,14 @@ model:
 
   bridge_layers: 1
 
-  # Decoder: 2 layers (CIF → Mamba)
-  #   L0: mamba_cif  — Mamba + CIF acoustic embeddings (no CA, CIF provides embeddings)
-  #   L1: mamba_only — sequential writing
-  decoder_layer_types: ["mamba_cif", "mamba_only"]
+  # Decoder: 1 layer (Mamba → last token + audio → SA + FFN)
+  #   L0: mamba_sa — Mamba + last token + CIF acoustic tokens → Self-Attention → FFN → output
+  decoder_layer_types: ["mamba_sa"]
   decoder_layer_ca_levels:
-    - null      # L0: CIF provides acoustic_embs (no CA needed)
-    - null      # L1: Mamba only
+    - null      # L0: mamba_sa handles its own attention
   decoder_layer_full_freq:
     - null
-    - null
   decoder_layer_cascade_com:
-    - null
     - null
 
   # bar_token_id: <bar>=4 still needed for bar_mask detection (schema injection)
@@ -86,14 +82,14 @@ model:
   # CIF (Continuous Integrate-and-Fire) — replaces BarMamba
   # Decoupled design: fire_signal (BiMamba) + acoustic_src (Swin S0)
   use_cif: true
-  cif_threshold: 1.0          # Fixed threshold (CIF fires when cumsum(α) crosses 1, 2, 3, ...)
+  cif_threshold: 0.5          # Probability threshold (CIF fires when onset_prob >= 0.5)
   cif_conv_kernel: 3          # Temporal context (±1 frame @ 100fps = ±10ms, matches FunASR)
-  cif_quantity_loss_weight: 0.01    # |sum(P_onset) - N_acoustic|; gradient only trains CIF (fire_signal detached)
+  cif_quantity_loss_weight: 0.01    # |sum(onset_prob) - N_acoustic|
                                      # Loss stages: init ~100 → mid ~30 → converged ~10
                                      # Gradient: 0.03×100=3.0 → 0.03×30=0.9 → 0.03×10=0.3 (stable)
-  cif_schmitt_temp: 0.1             # Soft Schmitt Trigger temperature for onset_prob = σ((α−threshold)/temp)
-                                     # 0.1: sharp step function, prevents quantity loss lower-bound trap at 100fps
   cif_avg_fires: 128               # avg <bar>+<nl> per 30s chunk
+  cif_window_k: 5                  # ±K fire slots for Windowed CA in MambaSALayer (covers qty_loss≈10 noise)
+  cif_perceiver_m: 8               # M Perceiver summary tokens per fire slot (compress L→M for CA)
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
   tf_anneal_steps: 100000

@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .attention import WindowCrossAttention
-from .cif import CIFModule, compute_acoustic_target_lengths
+from .cif import CIFModule, compute_acoustic_target_lengths, build_cif_alignment
 
 
 def _carry_forward_h_bar(
@@ -782,6 +782,217 @@ class MambaCIFLayer(nn.Module):
         return fused
 
 
+class MambaSALayer(nn.Module):
+    """Mamba2 + Windowed CA (CIF calibration) + Self-Attention decoder layer.
+
+    Flow:
+      1. Mamba(tgt) → y  [B, S, D]  — compress token history
+      2. last_token = y[:, -1:, :]  [B, 1, D]
+      3. Windowed CA: Q=last_token, KV=summary_tokens[ptr-K : ptr+K]
+         → attn_weights [B, 1, (2K+1)*M]
+         → CoM offset → actual_ptr  (hard, not differentiable, that's fine)
+         → ca_out [B, 1, D]  (residual: ca_out = last_token + wca_out)
+      4. Gather full audio tokens at actual_ptr → [B, L, D]
+      5. concat [ca_out, full_audio] → [B, 1+L, D]
+      6. Self-Attention (Flash SDPA) — ca_out attends freq tokens, freq tokens互看
+      7. FFN
+      8. Output: SA_out[:, 0:1, :] → [B, 1, D]
+
+    Key design choices:
+      - CA calibrates the hard CIF pointer using learned attention (robust to ±K misfire)
+      - residual on ca_out ensures last_token representation is preserved for SA
+      - SA input is [ca_out, full_audio]: last_token (via ca_out)互看 audio freq tokens
+      - CoM ptr correction has no gradient — decoder loss backprops through ca_out → CA weights
+    """
+
+    def __init__(
+        self,
+        d_model: int = 512,
+        d_state: int = 128,
+        d_conv: int = 4,
+        expand: int = 2,
+        n_heads: int = 8,
+        ff_dim: int = 2048,
+        dropout: float = 0.1,
+        cif_window_k: int = 5,           # ±K fire slots for windowed CA
+        cif_summary_m: int = 8,          # M summary tokens per fire slot (from Perceiver)
+        **kwargs,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.cif_window_k = cif_window_k
+        self.cif_summary_m = cif_summary_m
+
+        # 1. Mamba2 (processes token history)
+        self.norm1 = nn.LayerNorm(d_model)
+        from mamba_ssm import Mamba2
+        self.mamba = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        self.dropout_mamba = nn.Dropout(dropout)
+
+        # 2. Windowed CA for CIF pointer calibration
+        self.norm_wca = nn.LayerNorm(d_model)
+        self.wca_q_proj = nn.Linear(d_model, d_model)
+        self.wca_k_proj = nn.Linear(d_model, d_model)
+        self.wca_v_proj = nn.Linear(d_model, d_model)
+        self.wca_out    = nn.Linear(d_model, d_model)
+        self.dropout_wca = nn.Dropout(dropout)
+
+        # 3. Self-Attention (Flash)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.sa_qkv = nn.Linear(d_model, 3 * d_model)
+        self.sa_out = nn.Linear(d_model, d_model)
+        self.dropout_sa = nn.Dropout(dropout)
+
+        # 4. FFN
+        self.norm3 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+        valid_ratios: torch.Tensor,
+        past_state=None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        B, S, D = tgt.shape
+        mamba_state = past_state[1] if past_state is not None else None
+
+        # full_tokens:    [B, N, L, D] — complete freq tokens per fire slot (for SA)
+        # summary_tokens: [B, N, M, D] — Perceiver summary per fire slot (for Windowed CA)
+        # Computed lazily via cif_lazy() to avoid holding [B, N, L, D] in memory
+        # across the full decoder forward. cif_lazy is a zero-arg callable.
+        full_tokens    = kwargs.get('acoustic_emb_full', None)
+        summary_tokens = kwargs.get('acoustic_emb_summary', None)
+        cif_lazy       = kwargs.get('cif_lazy', None)
+        cif_ptr        = kwargs.get('cif_ptr', None)
+
+        # Resolve lazy CIF if eager tensors were not provided
+        if full_tokens is None and summary_tokens is None and cif_lazy is not None:
+            full_tokens, summary_tokens = cif_lazy()
+        # cif_ptr may be:
+        #   [B]    during inference (single new token, pointer to current fire slot)
+        #   [B, S] during training  (per-token pointer, from build_cif_alignment)
+
+        # Step 1: Mamba (history → y)
+        # Mamba needs all S tokens for causal compression.
+        tgt_normed = self.norm1(tgt)
+        mamba_out = self.mamba(tgt_normed, inference_params=mamba_state)
+        y = tgt + self.dropout_mamba(mamba_out)
+
+        # Steps 2-6 operate on the LAST token only, in both training and inference.
+        # Training: Mamba sees full sequence; only last token queries audio.
+        #   output = cat(y[:, :-1, :], last_out)  →  [B, S, D]
+        # Inference: S=1 by definition, same path.
+        last_token = y[:, -1:, :]  # [B, 1, D]
+
+        # Step 2: Windowed CA — last token queries Perceiver summary around cif_ptr
+        if summary_tokens is not None and cif_ptr is not None:
+            N = summary_tokens.shape[1]
+            K = self.cif_window_k
+            M = self.cif_summary_m
+            device = tgt.device
+            offsets = torch.arange(-K, K + 1, device=device)  # [2K+1]
+
+            # cif_ptr: [B, S] during training (take last col), [B] during inference
+            ptr = cif_ptr[:, -1] if cif_ptr.dim() == 2 else cif_ptr  # [B]
+
+            indices = ptr.unsqueeze(1) + offsets.unsqueeze(0)          # [B, 2K+1]
+            pad_mask = (indices < 0) | (indices >= N)                  # [B, 2K+1]
+            indices_clamped = indices.clamp(0, N - 1)                  # [B, 2K+1]
+            idx_exp = indices_clamped.unsqueeze(-1).unsqueeze(-1).expand(B, 2*K+1, M, D)
+            window = summary_tokens.gather(1, idx_exp)                 # [B, 2K+1, M, D]
+            window = window.masked_fill(pad_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
+            window_flat = window.reshape(B, (2*K+1)*M, D)              # [B, (2K+1)*M, D]
+
+            last_normed = self.norm_wca(last_token)
+            q = self.wca_q_proj(last_normed)                           # [B, 1, D]
+            k = self.wca_k_proj(window_flat)                           # [B, (2K+1)*M, D]
+            v = self.wca_v_proj(window_flat)                           # [B, (2K+1)*M, D]
+
+            def split_heads(x, seq):
+                return x.reshape(B, seq, self.n_heads, self.head_dim).transpose(1, 2)
+            q_h = split_heads(q, 1)
+            k_h = split_heads(k, (2*K+1)*M)
+            v_h = split_heads(v, (2*K+1)*M)
+
+            scale = self.head_dim ** -0.5
+            attn_logits = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale  # [B, H, 1, (2K+1)*M]
+            attn_weights = attn_logits.softmax(dim=-1)
+            wca_out_h = torch.matmul(attn_weights, v_h)                      # [B, H, 1, head_dim]
+            wca_out = wca_out_h.transpose(1, 2).reshape(B, 1, D)
+            wca_out = self.wca_out(wca_out)
+            wca_out = self.dropout_wca(wca_out)
+            ca_out = last_token + wca_out                                     # [B, 1, D]
+
+            # CoM → actual_ptr (used during inference for next-step pointer update)
+            attn_avg = attn_weights.mean(dim=1).squeeze(1)                   # [B, (2K+1)*M]
+            slot_weights = attn_avg.reshape(B, 2*K+1, M).sum(dim=-1)        # [B, 2K+1]
+            com_offset = (slot_weights * offsets.float()).sum(dim=-1)        # [B]
+            actual_ptr = (ptr + com_offset.round().long()).clamp(0, N - 1)   # [B]
+        else:
+            ca_out = last_token                                               # [B, 1, D]
+            ptr = cif_ptr[:, -1] if (cif_ptr is not None and cif_ptr.dim() == 2) else cif_ptr
+            actual_ptr = ptr
+
+        # Step 3: Gather full audio tokens at actual_ptr, build SA input
+        if full_tokens is not None:
+            L = full_tokens.shape[2]
+            ptr_clamped = actual_ptr.clamp(max=full_tokens.shape[1] - 1)    # [B]
+            ptr_exp = ptr_clamped.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(B, 1, L, D)
+            audio_at_ptr = full_tokens.gather(1, ptr_exp).squeeze(1)        # [B, L, D]
+            sa_input = torch.cat([ca_out, audio_at_ptr], dim=1)             # [B, 1+L, D]
+        else:
+            sa_input = ca_out                                                # [B, 1, D]
+
+        # Step 4: Self-Attention over [ca_out, full_audio] — last token attends to its audio slice
+        sa_input_normed = self.norm2(sa_input)
+        qkv = self.sa_qkv(sa_input_normed)
+        q_sa, k_sa, v_sa = qkv.chunk(3, dim=-1)
+        sa_out = F.scaled_dot_product_attention(
+            q_sa, k_sa, v_sa,
+            dropout_p=self.dropout_sa.p if self.training else 0.0,
+            is_causal=False,
+        )
+        sa_out = self.sa_out(sa_out)
+        sa_out = self.dropout_sa(sa_out)
+
+        # Take only the ca_out position (index 0) after SA
+        sa_out_0 = sa_out[:, :1, :]  # [B, 1, D]
+
+        # Step 5: FFN
+        ffn_out = self.ffn(self.norm3(sa_out_0))  # [B, 1, D]
+
+        # last_out: combine ca_out + SA residual + FFN
+        last_out = ca_out + sa_out_0 + ffn_out    # [B, 1, D]
+
+        # Output: prepend Mamba pass-through for positions 0..S-2, append last_out
+        if S > 1:
+            output = torch.cat([y[:, :-1, :], last_out], dim=1)  # [B, S, D]
+        else:
+            output = last_out                                      # [B, 1, D]
+
+        if use_cache:
+            return output, (None, mamba_state)
+        return output
+
+
 class MambaWindowCALayer(nn.Module):
     """Mamba2 + Window Cross-Attention decoder layer.
 
@@ -1460,12 +1671,13 @@ class ClefDecoder(nn.Module):
         cif_acoustic_dim: int = 192,             # Swin S0 output dim (pitch content)
         cif_acoustic_s1_dim: int = 384,          # Swin S1 output dim (beat content)
         cif_d_model: int = 512,                  # Final acoustic embedding dim (decoder d_model)
-        cif_threshold: float = 1.0,              # CIF fire threshold (base, overridden by dynamic)
+        cif_threshold: float = 0.5,              # CIF probability threshold
         cif_conv_kernel: int = 3,                # depthwise conv kernel for weight predictor
         cif_hidden_dim: int = 128,               # hidden dim for weight predictor Dense layer
         cif_target_fires: int = 128,             # Target fire count (avg structural tokens per chunk)
         cif_encoder_len: int = 3000,             # Encoder length (used for weight_proj bias init)
-        cif_schmitt_temp: float = 0.1,           # Soft Schmitt Trigger temperature for onset_prob
+        cif_window_k: int = 5,                   # ±K fire slots for windowed CA in MambaSALayer
+        cif_perceiver_m: int = 8,                # M Perceiver summary tokens per fire slot
     ):
         super().__init__()
 
@@ -1499,13 +1711,14 @@ class ClefDecoder(nn.Module):
                 self.cif = CIFModule(
                     fire_signal_dim=cif_fire_signal_dim,   # Octopus onset_1d dim (32)
                     swin_dim=cif_acoustic_dim,              # Swin output dim per token (192)
+                    swin_s1_dim=cif_acoustic_dim,           # Swin S1 output dim (same as S0, 192)
                     d_model=cif_d_model,
                     threshold=cif_threshold,
                     conv_kernel=cif_conv_kernel,
                     cif_hidden_dim=cif_hidden_dim,
                     target_fires=cif_target_fires,
                     encoder_len=cif_encoder_len,
-                    schmitt_temp=cif_schmitt_temp,
+                    perceiver_m=cif_perceiver_m,
                 )
             else:
                 self.bar_mamba = BarMamba(
@@ -1533,6 +1746,18 @@ class ClefDecoder(nn.Module):
                     d_conv=d_conv,
                     expand=expand,
                     dropout=dropout,
+                ))
+            elif lt == 'mamba_sa':
+                self.layers.append(MambaSALayer(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    n_heads=n_heads,
+                    ff_dim=ff_dim,
+                    dropout=dropout,
+                    cif_window_k=cif_window_k,
+                    cif_summary_m=cif_perceiver_m,
                 ))
             elif lt == 'mamba_full_ca':
                 self.layers.append(MambaFullCALayer(
@@ -1643,7 +1868,7 @@ class ClefDecoder(nn.Module):
         # Assign layer_idx to Mamba layers (needed for InferenceParams state indexing)
         mamba_idx = 0
         for layer in self.layers:
-            if isinstance(layer, (MambaOnlyLayer, MambaCIFLayer, MambaFullCALayer, MambaWindowCALayer)):
+            if isinstance(layer, (MambaOnlyLayer, MambaCIFLayer, MambaSALayer, MambaFullCALayer, MambaWindowCALayer)):
                 layer.mamba.layer_idx = mamba_idx
                 mamba_idx += 1
 
@@ -1712,7 +1937,10 @@ class ClefDecoder(nn.Module):
         # ── CIF or BarMamba temporal alignment ──────────────────────────────
         dense_com_t = None
         summary_embed_dense = None
-        acoustic_embs_dense = None  # [B, S, D] for CIF path (MambaFullCALayer bypass)
+        acoustic_embs_dense   = None  # [B, S, L, D] for CIF path (non-MambaSALayer layers)
+        acoustic_embs_full    = None  # [B, N, L, D] full freq tokens per fire slot
+        acoustic_embs_summary = None  # [B, N, M, D] Perceiver summary per fire slot
+        cif_lazy              = None  # callable () -> (full, summary) for MambaSALayer lazy eval
         self._cif_quantity_loss = None
         self._cif_sum_alpha = None
         self._cif_target = None
@@ -1746,16 +1974,39 @@ class ClefDecoder(nn.Module):
             if pitch_sa_module is not None and flow_feat is not None:
                 pitch_tokens = pitch_sa_module(flow_feat, fire_frames)  # [B, N, P, d_pitch]
 
-            # Step 3: Assemble freq token seqs — ONE pass through swin_proj + pitch_proj
-            acoustic_embs = self.cif(
-                fire_signal=fire_signal,
-                swin_2d=acoustic_src,
-                fire_frames=fire_frames,
-                pitch_tokens=pitch_tokens,
-            )  # [B, N, L_freq, d_model]
+            has_mamba_sa = any(isinstance(l, MambaSALayer) for l in self.layers)
+            needs_dense  = any(isinstance(l, (MambaFullCALayer, MambaCIFLayer)) for l in self.layers)
 
-            # [B, N, L_freq, d_model] → scatter to [B, S, L_freq, d_model]
-            acoustic_embs_dense = self.cif.align_to_seq_len(acoustic_embs, S, input_ids=input_ids)
+            if needs_dense:
+                # Step 3a: Non-MambaSALayer path — compute now and scatter to [B, S, L, D]
+                acoustic_embs_full, acoustic_embs_summary = self.cif(
+                    fire_signal=fire_signal,
+                    swin_2d=acoustic_src,
+                    fire_frames=fire_frames,
+                    pitch_tokens=pitch_tokens,
+                    swin_2d_s1=acoustic_src_s1,
+                )
+                acoustic_embs_dense = self.cif.align_to_seq_len(acoustic_embs_full, S, input_ids=input_ids)
+            elif has_mamba_sa:
+                # Step 3b: MambaSALayer path — defer CIF assembly until inside the layer.
+                # Capture references in a closure; tensors are computed on first call and
+                # the closure is not retained after the layer returns, so [B, N, L, D]
+                # lives only while MambaSALayer.forward() is on the call stack.
+                _cif_ref      = self.cif
+                _fire_signal  = fire_signal
+                _fire_frames  = fire_frames
+                _pitch_tokens = pitch_tokens
+                _acoustic_src = acoustic_src
+                _acoustic_s1  = acoustic_src_s1
+                def cif_lazy():
+                    return _cif_ref(
+                        fire_signal=_fire_signal,
+                        swin_2d=_acoustic_src,
+                        fire_frames=_fire_frames,
+                        pitch_tokens=_pitch_tokens,
+                        swin_2d_s1=_acoustic_s1,
+                    )
+
             self._cif_quantity_loss = qty_loss
             self._cif_sum_alpha    = alpha.sum(dim=1).mean().item()
             self._cif_target       = target_lengths.mean().item() if target_lengths is not None else None
@@ -1846,6 +2097,14 @@ class ClefDecoder(nn.Module):
         # com_f cascade: L1's WindowCA com_f → L3 freq_center; L3's → L5 freq_center.
         last_com_f: Optional[torch.Tensor] = None  # [B, S, 1]
 
+        # CIF pointer: current fire slot index for MambaSALayer windowed CA.
+        # Shape [B] LongTensor for inference (starts at 0);
+        # Shape [B, S] LongTensor for training (per-token alignment from build_cif_alignment).
+        if self.cif is not None and input_ids is not None:
+            cif_ptr = build_cif_alignment(input_ids)  # [B, S]
+        else:
+            cif_ptr = torch.zeros(B, dtype=torch.long, device=output.device)  # [B]
+
         for i, layer in enumerate(self.layers):
             layer_state = past_states[i] if past_states else None
             layer_value_cache = value_cache_list[i] if value_cache_list else None
@@ -1884,10 +2143,13 @@ class ClefDecoder(nn.Module):
                     guidance_bounds=layer_guidance_bounds,
                     bar_mask=bar_mask,
                 )
-                if isinstance(layer, (MambaFullCALayer, MambaCIFLayer)):
+                if isinstance(layer, (MambaFullCALayer, MambaCIFLayer, MambaSALayer)):
                     layer_kwargs['tgt_query'] = tgt_query
                     if acoustic_embs_dense is not None:
                         layer_kwargs['acoustic_emb_dense'] = acoustic_embs_dense
+                    if isinstance(layer, MambaSALayer):
+                        layer_kwargs['cif_ptr']   = cif_ptr
+                        layer_kwargs['cif_lazy']  = cif_lazy
                 output, new_state = layer(
                     output, memory,
                     spatial_shapes, level_start_index, valid_ratios,
@@ -1898,13 +2160,17 @@ class ClefDecoder(nn.Module):
                 _guidance = layer_guidance_bounds
                 _freq_in = layer_freq_center_in
                 _is_window = isinstance(layer, SAWindowCALayer)
-                _is_cif_ca = isinstance(layer, (MambaFullCALayer, MambaCIFLayer))
+                _is_cif_ca = isinstance(layer, (MambaFullCALayer, MambaCIFLayer, MambaSALayer))
+                _is_mamba_sa = isinstance(layer, MambaSALayer)
                 _tgt_query = tgt_query if _is_cif_ca else None
                 _acoustic = acoustic_embs_dense if _is_cif_ca else None
-                def _layer_fn(out, mem, gb, time_in, freq_in, tq, acou,
+                _cif_ptr = cif_ptr if _is_mamba_sa else None
+                _cif_lazy = cif_lazy if _is_mamba_sa else None
+                def _layer_fn(out, mem, gb, time_in, freq_in, tq, acou, cp,
                               _l=layer, _sp=spatial_shapes, _lsi=level_start_index,
                               _vr=valid_ratios, _tp=tgt_pos, _iw=_is_window,
-                              _bm=bar_mask, _imfc=_is_cif_ca):
+                              _bm=bar_mask, _imfc=_is_cif_ca, _ims=_is_mamba_sa,
+                              _cl=_cif_lazy):
                     kwargs = dict(
                         tgt_pos=_tp,
                         time_center_in=time_in,
@@ -1916,10 +2182,14 @@ class ClefDecoder(nn.Module):
                         kwargs['tgt_query'] = tq
                         if acou is not None:
                             kwargs['acoustic_emb_dense'] = acou
+                        if cp is not None:
+                            kwargs['cif_ptr'] = cp
+                        if _ims and _cl is not None:
+                            kwargs['cif_lazy'] = _cl
                     return _l(out, mem, _sp, _lsi, _vr, **kwargs)
                 output = grad_checkpoint(_layer_fn, output, memory,
                                         _guidance, layer_window_center, _freq_in,
-                                        _tgt_query, _acoustic,
+                                        _tgt_query, _acoustic, _cif_ptr,
                                         use_reentrant=False)
             else:
                 layer_kwargs = dict(
@@ -1929,10 +2199,13 @@ class ClefDecoder(nn.Module):
                     guidance_bounds=layer_guidance_bounds,
                     bar_mask=bar_mask,
                 )
-                if isinstance(layer, (MambaFullCALayer, MambaCIFLayer)):
+                if isinstance(layer, (MambaFullCALayer, MambaCIFLayer, MambaSALayer)):
                     layer_kwargs['tgt_query'] = tgt_query
                     if acoustic_embs_dense is not None:
                         layer_kwargs['acoustic_emb_dense'] = acoustic_embs_dense
+                    if isinstance(layer, MambaSALayer):
+                        layer_kwargs['cif_ptr']  = cif_ptr
+                        layer_kwargs['cif_lazy'] = cif_lazy
                 output = layer(
                     output, memory,
                     spatial_shapes, level_start_index, valid_ratios,

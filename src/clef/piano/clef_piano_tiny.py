@@ -155,16 +155,15 @@ class ClefPianoTiny(nn.Module):
             use_cif=getattr(config, 'use_cif', False),
             # CIF fire signal = BiMamba (temporal context in Pitch Space, tied to n_mels)
             cif_fire_signal_dim=config.n_mels,
-            # CIF acoustic = Swin 2D tokens (freq slices) + PitchSA tokens
+            # CIF acoustic = Swin S0 + S1 tokens (freq slices) + PitchSA tokens
             # The actual token dim is d_model (after projection in CIFModule)
-            cif_acoustic_dim=swin_out_dim,      # kept for compat; CIFModule uses swin_dim
-            cif_acoustic_s1_dim=0,              # not used (Swin 2D replaces S1 separate path)
+            cif_acoustic_dim=swin_out_dim,      # Swin S0 dim (192)
+            cif_acoustic_s1_dim=swin_out_dim,   # Swin S1 dim (same as S0, 192)
             cif_d_model=config.d_model,
-            cif_threshold=getattr(config, 'cif_threshold', 1.0),
+            cif_threshold=getattr(config, 'cif_threshold', 0.5),
             cif_conv_kernel=getattr(config, 'cif_conv_kernel', 1),
             cif_target_fires=getattr(config, 'cif_avg_fires', 128),
             cif_encoder_len=getattr(config, 'chunk_frames', 3000),
-            cif_schmitt_temp=getattr(config, 'cif_schmitt_temp', 0.1),
         )
 
 
@@ -284,9 +283,10 @@ class ClefPianoTiny(nn.Module):
 
         # Return all sources:
         # feat_bimamba: CIF fire signal (has full temporal sequence context)
-        # swin_2d:  Swin 2D for CIF freq slice lookup
+        # swin_2d:  Swin S0 2D for CIF freq slice lookup
+        # feat_swin_s1: Swin S1 2D for CIF (beat-aware features)
         # flow_with_onset: needed by PitchSA in forward() (after fire frames known)
-        return memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, swin_2d, flow_with_onset
+        return memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, feat_swin_s0, feat_swin_s1, flow_with_onset
 
     def forward(
         self,
@@ -319,7 +319,7 @@ class ClefPianoTiny(nn.Module):
             total_loss: Same as loss (for compatibility)
         """
         # Encode
-        memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, swin_2d, flow_with_onset = self.encode(mel)
+        memory, spatial_shapes, level_start_index, valid_ratios, feat_bimamba, swin_2d, swin_2d_s1, flow_with_onset = self.encode(mel)
 
         # Embed tokens
         tgt = self.token_embed(input_ids)  # [B, S] → [B, S, D]
@@ -332,8 +332,8 @@ class ClefPianoTiny(nn.Module):
             valid_ratios,
             input_ids=input_ids,
             fire_signal=feat_bimamba,      # BiMamba [B,T_flow,128] — temporal context
-            acoustic_src=swin_2d,          # Swin 2D [B,H,W,192] — freq slices for CA
-            acoustic_src_s1=None,          # not used (Swin 2D carries both)
+            acoustic_src=swin_2d,          # Swin S0 [B,H,W,192] — freq slices for CA
+            acoustic_src_s1=swin_2d_s1,    # Swin S1 [B,H,W,192] — beat-aware features
             flow_feat=flow_with_onset,     # [B, T_flow, 128] for PitchSA
             pitch_sa_module=self.pitch_sa, # PitchSA module — called at fire positions
         )
@@ -421,9 +421,8 @@ class ClefPianoTiny(nn.Module):
         )  # [B, N, D]
         N_fires = acoustic_embs.shape[1]
 
-        # CIF pointer: advances on <sos> (already generated as first token) and <nl>
-        # <sos> was already emitted before the loop, so ptr starts at 1
-        cif_ptr = torch.ones(B, dtype=torch.long, device=device)
+        # CIF pointer: starts at 0 (first fire slot)
+        cif_ptr = torch.zeros(B, dtype=torch.long, device=device)
 
         # Initialize with BOS
         generated = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
@@ -455,6 +454,7 @@ class ClefPianoTiny(nn.Module):
                 fire_signal=feat_bimamba,
                 acoustic_src=feat_swin_s0,
                 acoustic_src_s1=feat_swin_s1,
+                cif_ptr=cif_ptr,
             )
             if isinstance(decoder_out, tuple):
                 decoder_out = decoder_out[0]
