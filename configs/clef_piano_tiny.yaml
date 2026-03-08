@@ -1,8 +1,9 @@
-# clef-piano-tiny Training Configuration (Zeng-style)
+# clef-piano-tiny Training Configuration (Mono-Attn)
 # =======================================
 #
-# Minimal PoC: Octopus + Flow + BiMamba + 2-layer decoder
-# Goal: Beat SOTA with minimal architecture following Zeng et al. 2024
+# Architecture: Octopus + Flow + Swin + BiMamba encoder
+#               MambaMonoAttnLayer decoder (monotonic attention + onset prior)
+# Goal: Beat SOTA with principled temporal alignment
 #
 # This YAML is the single source of truth for ALL hyperparameters.
 # Training: python -m src.clef.piano.train --config configs/clef_piano_tiny.yaml [--resume <ckpt>] [--wandb]
@@ -19,27 +20,25 @@ seed:
 model:
   name: "clef-piano-tiny"
 
-  # NO Swin in Zeng-style design — BiMamba directly processes Flow output
-  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"  # Keep for compatibility
-  swin_dims: []  # No Swin stages used
+  # SwinEncoder (S0 + S1) for acoustic feature extraction
+  # Flow [B, T, 128] → SwinEncoder → [B, T/8, 384] @12.5fps
+  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"
+  swin_dims: []  # Not used (Swin handles internally)
+  swin_use_gradient_checkpointing: false
   freeze_swin: true
   swin_start_stage: 0
   swin_pool_strides: []
 
-  # BiMamba Encoder (temporal timing for CIF, 128→128 no projection)
-  # Learns onset timing from Flow [B, 3000, 128] @ 100fps
-  # Output: fire_signal [B, 3000, 128] for CIF alpha prediction
+  # BiMamba Encoder (time-oriented, after Swin → freq_conv)
+  # Swin S0+S1 concat (384) → freq_conv → swin_feat [B, T/8, 384] → BiMamba
+  # Output h_j [B, T=375, D=384] = decoder memory for monotonic attention
+  use_bimamba_encoder: true
+  bimamba_input_dim: 384      # Swin S0+S1 concat output dimension
+  bimamba_d_model: 384        # Match decoder d_model (Whisper tiny)
   bimamba_d_state: 128
   bimamba_d_conv: 4
-  bimamba_num_layers: 1
+  bimamba_num_layers: 2
   bimamba_dropout: 0.1
-
-  # Swin S0 Encoder (acoustic content for CIF, independent path)
-  # Extracts pitch-selective features from Flow [B, 3000, 128]
-  # Output: acoustic_src [B, 375, 192] @ 12.5fps (8x downsample: patch_embed 4x + downsample 2x)
-  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"
-  swin_unfreeze: []  # Empty list = finetune ALL S0 (pretrained init)
-  swin_lr_scale: 0.1  # Learning rate multiplier for S0
 
   # Octopus2D (onset detection)
   use_octopus: true
@@ -52,58 +51,44 @@ model:
   # HarmonizingFlow (pitch space transform)
   use_flow: true
   n_harmonics: 6
-  flow_pool_stride: 1  # No pooling (10ms resolution)
+  flow_pool_stride: 1  # No pooling, directly to SwinEncoder
 
-  # Attention config
+  # Attention config (Whisper tiny: d_model=384, n_heads=6, ff_dim=1536)
   d_model: 384
-  n_heads: 8
-  n_levels: 2                  # Octopus (L0) + Flow (L1); BiMamba/Swin S0 are CIF-internal
-  ff_dim: 1536                 # 4 * d_model
+  n_heads: 6
+  n_levels: 1                  # Only BiMamba output (level 0)
+  ff_dim: 1536                 # 4 × d_model
   dropout: 0.1
 
   rope_base: 10000.0
 
   bridge_layers: 1
 
-  # Decoder: 1 layer (Mamba → last token + audio → SA + FFN)
-  #   L0: mamba_sa — Mamba + last token + CIF acoustic tokens → Self-Attention → FFN → output
-  decoder_layer_types: ["mamba_sa"]
+  # Decoder: MambaMonoAttnLayer
+  #   Mamba(tgt) → y_i  (token history)
+  #   MonotonicAttn(y_i, h_j, p_onset) → c_i  (audio context)
+  #   W_fuse(cat([y_i, c_i])) → pred
+  decoder_layer_types: ["mamba_mono_attn"]
   decoder_layer_ca_levels:
-    - null      # L0: mamba_sa handles its own attention
+    - null
   decoder_layer_full_freq:
     - null
   decoder_layer_cascade_com:
     - null
 
-  # bar_token_id: <bar>=4 still needed for bar_mask detection (schema injection)
   bar_token_id: 4
-  curriculum_warmup_steps: 0  # Disabled
 
-  # CIF (Continuous Integrate-and-Fire) — replaces BarMamba
-  # Decoupled design: fire_signal (BiMamba) + acoustic_src (Swin S0)
-  use_cif: true
-  cif_threshold: 0.5          # Probability threshold (CIF fires when onset_prob >= 0.5)
-  cif_conv_kernel: 3          # Temporal context (±1 frame @ 100fps = ±10ms, matches FunASR)
-  cif_quantity_loss_weight: 0.01    # |sum(onset_prob) - N_acoustic|
-                                     # Loss stages: init ~100 → mid ~30 → converged ~10
-                                     # Gradient: 0.03×100=3.0 → 0.03×30=0.9 → 0.03×10=0.3 (stable)
-  cif_avg_fires: 128               # avg <bar>+<nl> per 30s chunk
-  cif_window_k: 5                  # ±K fire slots for Windowed CA in MambaSALayer (covers qty_loss≈10 noise)
-  cif_perceiver_m: 8               # M Perceiver summary tokens per fire slot (compress L→M for CA)
+  # Onset detector (CIF-inspired, drives monotonic attention prior)
+  quantity_loss_weight: 0.01   # |sum(onset_prob) - N|, N = count(<nl>) + count(<bar>)
+  onset_conv_kernel: 3         # Temporal context for onset conv head
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
   tf_anneal_steps: 100000
 
-  # Window parameters
-  # Level 2 = BiMamba (50fps, 30s = 1500 frames).
-  # 512 frames ≈ ±5.1s ≈ ±1.7 bars at 80bpm (covers ±2 bars at ≥100bpm).
-  # Levels 0,1 values are unused (only level 2 is active).
+  # Window parameters (kept for compatibility, not used by mamba_mono_attn)
   window_time_frames: [32, 16, 512]
-  window_freq_bins: [4, 4, 1]         # level 2: H=1 (1D BiMamba), must be 1
+  window_freq_bins: [4, 4, 1]
   window_seq_chunk_size: 10000
-
-  # Exponential decay soft mask: score_j += -lambda * |t_j - com_t| (before softmax).
-  # λ=10: 1 bar (150 frames, 0.1 unit) → bias=-1.0 (soft). Range: 10–50.
   window_exp_decay_lambda: 10.0
 
   # Mamba config
@@ -117,7 +102,7 @@ model:
   label_smoothing: 0.0
 
   # Gradient checkpointing
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   window_ca_use_checkpoint: false
 
   # No guided attention
@@ -155,15 +140,15 @@ data:
 # Training
 # =============================================================================
 training:
-  batch_size: 8
-  gradient_accumulation_steps: 4
+  batch_size: 32
+  gradient_accumulation_steps: 1
   gradient_clip: 5.0
 
   learning_rate: 2.0e-4
-  weight_decay: 0.05
+  weight_decay: 0.01
   max_epochs: 50
   warmup_steps: 2500
-  lr_flat_ratio: 0.25  # WSD: 25% of post-warmup = flat plateau, 75% = cosine decay
+  lr_flat_ratio: 0.25   # WSD: 25% flat plateau, 75% cosine decay
   lr_min_ratio: 0.1
 
   save_every_n_epochs: 5

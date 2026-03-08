@@ -70,12 +70,12 @@ if [ "$WANDB" = "true" ]; then
     CMD="$CMD --wandb --wandb-project $WANDB_PROJECT"
 fi
 
-if [ -n "$RESUME" ]; then
-    CMD="$CMD --resume $RESUME"
-fi
-
 if [ -n "$RUN_NAME" ]; then
     CMD="$CMD --wandb-run-name $RUN_NAME"
+fi
+
+if [ -n "$RESUME" ]; then
+    CMD="$CMD --resume $RESUME"
 fi
 
 echo "Running:"

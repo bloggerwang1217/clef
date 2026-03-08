@@ -60,14 +60,9 @@ class ClefPianoConfig(ClefConfig):
     # 0.0 = disabled; recommended range: 10.0 (soft) to 50.0 (strong).
     window_exp_decay_lambda: float = 0.0
 
-    # CIF (Continuous Integrate-and-Fire) — replaces BarMamba for tiny model.
-    # Enabled when use_cif=True. Provides per-token acoustic embeddings without CA.
-    use_cif: bool = False
-    cif_threshold: float = 1.0         # fire threshold (standard = 1.0)
-    cif_conv_kernel: int = 3           # depthwise conv kernel for weight predictor
-    cif_active_level: int = 2          # memory level index to extract encoder_1d (BiMamba)
-    cif_quantity_loss_weight: float = 0.0  # weight for |sum(P_onset) - N_acoustic| loss
-    cif_schmitt_temp: float = 0.1          # Soft Schmitt Trigger temperature; smaller = sharper onset gate
+    # Onset detector (drives monotonic attention prior)
+    quantity_loss_weight: float = 0.01  # |sum(onset_prob) - N| where N = count(<nl>)+count(<bar>)
+    onset_conv_kernel: int = 3          # depthwise conv kernel for onset head
 
     # Gradient checkpointing (trades compute for memory)
     gradient_checkpointing: bool = False
@@ -148,6 +143,7 @@ class ClefPianoConfig(ClefConfig):
             swin_model=model_cfg.get("swin_model", defaults.swin_model),
             swin_dims=model_cfg.get("swin_dims", defaults.swin_dims),
             freeze_swin=model_cfg.get("freeze_swin", defaults.freeze_swin),
+            swin_use_gradient_checkpointing=model_cfg.get("swin_use_gradient_checkpointing", defaults.swin_use_gradient_checkpointing),
             swin_unfreeze=model_cfg.get("swin_unfreeze", defaults.swin_unfreeze),
             swin_lr_scale=model_cfg.get("swin_lr_scale", defaults.swin_lr_scale),
 
@@ -163,6 +159,7 @@ class ClefPianoConfig(ClefConfig):
             octopus_time_kernel=model_cfg.get("octopus_time_kernel", defaults.octopus_time_kernel),
             octopus_channels=model_cfg.get("octopus_channels", defaults.octopus_channels),
             octopus_time_pool_stride=model_cfg.get("octopus_time_pool_stride", defaults.octopus_time_pool_stride),
+            octopus_freq_pool_stride=model_cfg.get("octopus_freq_pool_stride", 4),
 
             # Swin input mode
             swin_start_stage=model_cfg.get("swin_start_stage", defaults.swin_start_stage),
@@ -228,14 +225,9 @@ class ClefPianoConfig(ClefConfig):
             window_time_frames=model_cfg.get("window_time_frames", defaults.window_time_frames),
             window_freq_bins=model_cfg.get("window_freq_bins", defaults.window_freq_bins),
             window_exp_decay_lambda=model_cfg.get("window_exp_decay_lambda", defaults.window_exp_decay_lambda),
-
-            # CIF
-            use_cif=model_cfg.get("use_cif", defaults.use_cif),
-            cif_threshold=model_cfg.get("cif_threshold", defaults.cif_threshold),
-            cif_conv_kernel=model_cfg.get("cif_conv_kernel", defaults.cif_conv_kernel),
-            cif_active_level=model_cfg.get("cif_active_level", defaults.cif_active_level),
-            cif_quantity_loss_weight=model_cfg.get("cif_quantity_loss_weight", defaults.cif_quantity_loss_weight),
-            cif_schmitt_temp=model_cfg.get("cif_schmitt_temp", defaults.cif_schmitt_temp),
+            # Onset detector
+            quantity_loss_weight=model_cfg.get("quantity_loss_weight", defaults.quantity_loss_weight),
+            onset_conv_kernel=model_cfg.get("onset_conv_kernel", defaults.onset_conv_kernel),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),
