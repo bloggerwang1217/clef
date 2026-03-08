@@ -105,8 +105,9 @@ docs/legacy/
 docs/ai-interaction/
 paper/
 
-# Musescore Tools
+# Tools
 tools/
+MV2H/
 
 # Paper drafts
 results/paper/
