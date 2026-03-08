@@ -237,8 +237,13 @@ class Trainer:
         self.swin_min_lr = swin_lr * lr_min_ratio if has_swin else None
 
         # Mixed precision
-        self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+        # BF16 has sufficient dynamic range and does NOT need loss scaling.
+        # GradScaler is only needed for FP16 (to prevent underflow).
+        # Using GradScaler with BF16 adds overhead (unscale + inf/NaN scan every step) for no benefit.
         self.autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        self.scaler = (
+            torch.amp.GradScaler('cuda') if self.autocast_dtype == torch.float16 else None
+        )
 
         # Training state
         self.epoch = 0

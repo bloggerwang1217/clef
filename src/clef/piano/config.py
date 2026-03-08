@@ -60,6 +60,12 @@ class ClefPianoConfig(ClefConfig):
     # 0.0 = disabled; recommended range: 10.0 (soft) to 50.0 (strong).
     window_exp_decay_lambda: float = 0.0
 
+    # GRU sequential mode for mamba_full_ca layers.
+    # Replaces Mamba.step() (no backward for SSM internals) with GRUCell (fully differentiable).
+    # Hypothesis validation: does audio-conditioned query (h_{t-1}) push pitch loss < 2?
+    use_gru_sequential: bool = False
+    tbptt_chunk_size: int = 256  # detach GRU hidden every N steps (0 = full BPTT)
+
     # Gradient checkpointing (trades compute for memory)
     gradient_checkpointing: bool = False
     window_ca_use_checkpoint: bool = True  # checkpoint per seq-chunk inside WindowCrossAttention
@@ -133,6 +139,7 @@ class ClefPianoConfig(ClefConfig):
             swin_model=model_cfg.get("swin_model", defaults.swin_model),
             swin_dims=model_cfg.get("swin_dims", defaults.swin_dims),
             freeze_encoder=model_cfg.get("freeze_encoder", defaults.freeze_encoder),
+            swin_use_gradient_checkpointing=model_cfg.get("swin_use_gradient_checkpointing", defaults.swin_use_gradient_checkpointing),
             swin_unfreeze=model_cfg.get("swin_unfreeze", defaults.swin_unfreeze),
             swin_lr_scale=model_cfg.get("swin_lr_scale", defaults.swin_lr_scale),
 
@@ -148,6 +155,7 @@ class ClefPianoConfig(ClefConfig):
             octopus_time_kernel=model_cfg.get("octopus_time_kernel", defaults.octopus_time_kernel),
             octopus_channels=model_cfg.get("octopus_channels", defaults.octopus_channels),
             octopus_time_pool_stride=model_cfg.get("octopus_time_pool_stride", defaults.octopus_time_pool_stride),
+            octopus_freq_pool_stride=model_cfg.get("octopus_freq_pool_stride", 4),
 
             # Swin input mode
             swin_start_stage=model_cfg.get("swin_start_stage", defaults.swin_start_stage),
@@ -209,6 +217,8 @@ class ClefPianoConfig(ClefConfig):
             window_time_frames=model_cfg.get("window_time_frames", defaults.window_time_frames),
             window_freq_bins=model_cfg.get("window_freq_bins", defaults.window_freq_bins),
             window_exp_decay_lambda=model_cfg.get("window_exp_decay_lambda", defaults.window_exp_decay_lambda),
+            use_gru_sequential=model_cfg.get("use_gru_sequential", defaults.use_gru_sequential),
+            tbptt_chunk_size=model_cfg.get("tbptt_chunk_size", defaults.tbptt_chunk_size),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),

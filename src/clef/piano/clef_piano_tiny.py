@@ -26,9 +26,9 @@ from transformers import Swinv2Model
 
 from .config import ClefPianoConfig
 from ..bimamba import BiMambaEncoder
-from ..bridge import MultiScaleBridge
 from ..decoder import ClefDecoder
 from ..flow import HarmonizingFlow, Octopus2D
+from ..swin import SwinEncoder
 
 
 class ClefPianoTiny(nn.Module):
@@ -73,39 +73,41 @@ class ClefPianoTiny(nn.Module):
             init=getattr(config, 'flow_init', 'log'),
         )
 
-        # === BiMamba Encoder (time-oriented, Zeng-style) ===
-        self.use_bimamba = getattr(config, 'use_bimamba_encoder', True)  # Now default
+        # === SwinEncoder (S0 + S1, acoustic feature extraction) ===
+        # Flow [B, T, 128] → SwinEncoder → [B, T/8, 384] @12.5fps
+        # S0: pitch/harmony features, S1: beat-aware features
+        self.swin = SwinEncoder(
+            input_dim=config.n_mels,  # 128 (Flow output dimension)
+            swin_model=getattr(config, 'swin_model', "microsoft/swinv2-tiny-patch4-window8-256"),
+            use_gradient_checkpointing=getattr(config, 'swin_use_gradient_checkpointing', False),
+        )
+
+        # Conv along freq axis to aggregate harmonic structure.
+        # Concat S0+S1: [B, H=16, W, 384] → permute → [B, 384, H=16, W]
+        # Two strided Conv2d: H=16 → 4 → 1 (each layer has local receptive field of 4 bins)
+        # Harmonic intervals are fixed in log-mel space, so local conv can learn them.
+        bimamba_d_model = getattr(config, 'bimamba_d_model', config.d_model)
+        swin_concat_dim = self.swin.output_dim * 2  # 192 * 2 = 384
+        self.freq_conv = nn.Sequential(
+            # [B, 384, H=16, W] → [B, bimamba_d_model, 4, W]
+            nn.Conv2d(swin_concat_dim, bimamba_d_model, kernel_size=(4, 1), stride=(4, 1)),
+            nn.GELU(),
+            # [B, bimamba_d_model, 4, W] → [B, bimamba_d_model, 1, W]
+            nn.Conv2d(bimamba_d_model, bimamba_d_model, kernel_size=(4, 1), stride=(4, 1)),
+        )
+
+        # === BiMamba Encoder (time-oriented, after Swin) ===
+        # swin_proj output [B, T/8, bimamba_d_model] → BiMamba temporal modeling
+        self.use_bimamba = getattr(config, 'use_bimamba_encoder', True)
         if self.use_bimamba:
-            # Flow output: [B, T, 128] — 128 is total frequency features
-            # BiMamba: Linear(128 → d_model) + Bi-Mamba temporal modeling
             self.bimamba_encoder = BiMambaEncoder(
-                input_dim=config.n_mels,  # 128 (Flow output dimension)
+                input_dim=bimamba_d_model,  # swin_proj output dimension
                 d_model=getattr(config, 'bimamba_d_model', config.d_model),
                 d_state=getattr(config, 'bimamba_d_state', 128),
                 d_conv=getattr(config, 'bimamba_d_conv', 4),
                 num_layers=getattr(config, 'bimamba_num_layers', 2),
                 dropout=getattr(config, 'bimamba_dropout', 0.1),
             )
-
-        # === Bridge: minimal (1 layer) ===
-        # Input dimensions for each level (Zeng-style, 3 levels):
-        # Level 0: Octopus (32 channels)
-        # Level 1: Flow (128 dims)
-        # Level 2: BiMamba (d_model, output from time-oriented Mamba)
-        octopus_channels = getattr(config, 'octopus_channels', 32)
-        bimamba_d_model = getattr(config, 'bimamba_d_model', config.d_model)
-        input_dims = [octopus_channels, config.n_mels, bimamba_d_model]
-
-        self.bridge = MultiScaleBridge(
-            swin_dims=config.swin_dims,  # Keep original for compatibility
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_levels=config.n_levels,  # 3: Octopus + Flow + S0
-            ff_dim=config.ff_dim,
-            dropout=config.dropout,
-            n_layers=getattr(config, 'bridge_layers', 1),
-            input_dims=input_dims,  # Specify actual input dimensions
-        )
 
         # === Decoder: 2 layers (SA+CA + Mamba) ===
         self.decoder = ClefDecoder(
@@ -137,17 +139,18 @@ class ClefPianoTiny(nn.Module):
             onset_1d_channels=getattr(config, 'octopus_channels', 32),
             bar_gru_hidden_size=getattr(config, 'bar_gru_hidden_size', 256),
             bar_gru_input_dropout=getattr(config, 'bar_gru_input_dropout', 0.1),
-            note_gru_hidden_size=getattr(config, 'note_gru_hidden_size', 256),
-            note_gru_input_dropout=getattr(config, 'note_gru_input_dropout', 0.1),
             # Curriculum Learning for mamba_full_ca path
             curriculum_warmup_steps=getattr(config, 'curriculum_warmup_steps', 0),
+            # GRU sequential mode (hypothesis validation)
+            use_gru_sequential=getattr(config, 'use_gru_sequential', False),
+            tbptt_chunk_size=getattr(config, 'tbptt_chunk_size', 256),
         )
 
 
         # === Token embedding ===
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
 
-        # Output projection
+        # Output projection: decoder output is [B, S, D] (MambaFullCALayer.out_proj handles 2D→D)
         self.output_projection = nn.Linear(config.d_model, config.vocab_size)
 
         # Gradient checkpointing (enabled via config)
@@ -205,61 +208,58 @@ class ClefPianoTiny(nn.Module):
         valid_ratios_list.append([1.0, 1.0])
 
         # === Step 2: Flow (pitch space transform) ===
-        flow_feat = self.flow(mel)  # [B, T, 128]
-
-        # Temporal pooling
-        pool_stride = getattr(self.config, 'flow_pool_stride', 4)
-        if pool_stride > 1:
-            flow_feat = flow_feat.permute(0, 2, 1)  # [B, 128, T]
-            flow_feat = F.avg_pool1d(flow_feat, kernel_size=pool_stride, stride=pool_stride)
-            flow_feat = flow_feat.permute(0, 2, 1)  # [B, T//4, 128]
-
+        flow_feat = self.flow(mel)  # [B, T, 128] @100fps
         T_flow = flow_feat.shape[1]
 
         # === Step 2.5: Integrate onset into pitch space ===
         onset_signal = self.onset_to_pitch(onset_raw).squeeze(1)  # [B, 128, T]
-
-        if pool_stride > 1:
-            onset_signal = F.avg_pool1d(onset_signal, kernel_size=pool_stride, stride=pool_stride)
-
-        onset_signal = onset_signal.permute(0, 2, 1)  # [B, T//4, 128]
-        onset_in_pitch = onset_signal @ self.flow.transform.T  # [B, T//4, 128]
-
+        onset_signal = onset_signal.permute(0, 2, 1)  # [B, T, 128]
+        onset_in_pitch = onset_signal @ self.flow.transform.T  # [B, T, 128]
         flow_with_onset = flow_feat + onset_in_pitch
 
         features.append(flow_with_onset)
         spatial_shapes_list.append((1, T_flow))
         valid_ratios_list.append([1.0, 1.0])
 
-        # === Step 3: BiMamba Encoder (Zeng-style, time-oriented) ===
-        # flow_with_onset: [B, T_flow, 128] — time-major, all frequencies visible
-        # This is exactly like Zeng's Bi-GRU input: (B, T, freq_features)
+        # === Step 3: SwinEncoder (S0 + S1) ===
+        # flow_with_onset: [B, T, 128] @100fps
+        # SwinEncoder: patch_embed (4x) + S0 downsample (2x) = 8x temporal reduction
+        # Output: [B, H, W, 192] @12.5fps where W = T/8
+        swin_s0, swin_s1 = self.swin(flow_with_onset)  # each [B, H, W, 192]
+        B_swin, H_swin, W_swin, D_swin = swin_s0.shape
+        T_swin = W_swin  # time dimension
 
+        # Concat S0+S1 along channel dim, then conv along freq axis.
+        # [B, H, W, 192] × 2 → [B, H, W, 384] → [B, 384, H, W] → freq_conv → [B, bimamba_d_model, 1, W]
+        swin_2d = torch.cat([swin_s0, swin_s1], dim=-1)          # [B, H, W, 384]
+        swin_2d = swin_2d.permute(0, 3, 1, 2)                    # [B, 384, H, W]
+        swin_2d = self.freq_conv(swin_2d)                         # [B, bimamba_d_model, 1, W]
+        swin_feat = swin_2d.squeeze(2).permute(0, 2, 1)          # [B, W, bimamba_d_model]
+
+        # === Step 4: BiMamba Encoder (time-oriented) ===
+        # swin_feat: [B, T_swin, 384] @12.5fps → BiMamba projects to d_model
+        encoder_hidden = None
         if self.use_bimamba:
-            # Apply time-oriented bidirectional Mamba (Zeng-style)
-            feat_bimamba = self.bimamba_encoder(flow_with_onset)
-            # feat_bimamba: [B, T_flow, d_model] — time-major output
+            feat_bimamba = self.bimamba_encoder(swin_feat)
+            # feat_bimamba: [B, T_swin, 384] @12.5fps
 
-            # BiMamba output is [B, W, d_model], treat as spatial shape (1, W)
-            features.append(feat_bimamba)
-            spatial_shapes_list.append((1, T_flow))  # Time-only (1D sequence)
-            valid_ratios_list.append([1.0, 1.0])
+            # Extract hidden state (last time step)
+            encoder_hidden = feat_bimamba[:, -1, :].unsqueeze(1)  # [B, 1, 384]
 
-        # === Bridge fusion ===
-        # Convert valid ratios to tensor
-        n_levels_actual = len(features)  # 3 or 4 depending on use_bimamba
-        level_valid_ratios = torch.tensor(
-            valid_ratios_list,
-            device=mel.device,
-            dtype=torch.float32
-        ).unsqueeze(0).expand(B, -1, -1)  # [B, n_levels, 2]
+            # BiMamba output as the only memory for decoder
+            memory = feat_bimamba  # [B, T_swin, 384]
+            spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
+            level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
+            valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
 
-        # Bridge will handle projection and concatenation
-        memory, spatial_shapes, level_start_index, valid_ratios = self.bridge(
-            features, spatial_shapes_list, level_valid_ratios
-        )
+            return memory, spatial_shapes, level_start_index, valid_ratios, encoder_hidden
 
-        return memory, spatial_shapes, level_start_index, valid_ratios
+        # Fallback (should not happen since use_bimamba=True by default)
+        memory = swin_feat
+        spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
+        level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
+        valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
+        return memory, spatial_shapes, level_start_index, valid_ratios, encoder_hidden
 
     def forward(
         self,
@@ -292,10 +292,13 @@ class ClefPianoTiny(nn.Module):
             total_loss: Same as loss (for compatibility)
         """
         # Encode
-        memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
+        memory, spatial_shapes, level_start_index, valid_ratios, encoder_hidden = self.encode(mel)
 
-        # Embed tokens
-        tgt = self.token_embed(input_ids)  # [B, S] → [B, S, D]
+        # Embed tokens (pure token embeddings, no encoder hidden added)
+        # Zeng: token embeddings are pure, encoder_hidden only used as:
+        #   1. Initial prev_out in sequential loop
+        #   2. CA query (via prev_out)
+        tgt = self.token_embed(input_ids)  # [B, S, D]
 
         # Decode
         # If scheduled sampling (tf_ratio < 1.0) is active during training, we need
@@ -307,6 +310,7 @@ class ClefPianoTiny(nn.Module):
                     tgt, memory, spatial_shapes, level_start_index, valid_ratios,
                     input_ids=input_ids,
                     tf_ratio=1.0,  # Pure TF for the first pass to get stable predictions
+                    encoder_hidden=encoder_hidden,
                 )
                 _logits = self.output_projection(_decoder_out)
                 # Greedy prediction → embedding
@@ -324,6 +328,7 @@ class ClefPianoTiny(nn.Module):
             input_ids=input_ids,
             tf_ratio=tf_ratio,
             pred_embs=pred_embs,
+            encoder_hidden=encoder_hidden,
         )
         logits = self.output_projection(decoder_out)
 
@@ -378,7 +383,7 @@ class ClefPianoTiny(nn.Module):
         device = mel.device
 
         # Encode once
-        memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
+        memory, spatial_shapes, level_start_index, valid_ratios, encoder_hidden = self.encode(mel)
 
         # Initialize with BOS
         generated = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
@@ -395,6 +400,7 @@ class ClefPianoTiny(nn.Module):
                 level_start_index,
                 valid_ratios,
                 input_ids=generated,
+                encoder_hidden=encoder_hidden,
             )
             if isinstance(decoder_out, tuple):
                 decoder_out = decoder_out[0]

@@ -30,7 +30,9 @@ GPUS="${GPUS:-1,2}"
 NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
 MASTER_PORT="${MASTER_PORT:-29501}"
 RESUME="${RESUME:-}"
-WANDB="${WANDB:-false}"
+WANDB="${WANDB:-true}"
+RUN_NAME="${RUN_NAME:-}"
+WANDB_PROJECT="${WANDB_PROJECT:-clef-piano-tiny}"
 
 # =============================================================================
 # Print summary
@@ -65,7 +67,11 @@ CMD="poetry run torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT -
 CMD="$CMD --config $CONFIG"
 
 if [ "$WANDB" = "true" ]; then
-    CMD="$CMD --wandb"
+    CMD="$CMD --wandb --wandb-project $WANDB_PROJECT"
+fi
+
+if [ -n "$RUN_NAME" ]; then
+    CMD="$CMD --wandb-run-name $RUN_NAME"
 fi
 
 if [ -n "$RESUME" ]; then

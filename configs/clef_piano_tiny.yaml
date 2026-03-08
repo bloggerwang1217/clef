@@ -19,17 +19,19 @@ seed:
 model:
   name: "clef-piano-tiny"
 
-  # NO Swin in Zeng-style design — BiMamba directly processes Flow output
-  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"  # Keep for compatibility
-  swin_dims: []  # No Swin stages used
+  # SwinEncoder (S0 + S1) for acoustic feature extraction
+  # Flow [B, T, 128] → SwinEncoder → [B, T/8, 384] @12.5fps
+  swin_model: "microsoft/swinv2-tiny-patch4-window8-256"
+  swin_dims: []  # Not used (Swin handles internally)
+  swin_use_gradient_checkpointing: false
   freeze_encoder: true
   swin_start_stage: 0
   swin_pool_strides: []
 
-  # BiMamba Encoder (time-oriented, Zeng 2024 style)
+  # BiMamba Encoder (time-oriented, after Swin)
   use_bimamba_encoder: true
-  bimamba_input_dim: 128      # Flow output dimension (n_mels)
-  bimamba_d_model: 512        # Match decoder d_model
+  bimamba_input_dim: 384      # Swin S0+S1 concat output dimension
+  bimamba_d_model: 384        # Match decoder d_model (Whisper tiny)
   bimamba_d_state: 128
   bimamba_d_conv: 4
   bimamba_num_layers: 2
@@ -46,33 +48,26 @@ model:
   # HarmonizingFlow (pitch space transform)
   use_flow: true
   n_harmonics: 6
-  flow_pool_stride: 1  # No pooling (10ms resolution)
+  flow_pool_stride: 1  # No pooling, directly to SwinEncoder
 
-  # Attention config
-  d_model: 512
-  n_heads: 8
-  n_levels: 3                  # Octopus (L0) + Flow (L1) + BiMamba (L2)
-  ff_dim: 2048
+  # Attention config (Whisper tiny: d_model=384, n_heads=6, ff_dim=1536)
+  d_model: 384
+  n_heads: 6
+  n_levels: 1                  # Only BiMamba output (level 0)
+  ff_dim: 1536                 # 4 × d_model
   dropout: 0.1
 
   rope_base: 10000.0
 
-  bridge_layers: 1
-
-  # Decoder: 2 layers (CA → Mamba)
-  #   L0: mamba_full_ca — Mamba + Window CA to BiMamba (level 2, 1D temporal)
-  #   L1: mamba_only    — sequential writing
-  decoder_layer_types: ["mamba_full_ca", "mamba_only"]
-  # decoder_layer_types: ["mamba_window_ca", "mamba_only"]  # window CA variant
+  # Decoder: 1 layer (SA + CA to BiMamba)
+  #   L0: mamba_full_ca — Mamba + CA, outputs cat([mamba_out, ca_out]) = 2D
+  decoder_layer_types: ["mamba_full_ca"]
   decoder_layer_ca_levels:
-    - [2]       # L0: Full CA to BiMamba (level 2, temporal features)
-    - null      # L1: Mamba only
+    - [0]       # L0: Full CA to BiMamba (level 0)
   decoder_layer_full_freq:
-    - true      # L0: BiMamba level 2 is H=1 (1D), full_freq is the only option
-    - null
+    - true      # L0: BiMamba level is H=1 (1D), full_freq is the only option
   decoder_layer_cascade_com:
     - false
-    - null
 
   # BarMamba: bar-level module for mamba_full_ca path
   bar_token_id: 4       # <bar> token ID in KernTokenizer vocab
@@ -80,6 +75,11 @@ model:
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
   tf_anneal_steps: 100000
+
+  # GRU sequential mode: replace Mamba.step() with GRUCell for hypothesis validation.
+  # Validates: does audio-conditioned query h_{t-1} push pitch loss below 2?
+  use_gru_sequential: true
+  tbptt_chunk_size: 256  # detach hidden state every 256 steps
 
   # Window parameters
   # Level 2 = BiMamba (50fps, 30s = 1500 frames).
@@ -142,12 +142,12 @@ data:
 # Training
 # =============================================================================
 training:
-  batch_size: 2
-  gradient_accumulation_steps: 2
+  batch_size: 32
+  gradient_accumulation_steps: 1
   gradient_clip: 1.0
 
   learning_rate: 2.0e-4
-  weight_decay: 0.05
+  weight_decay: 0.01
   max_epochs: 50
   warmup_steps: 1000
   lr_flat_ratio: 0.6   # WSD: 60% of post-warmup = flat plateau, 40% = cosine decay
@@ -161,5 +161,5 @@ training:
 # Paths
 # =============================================================================
 paths:
-  manifest_dir: "data/experiments/clef_piano_tiny"
+  manifest_dir: "data/experiments/clef_piano_base"  # Use base data for testing
   checkpoint_dir: "checkpoints/clef_piano_tiny"
