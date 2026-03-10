@@ -1097,8 +1097,8 @@ class MambaMonoAttnLayer(nn.Module):
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         # Scalar offset r (Raffel 2017 eq.16): added to energy before sigmoid.
-        # Initialized negative so p_{i,j} starts near 0 → pointer doesn't fire too early.
-        # Without r, sigmoid(0)=0.5 means every ~2 frames fire at init → poor gradients.
+        # r: fallback scalar offset used when onset_logit_bias is unavailable.
+        # When onset_logit_bias is provided, it serves as the inductive bias instead.
         self.r = nn.Parameter(torch.tensor(-4.0))
         self.dropout_attn = nn.Dropout(dropout)
 
@@ -1135,14 +1135,14 @@ class MambaMonoAttnLayer(nn.Module):
         K = self.k_proj(memory).reshape(B, T, H, dh).permute(0, 2, 1, 3)   # [B, H, T, dh]
 
         # Energy: e_{i,j} = Q_i · K_j / sqrt(dh) + onset_logit_bias_j + r
-        # r: learnable scalar offset (Raffel 2017 eq.16), initialized negative
-        #    so p starts near 0 → pointer doesn't fire prematurely at init
         energy = torch.matmul(Q, K.transpose(-2, -1)) / (dh ** 0.5)         # [B, H, S, T]
-        energy = energy.mean(dim=1) + self.r                                 # [B, S, T]
+        energy = energy.mean(dim=1)                                          # [B, S, T]
 
         if onset_logit_bias is not None:
-            # onset_logit_bias [B, T] → broadcast over S
+            # onset_logit_bias [B, T] acts as frame-varying inductive bias (replaces r)
             energy = energy + onset_logit_bias.unsqueeze(1)                  # [B, S, T]
+        else:
+            energy = energy + self.r                                         # [B, S, T]
 
         p = torch.sigmoid(energy)                                            # [B, S, T]
 
@@ -1196,7 +1196,7 @@ class MambaMonoAttnLayer(nn.Module):
         K = self.k_proj(memory).reshape(B, T, H, dh).permute(0, 2, 1, 3)   # [B, H, T, dh]
 
         energy = torch.matmul(Q, K.transpose(-2, -1)).squeeze(2) / (dh ** 0.5)  # [B, H, T]
-        energy = energy.mean(dim=1) + self.r + onset_logit_bias                 # [B, T]
+        energy = energy.mean(dim=1) + onset_logit_bias                           # [B, T]  (r not used; onset_logit_bias is the inductive bias)
         p_full = torch.sigmoid(energy)                                            # [B, T]
 
         # For each batch element, scan forward from its current ptr

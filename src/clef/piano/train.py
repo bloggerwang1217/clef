@@ -544,7 +544,9 @@ class Trainer:
                 else:
                     total_loss.backward()
 
-            accumulated_loss += ce_loss.item()
+            # Accumulate total_loss (CE + qty_loss) for logging
+            # Un-scale the division applied for gradient accumulation
+            accumulated_loss += total_loss.item() * self.gradient_accumulation_steps
 
             # Update weights every gradient_accumulation_steps
             if is_update_step:
@@ -600,20 +602,15 @@ class Trainer:
                     if guidance_loss_cached is not None:
                         log_dict['train/guidance_loss'] = guidance_loss_cached.item()
                         log_dict['train/guidance_weight'] = current_guidance_weight
+                    # Quantity loss (mono-attn architecture: stored on model._qty_loss)
+                    _model_inner = self.model.module if hasattr(self.model, 'module') else self.model
+                    qty_loss_cached = getattr(_model_inner, '_qty_loss', None)
+                    if qty_loss_cached is not None:
+                        log_dict['train/qty_loss'] = qty_loss_cached.item()
+                    # Legacy CIF quantity loss (old architecture)
                     cif_qty_loss_cached = getattr(decoder, '_cif_quantity_loss', None)
                     if cif_qty_loss_cached is not None:
                         log_dict['train/cif_quantity_loss'] = cif_qty_loss_cached.item()
-                        # Also log sum_alpha and target for diagnosis
-                        cif_sum_alpha = getattr(decoder, '_cif_sum_alpha', None)
-                        cif_target = getattr(decoder, '_cif_target', None)
-                        if cif_sum_alpha is not None:
-                            log_dict['train/cif_sum_alpha'] = cif_sum_alpha
-                        if cif_target is not None:
-                            log_dict['train/cif_target'] = cif_target
-                        # Log CIF bias to monitor training progress
-                        if decoder.cif is not None:
-                            cif_bias = decoder.cif.weight_proj.bias.item()
-                            log_dict['train/cif_bias'] = cif_bias
                     log_dict['train/tf_ratio'] = current_tf_ratio
 
                     if len(last_lrs) > 1:
@@ -697,21 +694,24 @@ class Trainer:
             mel_valid_ratios = batch['mel_valid_ratios'].to(self.device)
 
             with torch.amp.autocast('cuda', dtype=self.autocast_dtype):
-                logits, ce_loss, _ = self.model(
+                logits, ce_loss, total_loss_batch = self.model(
                     mel=mel,
                     input_ids=input_ids,
                     labels=labels,
                     mel_valid_ratios=mel_valid_ratios,
                 )
 
-            total_loss += ce_loss.item()
+            # Log total_loss (CE + qty) if available, else fall back to CE
+            loss_to_log = total_loss_batch if total_loss_batch is not None else ce_loss
+            total_loss += loss_to_log.item()
             num_batches += 1
 
-            # Accumulate CIF quantity loss (if available)
+            # Accumulate quantity loss (mono-attn: _qty_loss; legacy CIF: _cif_qty_loss)
             model_unwrapped = self.model.module if isinstance(self.model, DDP) else self.model
-            cif_qty_loss = getattr(model_unwrapped, '_cif_qty_loss', None)
-            if cif_qty_loss is not None:
-                total_qty_loss += cif_qty_loss.item()
+            qty_loss_val = getattr(model_unwrapped, '_qty_loss', None) \
+                        or getattr(model_unwrapped, '_cif_qty_loss', None)
+            if qty_loss_val is not None:
+                total_qty_loss += qty_loss_val.item()
 
             # Accumulate per-type losses
             breakdown = self._compute_loss_breakdown(logits, labels)

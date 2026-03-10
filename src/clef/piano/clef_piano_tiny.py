@@ -115,7 +115,7 @@ class ClefPianoTiny(nn.Module):
             nn.Conv2d(bimamba_d_model, bimamba_d_model, kernel_size=(4, 1), stride=(4, 1)),
         )
 
-        # === BiMamba Encoder ===
+        # === BiMamba Encoder (decoder memory) ===
         # swin_feat [B, T/8, D] → BiMamba → h [B, T/8, D]  (decoder memory h_j)
         self.bimamba_encoder = BiMambaEncoder(
             d_model=bimamba_d_model,
@@ -125,11 +125,11 @@ class ClefPianoTiny(nn.Module):
         )
 
         # === Onset Detector head ===
-        # Operates on flow_with_onset [B, T=3000, 128] @100fps for sharp impulse detection.
+        # Operates on flow_with_onset [B, T=3000, 128] @100fps directly.
         # Output p_onset_hires [B, 3000] is max-pooled 8x → [B, 375] for attention bias.
         self.onset_detector = OnsetDetector(
-            d_model=config.n_mels,                                # 128 (flow_with_onset dim)
-            hidden_dim=getattr(config, 'onset_hidden_dim', 128),  # CIF hidden dim
+            d_model=config.n_mels,                                # 128
+            hidden_dim=getattr(config, 'onset_hidden_dim', 128),
             conv_kernel=getattr(config, 'onset_conv_kernel', 3),
         )
 
@@ -197,10 +197,7 @@ class ClefPianoTiny(nn.Module):
         swin_2d = self.freq_conv(swin_2d)                               # [B, D, 1, W]
         swin_feat = swin_2d.squeeze(2).permute(0, 2, 1)                # [B, T_swin, D]
 
-        # Step 4: Onset detector on flow_with_onset @100fps
-        # Returns logits (before sigmoid) so we can:
-        #   - sigmoid → p_onset_hires for qty_loss (Σ ≈ N 性質保留)
-        #   - max_pool logits → logit_bias for attention energy (logit 空間一致)
+        # Step 4: Onset Detector @100fps
         onset_logits = self.onset_detector(flow_with_onset)             # [B, T=3000]
         p_onset_hires = torch.sigmoid(onset_logits)                     # [B, 3000]
         onset_logit_bias = F.max_pool1d(
@@ -267,6 +264,9 @@ class ClefPianoTiny(nn.Module):
 
             qty_weight = getattr(self.config, 'quantity_loss_weight', 0.01)
             total_loss = loss + qty_weight * qty_loss
+            self._qty_loss = qty_loss.detach()
+        else:
+            self._qty_loss = None
 
         return logits, loss, total_loss
 
