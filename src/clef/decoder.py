@@ -993,78 +993,165 @@ class MambaSALayer(nn.Module):
         return output
 
 
-def _monotonic_attn_alpha(
-    p: torch.Tensor,             # [B, S, T]  selection probs p_{i,j} = σ(energy)
-    alpha_init: torch.Tensor,    # [B, T]     α_{0,j} = 1[j=0]
-) -> torch.Tensor:
-    """Compute expected attention weights via monotonic recurrence (Raffel et al. 2017 eq.11-14).
 
-    Structure:
-      - Outer loop over i (output steps): SEQUENTIAL — α_{i,j} depends on α_{i-1,j}.
-      - Inner computation over j (memory positions): PARALLEL via cumprod + cumsum.
 
-    For each output step i, the recurrence is:
-        q_{i,j} = (1-p_{i,j-1}) * q_{i,j-1} + α_{i-1,j}
-        α_{i,j} = p_{i,j} * q_{i,j}
+# ─────────────────────────────────────────────────────────────────────────────
+# Isotonic Attention helpers  (Bengio & Frasconi 1995 IOHMM formulation)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Closed-form parallel-over-j solution:
-        cp[j]  = prod_{l=0}^{j-1}(1-p[l])   ← exclusive cumprod of decay factors
-        q[j]   = cp[j] * cumsum(α_prev / cp)[j]
-        α[j]   = p[j] * q[j]
+def _isotonic_context_varA(
+    onset_logit_bias: torch.Tensor,  # [B, T]  audio-only logit
+    V: torch.Tensor,                 # [B, T, D]  v_proj(memory)
+    S: int,                          # number of decoder steps (= sequence length)
+    n_heads: int,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Variant A — Pure HMM: p_j = σ(ℓ_j), audio-only.
 
-    Numerical stability: cp stays in (0,1] (no overflow); division uses safe eps clamp.
-    When cp[j] → 0 (far past positions), α_prev[j] is also ~0 (no mass there), so error is negligible.
-
-    Complexity: O(S) sequential outer steps, each O(T) parallel GPU ops = O(S * T) total.
+    Runs Raffel recurrence S times with the same p = σ(ℓ) for every step.
+    The onset prior drives ~N effective firings while every decoder position
+    gets its own context vector — no expand step needed.
+    O(S * T) sequential-over-i; each step O(T) parallel-over-j.
 
     Returns:
-        alpha: [B, S, T]
+        c:     [B, S, D]  context vectors  c_i = concat_h(Σ_j α_{i,j} V_{h,j})
+        alpha: [B, S, T]  attention weights α_{i,j}
     """
-    B, S, T = p.shape
-    device, dtype = p.device, p.dtype
+    B, T, D = V.shape
+    H, dh = n_heads, head_dim
+    device, dtype = V.device, V.dtype
 
-    alpha_prev = alpha_init                                                   # [B, T]
-    alphas = []
+    V_h = V.reshape(B, T, H, dh).permute(0, 2, 1, 3)   # [B, H, T, dh]
 
-    for i in range(S):
-        p_i = p[:, i, :]                                                      # [B, T]
+    p = torch.sigmoid(onset_logit_bias)            # [B, T]
+    one_minus_p = (1.0 - p).clamp(min=1e-8)
+    # Exclusive cumprod: cp[j] = prod_{l<j}(1-p[l])
+    cp = F.pad(
+        torch.cumprod(one_minus_p[:, :-1], dim=-1),
+        (1, 0), value=1.0,
+    )                                              # [B, T]
+    safe_cp = cp.clamp(min=1e-8)
 
-        # Exclusive cumprod of decay factors: cp[j] = prod_{l=0}^{j-1}(1-p_i[l])
-        # cp[0] = 1.0, cp[j] = (1-p[0])*(1-p[1])*...*(1-p[j-1])
-        one_minus_p = (1.0 - p_i).clamp(min=1e-8)                            # [B, T]
-        cp = F.pad(
-            torch.cumprod(one_minus_p[:, :-1], dim=-1),
-            (1, 0), value=1.0
-        )                                                                      # [B, T]
+    alpha_prev = torch.zeros(B, T, device=device, dtype=dtype)
+    alpha_prev[:, 0] = 1.0                         # initial mass at frame 0
 
-        # q[j] = cp[j] * cumsum(α_prev / cp)[j]
-        safe_cp = cp.clamp(min=1e-8)                                          # avoid 0-division
-        cs      = torch.cumsum(alpha_prev / safe_cp, dim=-1)                  # [B, T]
-        q_i     = cp * cs                                                     # [B, T]
-
-        alpha_i    = p_i * q_i                                                # [B, T]
+    contexts, alphas = [], []
+    for _ in range(S):
+        cs      = torch.cumsum(alpha_prev / safe_cp, dim=-1)
+        q_i     = cp * cs                              # [B, T]
+        alpha_i = p * q_i                              # [B, T]
+        # Multi-head context: each head reads different frequency subspace
+        c_i = torch.einsum('bt,bhtd->bhd', alpha_i, V_h).reshape(B, H * dh)  # [B, D]
+        contexts.append(c_i)
         alphas.append(alpha_i)
         alpha_prev = alpha_i
 
-    return torch.stack(alphas, dim=1)                                         # [B, S, T]
+    return torch.stack(contexts, dim=1), torch.stack(alphas, dim=1)  # [B,S,D], [B,S,T]
 
 
-class MambaMonoAttnLayer(nn.Module):
-    """Mamba + Monotonic Cross-Attention decoder layer.
+def _isotonic_context_varB(
+    y: torch.Tensor,                 # [B, S, D]  full Mamba output (all token positions)
+    onset_logit_bias: torch.Tensor,  # [B, T]
+    memory: torch.Tensor,            # [B, T, D]  raw encoder memory (for K)
+    V: torch.Tensor,                 # [B, T, D]  v_proj(memory)  (for context c)
+    q_proj: nn.Linear,
+    k_proj: nn.Linear,
+    qk_scale: nn.Parameter,          # learnable scalar λ
+    n_heads: int,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Variant B — IOHMM: p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j), query-dependent.
 
-    Implements the core CLEF decoder:
+    Every decoder position i queries the encoder, so recurrence runs S steps.
+    This mirrors Raffel's monotonic attention but adds onset_logit_bias as prior:
+    the prior drives ~N effective firings while every token can influence alignment.
 
-      Step 1: y = Mamba(tgt)                        [B, S, D]  — token history
-      Step 2: e_{i,j} = a(y_i, h_j) + logit_bias_j              — energy + onset prior
-              p_{i,j} = σ(e_{i,j})                 [B, S, T]
-              α_{i,j} via recurrence (Raffel 2017)  [B, S, T]  — expected alignment
-              c_i = Σ_j α_{i,j} h_j                [B, S, D]  — audio context
-      Step 3: W_fuse(cat([y, c])) → output          [B, S, D]
+    K is projected from raw memory (alignment gradient path).
+    V is projected from memory separately (content gradient path).
 
-    Gradient path: CE → c_i → α_{i,j} → p_{i,j} → onset_logit_bias → BiMamba
-    Training: soft α (differentiable expected value)
-    Inference: re-uses soft path (hard pointer optimization deferred)
+    Precomputes all Q_i [B,H,S,dh] and K_j [B,H,T,dh], then runs S recurrence steps.
+    O(S * T) sequential-over-i; each step O(T) parallel-over-j.
+
+    Returns:
+        c:     [B, S, D]  context vectors (one per decoder position)
+        alpha: [B, S, T]  attention weights
     """
+    B, S, D = y.shape
+    T = memory.shape[1]
+    H, dh = n_heads, head_dim
+    device, dtype = memory.device, memory.dtype
+
+    K = k_proj(memory).reshape(B, T, H, dh).permute(0, 2, 1, 3)     # [B, H, T, dh]
+    Q = q_proj(y).reshape(B, S, H, dh).permute(0, 2, 1, 3)          # [B, H, S, dh]
+
+    energy_qk = torch.matmul(Q, K.transpose(-2, -1)) / (dh ** 0.5)   # [B, H, S, T]
+    energy_qk = qk_scale * energy_qk.mean(dim=1)                      # [B, S, T]
+    p_all = torch.sigmoid(energy_qk + onset_logit_bias.unsqueeze(1))  # [B, S, T]
+
+    alpha_prev = torch.zeros(B, T, device=device, dtype=dtype)
+    alpha_prev[:, 0] = 1.0
+
+    V_h = V.reshape(B, T, H, dh).permute(0, 2, 1, 3)                 # [B, H, T, dh]
+
+    contexts, alphas = [], []
+    for i in range(S):
+        p_i         = p_all[:, i, :]                                   # [B, T]
+        one_minus_p = (1.0 - p_i).clamp(min=1e-8)
+        cp          = F.pad(
+            torch.cumprod(one_minus_p[:, :-1], dim=-1),
+            (1, 0), value=1.0,
+        )                                                               # [B, T]
+        safe_cp     = cp.clamp(min=1e-8)
+        cs          = torch.cumsum(alpha_prev / safe_cp, dim=-1)
+        q_i         = cp * cs                                          # [B, T]
+        alpha_i     = p_i * q_i                                        # [B, T]
+        # Multi-head context: each head reads different frequency subspace
+        c_i = torch.einsum('bt,bhtd->bhd', alpha_i, V_h).reshape(B, H * dh)  # [B, D]
+        contexts.append(c_i)
+        alphas.append(alpha_i)
+        alpha_prev  = alpha_i
+
+    return torch.stack(contexts, dim=1), torch.stack(alphas, dim=1)   # [B,S,D], [B,S,T]
+
+
+def _expand_context_by_onset(
+    c: torch.Tensor,         # [B, N, D]
+    input_ids: torch.Tensor, # [B, S]
+    bar_id: int = 4,
+    nl_id: int = 6,
+) -> torch.Tensor:
+    """Map N onset contexts → S token positions.
+
+    Assignment: each position s uses context of the onset that fires AT or BEFORE s.
+        n_idx[s] = cumsum(is_advance)[s] - 1, clamped to [0, N-1]
+
+    Returns: [B, S, D]
+    """
+    B, N, D = c.shape
+    S = input_ids.shape[1]
+    is_adv   = ((input_ids == bar_id) | (input_ids == nl_id)).long()
+    cumcount = torch.cumsum(is_adv, dim=1)                             # [B, S] ∈ [0, N]
+    n_idx    = (cumcount - 1).clamp(0, N - 1)                         # [B, S] ∈ [0, N-1]
+    return torch.gather(c, 1, n_idx.unsqueeze(-1).expand(B, S, D))    # [B, S, D]
+
+
+class MambaIsotonicAttnLayer(nn.Module):
+    """Mamba + Isotonic Cross-Attention (IOHMM) decoder layer.
+
+    Fires N times (once per <bar>/<nl> advance token), not S times.
+    N context vectors c [B, N, D] are computed via the Raffel recurrence,
+    then scattered back to [B, S, D] for fusion with Mamba output.
+
+    Variant A ('hmm'):   p_j = σ(ℓ_j)                   — audio-only, no Q/K
+    Variant B ('iohmm'): p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j) — query-conditioned
+
+    Gradient path:
+        CE → c_i → α_{i,j} → p_{i,j} → onset_logit_bias → OnsetDetector → BiMamba
+        VarB additionally: → Q_i / K_j → Mamba output y / encoder memory h
+    """
+
+    BAR_ID = 4
+    NL_ID  = 6
 
     def __init__(
         self,
@@ -1074,14 +1161,16 @@ class MambaMonoAttnLayer(nn.Module):
         expand: int = 2,
         n_heads: int = 6,
         dropout: float = 0.1,
+        variant: str = 'iohmm',    # 'hmm' or 'iohmm'
         **kwargs,
     ):
         super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
+        self.d_model  = d_model
+        self.n_heads  = n_heads
         self.head_dim = d_model // n_heads
+        self.variant  = variant
 
-        # Step 1: Mamba (token history accumulation)
+        # Step 1: Mamba (token history)
         self.norm_mamba = nn.LayerNorm(d_model)
         from mamba_ssm import Mamba2
         self.mamba = Mamba2(
@@ -1092,30 +1181,50 @@ class MambaMonoAttnLayer(nn.Module):
         )
         self.dropout_mamba = nn.Dropout(dropout)
 
-        # Step 2: Monotonic cross-attention projections
-        # Q from y_i, K from h_j (memory), multi-head dot-product
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        # Scalar offset r (Raffel 2017 eq.16): added to energy before sigmoid.
-        # r: fallback scalar offset used when onset_logit_bias is unavailable.
-        # When onset_logit_bias is provided, it serves as the inductive bias instead.
-        self.r = nn.Parameter(torch.tensor(-4.0))
+        # Step 2: Cross-attention projections
+        # Value projection shared by both variants; head-split inside recurrence
+        self.v_proj   = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)  # mix heads after concat
+        # Q/K projections only for IOHMM
+        if variant == 'iohmm':
+            self.q_proj   = nn.Linear(d_model, d_model, bias=False)
+            self.k_proj   = nn.Linear(d_model, d_model, bias=False)
+            self.qk_scale = nn.Parameter(torch.tensor(0.1))
         self.dropout_attn = nn.Dropout(dropout)
 
-        # Step 3: Fusion W_fuse(cat([y, c])) → D
-        self.fuse_proj = nn.Linear(2 * d_model, d_model)
+        # Step 3: Fusion W_fuse([y; c]) → D
+        self.fuse_proj    = nn.Linear(2 * d_model, d_model)
         self.dropout_fuse = nn.Dropout(dropout)
+
+    def _gather_advance_tokens(
+        self,
+        y: torch.Tensor,           # [B, S, D]
+        input_ids: torch.Tensor,   # [B, S]
+        N: int,
+    ) -> torch.Tensor:
+        """Extract Mamba output at advance token positions → [B, N, D]."""
+        B, S, D = y.shape
+        device = y.device
+        is_adv = ((input_ids == self.BAR_ID) | (input_ids == self.NL_ID))
+        y_adv  = torch.zeros(B, N, D, device=device, dtype=y.dtype)
+        for b in range(B):
+            pos = is_adv[b].nonzero(as_tuple=False).squeeze(-1)
+            n   = min(pos.numel(), N)
+            if n > 0:
+                y_adv[b, :n] = y[b, pos[:n]]
+        return y_adv                                                   # [B, N, D]
 
     def forward(
         self,
-        tgt: torch.Tensor,                              # [B, S, D]
-        memory: torch.Tensor,                           # [B, T, D]  BiMamba output h_j
+        tgt: torch.Tensor,                                # [B, S, D]
+        memory: torch.Tensor,                             # [B, T, D]
         spatial_shapes: torch.Tensor,
         level_start_index: torch.Tensor,
         valid_ratios: torch.Tensor,
         past_state=None,
         use_cache: bool = False,
-        onset_logit_bias: Optional[torch.Tensor] = None,  # [B, T]  from OnsetDetector
+        onset_logit_bias: Optional[torch.Tensor] = None, # [B, T]
+        input_ids: Optional[torch.Tensor] = None,         # [B, S]
         **kwargs,
     ) -> torch.Tensor:
         B, S, D = tgt.shape
@@ -1126,99 +1235,36 @@ class MambaMonoAttnLayer(nn.Module):
         # ── Step 1: Mamba (token history) ─────────────────────────────────────
         tgt_normed = self.norm_mamba(tgt)
         mamba_out  = self.mamba(tgt_normed, inference_params=mamba_state)
-        y = tgt + self.dropout_mamba(mamba_out)                              # [B, S, D]
+        y = tgt + self.dropout_mamba(mamba_out)                        # [B, S, D]
 
-        # ── Step 2: Monotonic Cross-Attention ─────────────────────────────────
-        # Q from y, K from memory h, multi-head scaled dot-product
-        H, dh = self.n_heads, self.head_dim
-        Q = self.q_proj(y).reshape(B, S, H, dh).permute(0, 2, 1, 3)        # [B, H, S, dh]
-        K = self.k_proj(memory).reshape(B, T, H, dh).permute(0, 2, 1, 3)   # [B, H, T, dh]
+        # ── Step 2: Isotonic Cross-Attention ──────────────────────────────────
+        if onset_logit_bias is None:
+            onset_logit_bias = torch.zeros(B, T, device=device, dtype=tgt.dtype)
 
-        # Energy: e_{i,j} = Q_i · K_j / sqrt(dh) + onset_logit_bias_j + r
-        energy = torch.matmul(Q, K.transpose(-2, -1)) / (dh ** 0.5)         # [B, H, S, T]
-        energy = energy.mean(dim=1)                                          # [B, S, T]
+        V = self.v_proj(memory)                                        # [B, T, D]
 
-        if onset_logit_bias is not None:
-            # onset_logit_bias [B, T] acts as frame-varying inductive bias (replaces r)
-            energy = energy + onset_logit_bias.unsqueeze(1)                  # [B, S, T]
+        if self.variant == 'hmm':
+            # HMM: p_j = σ(ℓ_j), audio-only, S steps → c [B, S, D] directly
+            c, _ = _isotonic_context_varA(
+                onset_logit_bias, V, S, self.n_heads, self.head_dim,
+            )
         else:
-            energy = energy + self.r                                         # [B, S, T]
-
-        p = torch.sigmoid(energy)                                            # [B, S, T]
-
-        # Monotonic attention recurrence: α_{i,j} via Raffel 2017 parallel scan
-        alpha_init = torch.zeros(B, T, device=device, dtype=tgt.dtype)
-        alpha_init[:, 0] = 1.0                                               # start at j=0
-        alpha = _monotonic_attn_alpha(p, alpha_init)                         # [B, S, T]
-
-        # Context vector: c_i = Σ_j α_{i,j} h_j
-        c = torch.bmm(alpha, memory)                                         # [B, S, D]
-        c = self.dropout_attn(c)
+            # IOHMM: p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j), S steps → c [B, S, D] directly
+            c, _ = _isotonic_context_varB(
+                y, onset_logit_bias, memory, V,
+                self.q_proj, self.k_proj, self.qk_scale,
+                self.n_heads, self.head_dim,
+            )
+        c = self.out_proj(c)
+        c_dense = self.dropout_attn(c)                                 # [B, S, D]
 
         # ── Step 3: Fusion ────────────────────────────────────────────────────
-        fused = self.fuse_proj(torch.cat([y, c], dim=-1))                   # [B, S, D]
+        fused  = self.fuse_proj(torch.cat([y, c_dense], dim=-1))      # [B, S, D]
         output = self.dropout_fuse(fused)
 
         if use_cache:
             return output, (None, mamba_state)
         return output
-
-    def decode_step(
-        self,
-        tgt: torch.Tensor,               # [B, S, D]  partial sequence so far
-        memory: torch.Tensor,            # [B, T, D]  encoder memory
-        onset_logit_bias: torch.Tensor,  # [B, T]     onset logit bias
-        ptr: torch.Tensor,               # [B]        current monotonic pointer (LongTensor)
-        tau: float = 0.5,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Hard monotonic decoding step for autoregressive inference.
-
-        Scans forward from ptr until p_{i,j} > tau, returns c_i = h[t_i].
-        Advances the pointer to the new position.
-
-        Returns:
-            output:  [B, D]  fused representation for last token
-            new_ptr: [B]     updated pointer positions
-        """
-        B, S, D = tgt.shape
-        T = memory.shape[1]
-        device = tgt.device
-
-        # Step 1: Mamba on full partial sequence
-        tgt_normed = self.norm_mamba(tgt)
-        mamba_out  = self.mamba(tgt_normed)
-        y = tgt + self.dropout_mamba(mamba_out)
-        y_last = y[:, -1:, :]                                       # [B, 1, D]
-
-        # Step 2: Hard monotonic attention — scan from ptr
-        H, dh = self.n_heads, self.head_dim
-        Q = self.q_proj(y_last).reshape(B, 1, H, dh).permute(0, 2, 1, 3)   # [B, H, 1, dh]
-        K = self.k_proj(memory).reshape(B, T, H, dh).permute(0, 2, 1, 3)   # [B, H, T, dh]
-
-        energy = torch.matmul(Q, K.transpose(-2, -1)).squeeze(2) / (dh ** 0.5)  # [B, H, T]
-        energy = energy.mean(dim=1) + onset_logit_bias                           # [B, T]  (r not used; onset_logit_bias is the inductive bias)
-        p_full = torch.sigmoid(energy)                                            # [B, T]
-
-        # For each batch element, scan forward from its current ptr
-        new_ptr = ptr.clone()
-        c_list  = []
-        for b in range(B):
-            p_b   = p_full[b]                        # [T]
-            start = ptr[b].item()
-            # Find first position >= start where p > tau
-            fired = (p_b[start:] > tau).nonzero(as_tuple=False)
-            if fired.numel() > 0:
-                t_i = start + fired[0].item()
-            else:
-                t_i = T - 1                          # fallback: last frame
-            new_ptr[b] = t_i
-            c_list.append(memory[b, t_i])            # [D]
-
-        c = torch.stack(c_list, dim=0).unsqueeze(1)  # [B, 1, D]
-
-        # Step 3: Fusion
-        fused = self.fuse_proj(torch.cat([y_last, c], dim=-1)).squeeze(1)   # [B, D]
-        return fused, new_ptr
 
 
 class MambaWindowCALayer(nn.Module):
@@ -1987,14 +2033,15 @@ class ClefDecoder(nn.Module):
                     cif_window_k=cif_window_k,
                     cif_summary_m=cif_perceiver_m,
                 ))
-            elif lt == 'mamba_mono_attn':
-                self.layers.append(MambaMonoAttnLayer(
+            elif lt in ('isotonic_hmm', 'isotonic_iohmm'):
+                self.layers.append(MambaIsotonicAttnLayer(
                     d_model=d_model,
                     d_state=d_state,
                     d_conv=d_conv,
                     expand=expand,
                     n_heads=n_heads,
                     dropout=dropout,
+                    variant='hmm' if lt == 'isotonic_hmm' else 'iohmm',
                 ))
             elif lt == 'mamba_full_ca':
                 self.layers.append(MambaFullCALayer(
@@ -2430,8 +2477,9 @@ class ClefDecoder(nn.Module):
                     guidance_bounds=layer_guidance_bounds,
                     bar_mask=bar_mask,
                 )
-                if isinstance(layer, MambaMonoAttnLayer):
+                if isinstance(layer, MambaIsotonicAttnLayer):
                     layer_kwargs['onset_logit_bias'] = p_onset
+                    layer_kwargs['input_ids']        = input_ids
                 elif isinstance(layer, (MambaFullCALayer, MambaCIFLayer, MambaSALayer)):
                     layer_kwargs['tgt_query'] = tgt_query
                     if acoustic_embs_dense is not None:

@@ -1,17 +1,18 @@
 """
-Clef Piano Tiny Model — Mono-Attn Architecture
-===============================================
+Clef Piano Tiny Model — Isotonic Attention Architecture
+========================================================
 
 Encoder: Octopus2D → Flow → SwinEncoder → freq_conv → BiMamba
          + Onset detector head → p_onset [B, T]
 
-Decoder: MambaMonoAttnLayer
-  Step 1: y = Mamba(tgt)                          [B, S, D]
-  Step 2: c_i = Σ_j α_{i,j} h_j  (monotonic attn) [B, S, D]
+Decoder: MambaIsotonicAttnLayer (IOHMM formulation, Bengio & Frasconi 1995)
+  Step 1: y = Mamba(tgt)                               [B, S, D]
+  Step 2: p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j)            (IOHMM transition)
+          α_{i,j} via Raffel recurrence  →  c [B, N, D] → expand → [B, S, D]
   Step 3: W_fuse(cat([y_i, c_i])) → pred
 
-Alignment: α_{i,j} driven by p_onset as logit bias.
-           Gradient: CE loss → α → p_onset → BiMamba (fully differentiable).
+Alignment: N onset vectors (one per <bar>/<nl>), not S.
+           Gradient: CE → α → p_{i,j} → onset_logit_bias → BiMamba.
            Quantity loss: |Σ p_onset - N| where N = count(<nl>) + count(<bar>).
 """
 
@@ -66,11 +67,11 @@ class OnsetDetector(nn.Module):
 
 
 class ClefPianoTiny(nn.Module):
-    """Clef Piano Tiny with Monotonic Attention decoder.
+    """Clef Piano Tiny with Isotonic Attention decoder.
 
     Encoder:  Octopus → Flow → Swin → freq_conv → BiMamba → h [B, T=375, D=384]
               + OnsetDetector(h) → p_onset [B, T]
-    Decoder:  MambaMonoAttnLayer (see decoder.py)
+    Decoder:  MambaIsotonicAttnLayer (IOHMM, see decoder.py)
     """
 
     def __init__(self, config: ClefPianoConfig):
@@ -133,7 +134,7 @@ class ClefPianoTiny(nn.Module):
             conv_kernel=getattr(config, 'onset_conv_kernel', 3),
         )
 
-        # === Decoder: MambaMonoAttnLayer ===
+        # === Decoder: MambaIsotonicAttnLayer ===
         self.decoder = ClefDecoder(
             d_model=config.d_model,
             n_heads=config.n_heads,
@@ -154,7 +155,7 @@ class ClefPianoTiny(nn.Module):
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
             use_rope=True,
-            bar_token_id=None,  # MambaMonoAttnLayer handles alignment, no BarMamba needed
+            bar_token_id=None,  # MambaIsotonicAttnLayer handles alignment, no BarMamba needed
             onset_1d_channels=octopus_channels,
         )
 
@@ -285,7 +286,9 @@ class ClefPianoTiny(nn.Module):
     ) -> torch.Tensor:
         """Greedy autoregressive generation.
 
-        At each step, the decoder uses hard monotonic pointer to select h_{t_i}.
+        MambaIsotonicAttnLayer is used in full-sequence soft mode each step:
+        the decoder re-runs over the growing generated sequence and reads the
+        last token's logits.  N onsets are counted from the generated tokens.
         """
         B = mel.shape[0]
         device = mel.device
@@ -294,21 +297,19 @@ class ClefPianoTiny(nn.Module):
 
         generated = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
 
-        # Hard monotonic pointer — one per batch element, starts at frame 0
-        layer = self.decoder.layers[0]  # MambaMonoAttnLayer
-        ptr = torch.zeros(B, dtype=torch.long, device=device)
-
         for _ in range(max_len - 1):
-            tgt = self.token_embed(generated)
+            tgt = self.token_embed(generated)                         # [B, S, D]
 
-            # Hard monotonic decode step: scans from ptr, advances pointer
-            fused, ptr = layer.decode_step(
-                tgt, memory, onset_logit_bias, ptr
-            )                                                         # fused [B, D]
+            decoder_out = self.decoder(
+                tgt, memory,
+                spatial_shapes, level_start_index, valid_ratios,
+                input_ids=generated,
+                p_onset=onset_logit_bias,
+            )                                                         # [B, S, D]
 
-            logits = self.output_projection(fused)                    # [B, vocab]
-            next_token = logits.argmax(dim=-1, keepdim=True)          # [B, 1]
-            generated = torch.cat([generated, next_token], dim=1)
+            logits      = self.output_projection(decoder_out[:, -1]) # [B, vocab]
+            next_token  = logits.argmax(dim=-1, keepdim=True)        # [B, 1]
+            generated   = torch.cat([generated, next_token], dim=1)
 
             if (next_token == eos_token_id).all():
                 break

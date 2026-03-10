@@ -2,7 +2,7 @@
 # =======================================
 #
 # Architecture: Octopus + Flow + Swin + BiMamba encoder
-#               MambaMonoAttnLayer decoder (monotonic attention + onset prior)
+#               MambaIsotonicAttnLayer decoder (IOHMM, Bengio & Frasconi 1995)
 # Goal: Beat SOTA with principled temporal alignment
 #
 # This YAML is the single source of truth for ALL hyperparameters.
@@ -64,11 +64,11 @@ model:
 
   bridge_layers: 1
 
-  # Decoder: MambaMonoAttnLayer
+  # Decoder: MambaIsotonicAttnLayer (IOHMM variant)
   #   Mamba(tgt) → y_i  (token history)
-  #   MonotonicAttn(y_i, h_j, p_onset) → c_i  (audio context)
-  #   W_fuse(cat([y_i, c_i])) → pred
-  decoder_layer_types: ["mamba_mono_attn"]
+  #   p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j)  →  α_{i,j} via Raffel recurrence
+  #   c [B, N, D] → expand → [B, S, D]  →  W_fuse([y; c]) → pred
+  decoder_layer_types: ["isotonic_hmm"]
   decoder_layer_ca_levels:
     - null
   decoder_layer_full_freq:
@@ -85,7 +85,7 @@ model:
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
   tf_anneal_steps: 100000
 
-  # Window parameters (kept for compatibility, not used by mamba_mono_attn)
+  # Window parameters (kept for compatibility, not used by isotonic_iohmm)
   window_time_frames: [32, 16, 512]
   window_freq_bins: [4, 4, 1]
   window_seq_chunk_size: 10000
