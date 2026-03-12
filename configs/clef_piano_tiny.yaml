@@ -68,7 +68,7 @@ model:
   #   Mamba(tgt) → y_i  (token history)
   #   p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j)  →  α_{i,j} via Raffel recurrence
   #   c [B, N, D] → expand → [B, S, D]  →  W_fuse([y; c]) → pred
-  decoder_layer_types: ["isotonic_hmm"]
+  decoder_layer_types: ["isotonic"]
   decoder_layer_ca_levels:
     - null
   decoder_layer_full_freq:
@@ -86,7 +86,7 @@ model:
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
   tf_anneal_steps: 100000
 
-  # Window parameters (kept for compatibility, not used by isotonic_iohmm)
+  # Window parameters (kept for compatibility, not used by isotonic)
   window_time_frames: [32, 16, 512]
   window_freq_bins: [4, 4, 1]
   window_seq_chunk_size: 10000

@@ -999,72 +999,25 @@ class MambaSALayer(nn.Module):
 # Isotonic Attention helpers  (Bengio & Frasconi 1995 IOHMM formulation)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _isotonic_context_varA(
-    onset_logit_bias: torch.Tensor,  # [B, T]  audio-only logit
-    V: torch.Tensor,                 # [B, T, D]  v_proj(memory)
-    S: int,                          # number of decoder steps (= sequence length)
-    n_heads: int,
-    head_dim: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Variant A — Pure HMM: p_j = σ(ℓ_j), audio-only.
-
-    Runs Raffel recurrence S times with the same p = σ(ℓ) for every step.
-    The onset prior drives ~N effective firings while every decoder position
-    gets its own context vector — no expand step needed.
-    O(S * T) sequential-over-i; each step O(T) parallel-over-j.
-
-    Returns:
-        c:     [B, S, D]  context vectors  c_i = concat_h(Σ_j α_{i,j} V_{h,j})
-        alpha: [B, S, T]  attention weights α_{i,j}
-    """
-    B, T, D = V.shape
-    H, dh = n_heads, head_dim
-    device, dtype = V.device, V.dtype
-
-    V_h = V.reshape(B, T, H, dh).permute(0, 2, 1, 3)   # [B, H, T, dh]
-
-    p = torch.sigmoid(onset_logit_bias)            # [B, T]
-    one_minus_p = (1.0 - p).clamp(min=1e-8)
-    # Exclusive cumprod: cp[j] = prod_{l<j}(1-p[l])
-    cp = F.pad(
-        torch.cumprod(one_minus_p[:, :-1], dim=-1),
-        (1, 0), value=1.0,
-    )                                              # [B, T]
-    safe_cp = cp.clamp(min=1e-8)
-
-    alpha_prev = torch.zeros(B, T, device=device, dtype=dtype)
-    alpha_prev[:, 0] = 1.0                         # initial mass at frame 0
-
-    contexts, alphas = [], []
-    for _ in range(S):
-        cs      = torch.cumsum(alpha_prev / safe_cp, dim=-1)
-        q_i     = cp * cs                              # [B, T]
-        alpha_i = p * q_i                              # [B, T]
-        # Multi-head context: each head reads different frequency subspace
-        c_i = torch.einsum('bt,bhtd->bhd', alpha_i, V_h).reshape(B, H * dh)  # [B, D]
-        contexts.append(c_i)
-        alphas.append(alpha_i)
-        alpha_prev = alpha_i
-
-    return torch.stack(contexts, dim=1), torch.stack(alphas, dim=1)  # [B,S,D], [B,S,T]
-
-
-def _isotonic_context_varB(
+def _isotonic_context(
     y: torch.Tensor,                 # [B, S, D]  full Mamba output (all token positions)
-    onset_logit_bias: torch.Tensor,  # [B, T]
+    onset_logit_bias: torch.Tensor,  # [B, T]  shifted logit (ℓ_j - μ)
     memory: torch.Tensor,            # [B, T, D]  raw encoder memory (for K)
     V: torch.Tensor,                 # [B, T, D]  v_proj(memory)  (for context c)
     q_proj: nn.Linear,
     k_proj: nn.Linear,
-    qk_scale: nn.Parameter,          # learnable scalar λ
+    onset_scale: nn.Parameter,       # learnable λ: scales onset prior strength
     n_heads: int,
     head_dim: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Variant B — IOHMM: p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j), query-dependent.
+    """IOHMM: p_{i,j} = σ(Q_i·K_j/√d + λ·ℓ_j), query-conditioned alignment.
 
-    Every decoder position i queries the encoder, so recurrence runs S steps.
-    This mirrors Raffel's monotonic attention but adds onset_logit_bias as prior:
-    the prior drives ~N effective firings while every token can influence alignment.
+    Q·K/√d is the main signal (decoder controls when to advance and what to attend).
+    λ·ℓ_j is the onset prior (audio marks which frames are onsets).
+
+    With dual ascent calibrating μ so that ℓ_j - μ ≈ 0 at onset frames:
+    - onset frames:     prior ≈ σ(0) = 0.5, Q·K decides
+    - non-onset frames: prior ≈ σ(λ·neg) ≈ 0, strongly suppressed
 
     K is projected from raw memory (alignment gradient path).
     V is projected from memory separately (content gradient path).
@@ -1085,8 +1038,8 @@ def _isotonic_context_varB(
     Q = q_proj(y).reshape(B, S, H, dh).permute(0, 2, 1, 3)          # [B, H, S, dh]
 
     energy_qk = torch.matmul(Q, K.transpose(-2, -1)) / (dh ** 0.5)   # [B, H, S, T]
-    energy_qk = qk_scale * energy_qk.mean(dim=1)                      # [B, S, T]
-    p_all = torch.sigmoid(energy_qk + onset_logit_bias.unsqueeze(1))  # [B, S, T]
+    energy_qk = energy_qk.mean(dim=1)                                  # [B, S, T]
+    p_all = torch.sigmoid(energy_qk + onset_scale * onset_logit_bias.unsqueeze(1))  # [B, S, T]
 
     alpha_prev = torch.zeros(B, T, device=device, dtype=dtype)
     alpha_prev[:, 0] = 1.0
@@ -1138,16 +1091,15 @@ def _expand_context_by_onset(
 class MambaIsotonicAttnLayer(nn.Module):
     """Mamba + Isotonic Cross-Attention (IOHMM) decoder layer.
 
-    Fires N times (once per <bar>/<nl> advance token), not S times.
-    N context vectors c [B, N, D] are computed via the Raffel recurrence,
-    then scattered back to [B, S, D] for fusion with Mamba output.
+    p_{i,j} = σ(Q_i·K_j/√d + λ·(ℓ_j - μ))
 
-    Variant A ('hmm'):   p_j = σ(ℓ_j)                   — audio-only, no Q/K
-    Variant B ('iohmm'): p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j) — query-conditioned
+    Q·K/√d is the main signal: decoder controls when to advance and what to attend.
+    λ·(ℓ_j - μ) is the onset prior: audio marks which frames are onsets.
+    μ (dual_mu) calibrates ℓ so onset frames sit at the decision boundary (≈0.5 prior).
 
     Gradient path:
-        CE → c_i → α_{i,j} → p_{i,j} → onset_logit_bias → OnsetDetector → BiMamba
-        VarB additionally: → Q_i / K_j → Mamba output y / encoder memory h
+        CE → c_i → α_{i,j} → p_{i,j} → Q_i / K_j → Mamba output y / encoder memory h
+                                        → onset_logit_bias → OnsetDetector → BiMamba
     """
 
     BAR_ID = 4
@@ -1161,14 +1113,12 @@ class MambaIsotonicAttnLayer(nn.Module):
         expand: int = 2,
         n_heads: int = 6,
         dropout: float = 0.1,
-        variant: str = 'iohmm',    # 'hmm' or 'iohmm'
         **kwargs,
     ):
         super().__init__()
         self.d_model  = d_model
         self.n_heads  = n_heads
         self.head_dim = d_model // n_heads
-        self.variant  = variant
 
         # Step 1: Mamba (token history)
         self.norm_mamba = nn.LayerNorm(d_model)
@@ -1182,14 +1132,11 @@ class MambaIsotonicAttnLayer(nn.Module):
         self.dropout_mamba = nn.Dropout(dropout)
 
         # Step 2: Cross-attention projections
-        # Value projection shared by both variants; head-split inside recurrence
-        self.v_proj   = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)  # mix heads after concat
-        # Q/K projections only for IOHMM
-        if variant == 'iohmm':
-            self.q_proj   = nn.Linear(d_model, d_model, bias=False)
-            self.k_proj   = nn.Linear(d_model, d_model, bias=False)
-            self.qk_scale = nn.Parameter(torch.tensor(0.1))
+        self.v_proj      = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj    = nn.Linear(d_model, d_model, bias=False)
+        self.q_proj      = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj      = nn.Linear(d_model, d_model, bias=False)
+        self.onset_scale = nn.Parameter(torch.tensor(0.1))  # λ: onset prior strength
         self.dropout_attn = nn.Dropout(dropout)
 
         # Step 3: Fusion W_fuse([y; c]) → D
@@ -1243,18 +1190,11 @@ class MambaIsotonicAttnLayer(nn.Module):
 
         V = self.v_proj(memory)                                        # [B, T, D]
 
-        if self.variant == 'hmm':
-            # HMM: p_j = σ(ℓ_j), audio-only, S steps → c [B, S, D] directly
-            c, _ = _isotonic_context_varA(
-                onset_logit_bias, V, S, self.n_heads, self.head_dim,
-            )
-        else:
-            # IOHMM: p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j), S steps → c [B, S, D] directly
-            c, _ = _isotonic_context_varB(
-                y, onset_logit_bias, memory, V,
-                self.q_proj, self.k_proj, self.qk_scale,
-                self.n_heads, self.head_dim,
-            )
+        c, _ = _isotonic_context(
+            y, onset_logit_bias, memory, V,
+            self.q_proj, self.k_proj, self.onset_scale,
+            self.n_heads, self.head_dim,
+        )
         c = self.out_proj(c)
         c_dense = self.dropout_attn(c)                                 # [B, S, D]
 
@@ -2033,7 +1973,7 @@ class ClefDecoder(nn.Module):
                     cif_window_k=cif_window_k,
                     cif_summary_m=cif_perceiver_m,
                 ))
-            elif lt in ('isotonic_hmm', 'isotonic_iohmm'):
+            elif lt == 'isotonic':
                 self.layers.append(MambaIsotonicAttnLayer(
                     d_model=d_model,
                     d_state=d_state,
@@ -2041,7 +1981,6 @@ class ClefDecoder(nn.Module):
                     expand=expand,
                     n_heads=n_heads,
                     dropout=dropout,
-                    variant='hmm' if lt == 'isotonic_hmm' else 'iohmm',
                 ))
             elif lt == 'mamba_full_ca':
                 self.layers.append(MambaFullCALayer(
