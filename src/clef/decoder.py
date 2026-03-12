@@ -1006,47 +1006,57 @@ def _isotonic_context(
     V: torch.Tensor,                 # [B, T, D]  v_proj(memory)  (for context c)
     q_proj: nn.Linear,
     k_proj: nn.Linear,
+    q_tilde_proj: nn.Linear,         # MoChA-IL: separate soft-attention query
+    k_tilde_proj: nn.Linear,         # MoChA-IL: separate soft-attention key
     onset_scale: nn.Parameter,       # learnable λ: scales onset prior strength
     n_heads: int,
     head_dim: int,
+    window_size: int = 4,            # MoChA Gaussian window half-width (frames)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """IOHMM: p_{i,j} = σ(Q_i·K_j/√d + λ·ℓ_j), query-conditioned alignment.
+    """MoChA-IL: shared monotonic pointer + per-head windowed soft retrieval.
 
-    Q·K/√d is the main signal (decoder controls when to advance and what to attend).
-    λ·ℓ_j is the onset prior (audio marks which frames are onsets).
+    Two-stage design (Chiu & Raffel 2018, MoChA + MMA-IL):
+      Stage 1 — Shared monotonic gate (single Raffel recurrence, all heads share pointer):
+        p_{i,j} = σ(mean_h[Q^h_i · K^h_j / √dh] + λ·ℓ_j)
+        α_{i,j} via Raffel recurrence  →  expected pointer μ_i = Σ_j j·α_{i,j}
 
-    With dual ascent calibrating μ so that ℓ_j - μ ≈ 0 at onset frames:
-    - onset frames:     prior ≈ σ(0) = 0.5, Q·K decides
-    - non-onset frames: prior ≈ σ(λ·neg) ≈ 0, strongly suppressed
+      Stage 2 — Per-head windowed soft retrieval (MoChA-IL, separate q̃/k̃):
+        window weight: w_{i,j} = exp(-(j - μ_i)² / (2σ²)),  σ = window_size/2
+        β^h_{i,j} = softmax(q̃^h_i · k̃^h_j / √dh  +  log w_{i,j},  dim=T)
+        c^h_i = Σ_j β^h_{i,j} · V^h_j
 
-    K is projected from raw memory (alignment gradient path).
-    V is projected from memory separately (content gradient path).
+    Shared pointer rationale: piano transcription has a single time axis — all heads
+    should point to the same time frame. Per-head independent pointers (MMA) would
+    allow heads to diverge in time, which has no physical meaning here.
 
-    Precomputes all Q_i [B,H,S,dh] and K_j [B,H,T,dh], then runs S recurrence steps.
-    O(S * T) sequential-over-i; each step O(T) parallel-over-j.
+    Per-head soft retrieval: different heads attend to different pitch/harmonic
+    subspaces within the shared Gaussian window (MoChA-IL separation of gate vs
+    value projections prevents gradient interference).
 
     Returns:
         c:     [B, S, D]  context vectors (one per decoder position)
-        alpha: [B, S, T]  attention weights
+        alpha: [B, S, T]  monotonic alignment weights (shared pointer)
     """
     B, S, D = y.shape
     T = memory.shape[1]
     H, dh = n_heads, head_dim
     device, dtype = memory.device, memory.dtype
 
+    # --- Stage 1: Monotonic gate projections ---
     K = k_proj(memory).reshape(B, T, H, dh).permute(0, 2, 1, 3)     # [B, H, T, dh]
     Q = q_proj(y).reshape(B, S, H, dh).permute(0, 2, 1, 3)          # [B, H, S, dh]
 
+    # Gate energy: average over heads → single shared monotonic pointer
     energy_qk = torch.matmul(Q, K.transpose(-2, -1)) / (dh ** 0.5)   # [B, H, S, T]
-    energy_qk = energy_qk.mean(dim=1)                                  # [B, S, T]
-    p_all = torch.sigmoid(energy_qk + onset_scale * onset_logit_bias.unsqueeze(1))  # [B, S, T]
+    p_all = torch.sigmoid(
+        energy_qk.mean(dim=1) + onset_scale * onset_logit_bias[:, None, :]  # [B, S, T]
+    )
 
-    alpha_prev = torch.zeros(B, T, device=device, dtype=dtype)
+    # Shared Raffel recurrence (single pointer for all heads — one time axis)
+    alpha_prev = torch.zeros(B, T, device=device, dtype=dtype)        # [B, T]
     alpha_prev[:, 0] = 1.0
 
-    V_h = V.reshape(B, T, H, dh).permute(0, 2, 1, 3)                 # [B, H, T, dh]
-
-    contexts, alphas = [], []
+    alpha_list = []
     for i in range(S):
         p_i         = p_all[:, i, :]                                   # [B, T]
         one_minus_p = (1.0 - p_i).clamp(min=1e-8)
@@ -1058,13 +1068,33 @@ def _isotonic_context(
         cs          = torch.cumsum(alpha_prev / safe_cp, dim=-1)
         q_i         = cp * cs                                          # [B, T]
         alpha_i     = p_i * q_i                                        # [B, T]
-        # Multi-head context: each head reads different frequency subspace
-        c_i = torch.einsum('bt,bhtd->bhd', alpha_i, V_h).reshape(B, H * dh)  # [B, D]
-        contexts.append(c_i)
-        alphas.append(alpha_i)
+        alpha_list.append(alpha_i)
         alpha_prev  = alpha_i
 
-    return torch.stack(contexts, dim=1), torch.stack(alphas, dim=1)   # [B,S,D], [B,S,T]
+    alpha_all = torch.stack(alpha_list, dim=1)                         # [B, S, T]
+
+    # --- Stage 2: MoChA-IL windowed soft retrieval (per-head) ---
+    # Expected pointer position: μ_i = Σ_j j·α_{i,j}  (shared across heads)
+    j_idx = torch.arange(T, device=device, dtype=dtype)               # [T]
+    mu    = (alpha_all * j_idx).sum(dim=-1)                           # [B, S]
+
+    # Gaussian window: log w_{i,j} = -(j - μ)² / (2σ²), σ = window_size/2
+    sigma = window_size / 2.0
+    dist2      = (j_idx.view(1, 1, T) - mu.unsqueeze(-1)) ** 2       # [B, S, T]
+    log_window = (-dist2 / (2.0 * sigma ** 2)).unsqueeze(1)           # [B, 1, S, T] → broadcast over H
+
+    # Soft-attention projections (separate from gate, MoChA-IL)
+    K_t = k_tilde_proj(memory).reshape(B, T, H, dh).permute(0, 2, 1, 3)  # [B, H, T, dh]
+    Q_t = q_tilde_proj(y).reshape(B, S, H, dh).permute(0, 2, 1, 3)       # [B, H, S, dh]
+    V_h = V.reshape(B, T, H, dh).permute(0, 2, 1, 3)                     # [B, H, T, dh]
+
+    e_tilde = torch.matmul(Q_t, K_t.transpose(-2, -1)) / (dh ** 0.5) # [B, H, S, T]
+    beta    = torch.softmax(e_tilde + log_window, dim=-1)             # [B, H, S, T]
+
+    c = torch.matmul(beta, V_h)                                       # [B, H, S, dh]
+    c = c.permute(0, 2, 1, 3).reshape(B, S, D)                       # [B, S, D]
+
+    return c, alpha_all                                                # [B,S,D], [B,S,T]
 
 
 def _expand_context_by_onset(
@@ -1132,12 +1162,16 @@ class MambaIsotonicAttnLayer(nn.Module):
         self.dropout_mamba = nn.Dropout(dropout)
 
         # Step 2: Cross-attention projections
-        self.v_proj      = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj    = nn.Linear(d_model, d_model, bias=False)
-        self.q_proj      = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj      = nn.Linear(d_model, d_model, bias=False)
-        self.onset_scale = nn.Parameter(torch.tensor(0.1))  # λ: onset prior strength
-        self.dropout_attn = nn.Dropout(dropout)
+        self.v_proj           = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj         = nn.Linear(d_model, d_model, bias=False)
+        # Monotonic gate (Raffel recurrence)
+        self.q_proj           = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj           = nn.Linear(d_model, d_model, bias=False)
+        # MoChA-IL: separate soft-attention q̃/k̃ for windowed value retrieval
+        self.q_tilde_proj     = nn.Linear(d_model, d_model, bias=False)
+        self.k_tilde_proj     = nn.Linear(d_model, d_model, bias=False)
+        self.onset_scale      = nn.Parameter(torch.tensor(0.1))  # λ: onset prior strength
+        self.dropout_attn     = nn.Dropout(dropout)
 
         # Step 3: Fusion W_fuse([y; c]) → D
         self.fuse_proj    = nn.Linear(2 * d_model, d_model)
@@ -1192,8 +1226,9 @@ class MambaIsotonicAttnLayer(nn.Module):
 
         c, _ = _isotonic_context(
             y, onset_logit_bias, memory, V,
-            self.q_proj, self.k_proj, self.onset_scale,
-            self.n_heads, self.head_dim,
+            self.q_proj, self.k_proj,
+            self.q_tilde_proj, self.k_tilde_proj,
+            self.onset_scale, self.n_heads, self.head_dim,
         )
         c = self.out_proj(c)
         c_dense = self.dropout_attn(c)                                 # [B, S, D]
