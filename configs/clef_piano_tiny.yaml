@@ -78,8 +78,9 @@ model:
 
   bar_token_id: 4
 
-  # Onset detector (CIF-inspired, drives monotonic attention prior)
-  quantity_loss_weight: 0.01   # |sum(onset_prob) - N|, N = count(<nl>) + count(<bar>)
+  # Onset detector (augmented Lagrangian: μ·gap + ρ·gap²)
+  quantity_loss_weight: 0.01   # ρ: quadratic penalty weight (stabilizes dual ascent)
+  dual_ascent_lr: 2.0e-4       # step size for dual variable μ update
   onset_conv_kernel: 3         # Temporal context for onset conv head
 
   # tf_anneal_steps: 0 = disabled (always TF 1.0)

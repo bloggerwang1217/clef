@@ -181,6 +181,8 @@ class Trainer:
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
+            if 'dual_mu' in name:   # managed by dual_optimizer, not main optimizer
+                continue
             nodecay = _is_no_decay(name)
             if name.startswith('swin.'):
                 (swin_nodecay if nodecay else swin_decay).append(param)
@@ -209,6 +211,17 @@ class Trainer:
             ]
 
         self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)  # per-group WD above
+
+        # Dual optimizer: gradient ascent on μ to enforce Σp=N (PPO-Lagrangian style).
+        # maximize μ(Σp-N)  ≡  minimize -μ(Σp-N)  via SGD with lr=dual_ascent_lr.
+        _model_inner = self.model.module if hasattr(self.model, 'module') else self.model
+        _dual_params = [p for n, p in _model_inner.named_parameters() if 'dual_mu' in n]
+        if _dual_params:
+            self.dual_optimizer = torch.optim.SGD(
+                _dual_params, lr=getattr(config, 'dual_ascent_lr', 0.001)
+            )
+        else:
+            self.dual_optimizer = None
 
         # Learning rate scheduler
         total_steps = len(train_loader) * (config.max_epochs if hasattr(config, 'max_epochs') else 50)
@@ -478,6 +491,7 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
         accumulated_loss = 0.0
+        accumulated_ce_loss = 0.0
         epoch_ce_loss_accum = 0.0  # running sum of avg_accum_loss for epoch-level reporting
         micro_batch_count = 0  # count successful micro-batches (not raw batch_idx)
 
@@ -544,9 +558,10 @@ class Trainer:
                 else:
                     total_loss.backward()
 
-            # Accumulate total_loss (CE + qty_loss) for logging
+            # Accumulate total_loss (CE + Lagrangian) for logging
             # Un-scale the division applied for gradient accumulation
             accumulated_loss += total_loss.item() * self.gradient_accumulation_steps
+            accumulated_ce_loss += ce_loss.item() if ce_loss is not None else 0.0
 
             # Update weights every gradient_accumulation_steps
             if is_update_step:
@@ -571,8 +586,19 @@ class Trainer:
 
                 self.optimizer.zero_grad()
 
+                # Dual step: maximize μ(Σp-N) → minimize -μ(Σp-N) via dual_optimizer.
+                if self.dual_optimizer is not None:
+                    _model_inner = self.model.module if hasattr(self.model, 'module') else self.model
+                    dual_gap = getattr(_model_inner, '_dual_signed_gap', None)
+                    if dual_gap is not None:
+                        self.dual_optimizer.zero_grad()
+                        dual_loss = -(_model_inner.dual_mu * dual_gap)
+                        dual_loss.backward()
+                        self.dual_optimizer.step()
+
                 # Update metrics (average over accumulation steps)
                 avg_accum_loss = accumulated_loss / self.gradient_accumulation_steps
+                avg_accum_ce_loss = accumulated_ce_loss / self.gradient_accumulation_steps
                 epoch_ce_loss_accum += avg_accum_loss
                 num_batches += 1
                 self.global_step += 1
@@ -589,6 +615,7 @@ class Trainer:
                     last_lrs = self.scheduler.get_last_lr()
                     log_dict = {
                         'train/loss': avg_accum_loss,
+                        'train/ce_loss': avg_accum_ce_loss,
                         'train/grad_norm': grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
                         'train/lr_base': last_lrs[0],         # group[0]: other (base_lr)
                         'train/epoch': self.epoch,
@@ -602,11 +629,14 @@ class Trainer:
                     if guidance_loss_cached is not None:
                         log_dict['train/guidance_loss'] = guidance_loss_cached.item()
                         log_dict['train/guidance_weight'] = current_guidance_weight
-                    # Quantity loss (mono-attn architecture: stored on model._qty_loss)
+                    # Lagrangian term + dual_mu (isotonic attention architecture)
                     _model_inner = self.model.module if hasattr(self.model, 'module') else self.model
-                    qty_loss_cached = getattr(_model_inner, '_qty_loss', None)
-                    if qty_loss_cached is not None:
-                        log_dict['train/qty_loss'] = qty_loss_cached.item()
+                    lagrangian_cached = getattr(_model_inner, '_qty_loss', None)
+                    if lagrangian_cached is not None:
+                        log_dict['train/lagrangian_loss'] = lagrangian_cached.item()
+                    dual_mu = getattr(_model_inner, 'dual_mu', None)
+                    if dual_mu is not None:
+                        log_dict['train/dual_mu'] = dual_mu.item()
                     # Legacy CIF quantity loss (old architecture)
                     cif_qty_loss_cached = getattr(decoder, '_cif_quantity_loss', None)
                     if cif_qty_loss_cached is not None:
@@ -631,6 +661,7 @@ class Trainer:
                 })
 
                 accumulated_loss = 0.0
+                accumulated_ce_loss = 0.0
 
                 # Step-based validation
                 if self.validate_every_n_steps > 0 and self.global_step % self.validate_every_n_steps == 0:
@@ -639,9 +670,11 @@ class Trainer:
                         logger.info(f'Step {self.global_step}: valid_loss={valid_metrics["valid_loss"]:.4f}')
                         if self.use_wandb:
                             valid_log = {'valid/loss': valid_metrics['valid_loss']}
-                            # Add quantity loss if available
-                            if 'quantity_loss' in valid_metrics:
-                                valid_log['valid/quantity_loss'] = valid_metrics['quantity_loss']
+                            if 'valid_ce_loss' in valid_metrics:
+                                valid_log['valid/ce_loss'] = valid_metrics['valid_ce_loss']
+                            # Add Lagrangian loss if available
+                            if 'lagrangian_loss' in valid_metrics:
+                                valid_log['valid/lagrangian_loss'] = valid_metrics['lagrangian_loss']
                             # Add CIF bias
                             decoder = getattr(self.model.module if hasattr(self.model, 'module')
                                               else self.model, 'decoder', None)
@@ -667,7 +700,8 @@ class Trainer:
         self.model.eval()
 
         total_loss = 0.0
-        total_qty_loss = 0.0  # CIF quantity loss accumulator
+        total_ce_loss = 0.0
+        total_lagrangian_loss = 0.0  # Lagrangian term accumulator (|μ·(Σp-N)|)
         num_batches = 0
         # Accumulators for per-type loss breakdown
         type_loss_sums = {'loss_pitch': 0.0, 'loss_duration': 0.0, 'loss_struct': 0.0, 'loss_schema': 0.0}
@@ -701,17 +735,19 @@ class Trainer:
                     mel_valid_ratios=mel_valid_ratios,
                 )
 
-            # Log total_loss (CE + qty) if available, else fall back to CE
+            # Log total_loss (CE + Lagrangian) if available, else fall back to CE
             loss_to_log = total_loss_batch if total_loss_batch is not None else ce_loss
             total_loss += loss_to_log.item()
+            if ce_loss is not None:
+                total_ce_loss += ce_loss.item()
             num_batches += 1
 
-            # Accumulate quantity loss (mono-attn: _qty_loss; legacy CIF: _cif_qty_loss)
+            # Accumulate Lagrangian loss (isotonic attention: _qty_loss; legacy CIF: _cif_qty_loss)
             model_unwrapped = self.model.module if isinstance(self.model, DDP) else self.model
-            qty_loss_val = getattr(model_unwrapped, '_qty_loss', None) \
+            lagrangian_val = getattr(model_unwrapped, '_qty_loss', None) \
                         or getattr(model_unwrapped, '_cif_qty_loss', None)
-            if qty_loss_val is not None:
-                total_qty_loss += qty_loss_val.item()
+            if lagrangian_val is not None:
+                total_lagrangian_loss += lagrangian_val.item()
 
             # Accumulate per-type losses
             breakdown = self._compute_loss_breakdown(logits, labels)
@@ -720,9 +756,10 @@ class Trainer:
                 type_loss_counts[k] += 1
 
         avg_loss = total_loss / max(num_batches, 1)
-        avg_qty_loss = total_qty_loss / max(num_batches, 1)
+        avg_ce_loss = total_ce_loss / max(num_batches, 1)
+        avg_lagrangian_loss = total_lagrangian_loss / max(num_batches, 1)
 
-        result = {'valid_loss': avg_loss, 'quantity_loss': avg_qty_loss}
+        result = {'valid_loss': avg_loss, 'valid_ce_loss': avg_ce_loss, 'lagrangian_loss': avg_lagrangian_loss}
         for k in type_loss_sums:
             if type_loss_counts[k] > 0:
                 result[k] = type_loss_sums[k] / type_loss_counts[k]
@@ -842,16 +879,19 @@ class Trainer:
                     }
                     if 'valid_loss' in valid_metrics:
                         epoch_log['epoch/valid_loss'] = valid_metrics['valid_loss']
+                    if 'valid_ce_loss' in valid_metrics:
+                        epoch_log['epoch/valid_ce_loss'] = valid_metrics['valid_ce_loss']
                     for k in ('loss_pitch', 'loss_duration', 'loss_struct', 'loss_schema'):
                         if k in valid_metrics:
                             epoch_log[f'epoch/valid_{k}'] = valid_metrics[k]
                     wandb.log(epoch_log, step=self.global_step)
 
-            # Save checkpoint and check early stopping
+            # Save checkpoint and check early stopping (use CE loss, not total which can be negative)
             is_best = False
-            if 'valid_loss' in valid_metrics:
-                if valid_metrics['valid_loss'] < self.best_valid_loss:
-                    self.best_valid_loss = valid_metrics['valid_loss']
+            monitor_loss = valid_metrics.get('valid_ce_loss', valid_metrics.get('valid_loss'))
+            if monitor_loss is not None:
+                if monitor_loss < self.best_valid_loss:
+                    self.best_valid_loss = monitor_loss
                     is_best = True
                     self.epochs_without_improvement = 0
                 else:

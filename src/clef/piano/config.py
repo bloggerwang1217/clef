@@ -60,8 +60,9 @@ class ClefPianoConfig(ClefConfig):
     # 0.0 = disabled; recommended range: 10.0 (soft) to 50.0 (strong).
     window_exp_decay_lambda: float = 0.0
 
-    # Onset detector (drives monotonic attention prior)
-    quantity_loss_weight: float = 0.01  # |sum(onset_prob) - N| where N = count(<nl>)+count(<bar>)
+    # Onset detector (augmented Lagrangian: μ·gap + ρ·gap²)
+    quantity_loss_weight: float = 0.01  # ρ: quadratic penalty weight for cardinality constraint
+    dual_ascent_lr: float = 2.0e-4       # step size for dual variable μ update: μ ← μ + α(Σp - N)
     onset_conv_kernel: int = 3          # depthwise conv kernel for onset head
 
     # Gradient checkpointing (trades compute for memory)
@@ -227,6 +228,7 @@ class ClefPianoConfig(ClefConfig):
             window_exp_decay_lambda=model_cfg.get("window_exp_decay_lambda", defaults.window_exp_decay_lambda),
             # Onset detector
             quantity_loss_weight=model_cfg.get("quantity_loss_weight", defaults.quantity_loss_weight),
+            dual_ascent_lr=model_cfg.get("dual_ascent_lr", defaults.dual_ascent_lr),
             onset_conv_kernel=model_cfg.get("onset_conv_kernel", defaults.onset_conv_kernel),
 
             # Audio

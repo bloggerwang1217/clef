@@ -3,17 +3,17 @@ Clef Piano Tiny Model — Isotonic Attention Architecture
 ========================================================
 
 Encoder: Octopus2D → Flow → SwinEncoder → freq_conv → BiMamba
-         + Onset detector head → p_onset [B, T]
+         + Onset detector head → onset_logits [B, T]
 
 Decoder: MambaIsotonicAttnLayer (IOHMM formulation, Bengio & Frasconi 1995)
   Step 1: y = Mamba(tgt)                               [B, S, D]
-  Step 2: p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j)            (IOHMM transition)
-          α_{i,j} via Raffel recurrence  →  c [B, N, D] → expand → [B, S, D]
+  Step 2: p_{i,j} = σ(λ Q_i·K_j/√d + ℓ_j - μ)       (IOHMM + cardinality relaxation)
+          α_{i,j} via Raffel recurrence  →  c [B, S, D]
   Step 3: W_fuse(cat([y_i, c_i])) → pred
 
-Alignment: N onset vectors (one per <bar>/<nl>), not S.
-           Gradient: CE → α → p_{i,j} → onset_logit_bias → BiMamba.
-           Quantity loss: |Σ p_onset - N| where N = count(<nl>) + count(<bar>).
+Alignment: LP relaxation of cardinality-constrained IP (Σz=N, z∈{0,1}).
+           Bisection finds μ per sample so Σ_j σ(ℓ_j - μ) = N.
+           Gradient: CE → α → p_{i,j} → (ℓ_j - μ) → onset_logits → BiMamba.
 """
 
 from typing import Optional, Tuple
@@ -36,8 +36,7 @@ class OnsetDetector(nn.Module):
       DWConv1d + residual → LayerNorm → Linear(D→hidden) → ReLU → Linear(hidden→1) → logits
 
     Returns logits (before sigmoid) so callers can:
-      - sigmoid → p_onset_hires for quantity loss (Σ ≈ N property preserved)
-      - max_pool logits → onset_logit_bias for attention energy (logit space)
+      - max_pool logits → onset_logit_bias [B, T'] for cardinality_relaxation + attention
     """
 
     def __init__(self, d_model: int, hidden_dim: int = 128, conv_kernel: int = 3):
@@ -163,6 +162,12 @@ class ClefPianoTiny(nn.Module):
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
         self.output_projection = nn.Linear(config.d_model, config.vocab_size)
 
+        # === Dual variable for cardinality relaxation (Eq. dual_ascent_z) ===
+        # μ ← μ + α(Σ p_s - N); updated each training step, not a learnable param.
+        # Dual variable μ for cardinality LP relaxation.
+        # Managed by a separate dual_optimizer in the training loop (not updated by main optimizer).
+        self.dual_mu = nn.Parameter(torch.full((1,), 0.5))
+
         if getattr(config, 'gradient_checkpointing', False):
             self.decoder.gradient_checkpointing = True
 
@@ -232,9 +237,16 @@ class ClefPianoTiny(nn.Module):
         Returns:
             logits:     [B, S, vocab_size]
             loss:       CE loss
-            total_loss: CE loss + quantity_loss_weight * qty_loss
+            total_loss: CE loss + qty_weight * |Σσ(ℓ_j) - N|
+                        dual_mu (updated externally) enforces Σσ(ℓ-μ)=N in decoder
         """
         memory, spatial_shapes, level_start_index, valid_ratios, onset_logit_bias, p_onset_hires = self.encode(mel)
+
+        # Cardinality relaxation: p_s = σ(ℓ_s - μ), where μ is updated by the
+        # training loop via update_dual_mu() after each optimizer step.
+        N_target = ((input_ids == 4).sum(dim=1) +
+                    (input_ids == 6).sum(dim=1)).float()        # <bar>=4, <nl>=6
+        onset_logit_bias = onset_logit_bias - self.dual_mu   # p_s = σ(ℓ_s - μ)
 
         tgt = self.token_embed(input_ids)   # [B, S, D]
 
@@ -245,7 +257,7 @@ class ClefPianoTiny(nn.Module):
             level_start_index,
             valid_ratios,
             input_ids=input_ids,
-            p_onset=onset_logit_bias,       # [B, T_swin] — onset logit bias for monotonic attention
+            p_onset=onset_logit_bias,       # [B, T_swin] — shifted logits (ℓ - μ)
         )
         logits = self.output_projection(decoder_out)
 
@@ -258,15 +270,17 @@ class ClefPianoTiny(nn.Module):
             )
             loss = loss_fn(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
 
-            # Quantity loss: drives Σ p_onset_hires → N (high-res, Σ ≈ N 性質保留)
-            N_target = ((input_ids == 4).sum(dim=1) +
-                        (input_ids == 6).sum(dim=1)).float()    # <bar>=4, <nl>=6
-            qty_loss = (p_onset_hires.sum(dim=1) - N_target).abs().mean()
-
-            qty_weight = getattr(self.config, 'quantity_loss_weight', 0.01)
-            total_loss = loss + qty_weight * qty_loss
-            self._qty_loss = qty_loss.detach()
+            # Augmented Lagrangian: μ·gap + ρ·gap²
+            # - Lagrangian term: ∂L/∂ℓ_j = μ·p(1-p), dual_mu detached so only dual_optimizer updates it
+            # - Quadratic term: ∂L/∂ℓ_j = 2ρ·gap·p(1-p), always-on stabiliser (dampens dual oscillation)
+            signed_gap = (torch.sigmoid(onset_logit_bias).sum(dim=1) - N_target).mean()
+            lagrangian_loss = self.dual_mu.detach() * signed_gap
+            quantity_loss = self.config.quantity_loss_weight * signed_gap ** 2
+            total_loss = loss + lagrangian_loss + quantity_loss
+            self._qty_loss = (lagrangian_loss + quantity_loss).detach().abs()
+            self._dual_signed_gap = signed_gap.detach()   # for dual_optimizer step
         else:
+            self._dual_signed_gap = None
             self._qty_loss = None
 
         return logits, loss, total_loss
