@@ -1056,7 +1056,11 @@ def _isotonic_context(
     alpha_prev = torch.zeros(B, T, device=device, dtype=dtype)        # [B, T]
     alpha_prev[:, 0] = 1.0
 
+    j_idx   = torch.arange(T, device=device, dtype=dtype)             # [T]  (reused in Stage 2)
+    mu_prev = torch.zeros(B, device=device, dtype=dtype)              # [B]  running pointer centre
+
     alpha_list = []
+    mu_list    = []
     for i in range(S):
         p_i         = p_all[:, i, :]                                   # [B, T]
         one_minus_p = (1.0 - p_i).clamp(min=1e-8)
@@ -1071,12 +1075,20 @@ def _isotonic_context(
         alpha_list.append(alpha_i)
         alpha_prev  = alpha_i
 
+        # Running pointer centre — causal isotonic regression on CoM
+        # μ_s = μ_{s-1}·(1 - fire_s) + Σ_t t·α_{s,t}
+        # Content tokens (fire≈0): μ stays; advance tokens (fire≈1): μ jumps to new CoM
+        fire_i = alpha_i.sum(dim=-1)                                   # [B]
+        com_i  = (alpha_i * j_idx).sum(dim=-1)                        # [B]
+        mu_i   = mu_prev * (1.0 - fire_i) + com_i                    # [B]
+        mu_list.append(mu_i)
+        mu_prev = mu_i
+
     alpha_all = torch.stack(alpha_list, dim=1)                         # [B, S, T]
 
     # --- Stage 2: MoChA-IL windowed soft retrieval (per-head) ---
-    # Expected pointer position: μ_i = Σ_j j·α_{i,j}  (shared across heads)
-    j_idx = torch.arange(T, device=device, dtype=dtype)               # [T]
-    mu    = (alpha_all * j_idx).sum(dim=-1)                           # [B, S]
+    # Running pointer centre μ_s: causal PAVA — ensures window never regresses
+    mu = torch.stack(mu_list, dim=1)                                   # [B, S]
 
     # Gaussian window: log w_{i,j} = -(j - μ)² / (2σ²), σ = window_size/2
     sigma = window_size / 2.0
