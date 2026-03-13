@@ -1008,7 +1008,7 @@ def _isotonic_context(
     k_proj: nn.Linear,
     q_tilde_proj: nn.Linear,         # MoChA-IL: separate soft-attention query
     k_tilde_proj: nn.Linear,         # MoChA-IL: separate soft-attention key
-    onset_scale: nn.Parameter,       # learnable λ: scales onset prior strength
+    onset_scale: float,               # fixed λ=1.0: scales onset prior strength
     n_heads: int,
     head_dim: int,
     window_size: int = 4,            # MoChA Gaussian window half-width (frames)
@@ -1182,7 +1182,7 @@ class MambaIsotonicAttnLayer(nn.Module):
         # MoChA-IL: separate soft-attention q̃/k̃ for windowed value retrieval
         self.q_tilde_proj     = nn.Linear(d_model, d_model, bias=False)
         self.k_tilde_proj     = nn.Linear(d_model, d_model, bias=False)
-        self.onset_scale      = nn.Parameter(torch.tensor(0.1))  # λ: onset prior strength
+        self.onset_scale      = 1.0  # λ: onset prior strength (fixed, not learnable)
         self.dropout_attn     = nn.Dropout(dropout)
 
         # Step 3: Fusion W_fuse([y; c]) → D
