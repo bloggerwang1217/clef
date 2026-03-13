@@ -1182,7 +1182,7 @@ class MambaIsotonicAttnLayer(nn.Module):
         # MoChA-IL: separate soft-attention q̃/k̃ for windowed value retrieval
         self.q_tilde_proj     = nn.Linear(d_model, d_model, bias=False)
         self.k_tilde_proj     = nn.Linear(d_model, d_model, bias=False)
-        self.onset_scale      = 1.0  # λ: onset prior strength (fixed, not learnable)
+        self.onset_scale      = 0.5  # λ: onset prior strength (fixed, not learnable)
         self.dropout_attn     = nn.Dropout(dropout)
 
         # Step 3: Fusion W_fuse([y; c]) → D
