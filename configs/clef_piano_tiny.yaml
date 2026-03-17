@@ -76,37 +76,24 @@ model:
   # tf_anneal_steps: 0 = disabled (always TF 1.0)
   tf_anneal_steps: 100000
 
-  # GRU sequential mode: replace Mamba.step() with GRUCell for hypothesis validation.
-  # Validates: does audio-conditioned query h_{t-1} push pitch loss below 2?
-  use_gru_sequential: true
-  tbptt_chunk_size: 256  # detach hidden state every 256 steps
-
-  # Window parameters
-  # Level 2 = BiMamba (50fps, 30s = 1500 frames).
-  # 512 frames ≈ ±5.1s ≈ ±1.7 bars at 80bpm (covers ±2 bars at ≥100bpm).
-  # Levels 0,1 values are unused (only level 2 is active).
-  window_time_frames: [32, 16, 512]
-  window_freq_bins: [4, 4, 1]         # level 2: H=1 (1D BiMamba), must be 1
-  window_seq_chunk_size: 10000
-
-  # Exponential decay soft mask: score_j += -lambda * |t_j - com_t| (before softmax).
-  # λ=10: 1 bar (150 frames, 0.1 unit) → bias=-1.0 (soft). Range: 10–50.
-  window_exp_decay_lambda: 10.0
+  tbptt_chunk_size: 256  # detach Mamba state every 256 steps for TBPTT
 
   # Mamba config
   mamba_d_state: 128
   mamba_d_conv: 4
   mamba_expand: 2
 
-  max_seq_len: 2048
+  max_seq_len: 768   # 10s chunks: p95=657, p99=815; dense chunks fall back to 5s
   vocab_size: 271
 
   label_smoothing: 0.0
 
   # Gradient checkpointing
+  # decoder: off — Mamba custom CUDA autograd (selective_scan_fn) is incompatible
+  #   with use_reentrant=False checkpoint (saved tensor metadata mismatch on recompute)
+  # swin: keep on — uses HuggingFace internal reentrant checkpoint, no issue
   gradient_checkpointing: false
-  window_ca_use_checkpoint: false
-
+  swin_use_gradient_checkpointing: true
   # No guided attention
   guidance_loss_weight: 0.0
   guidance_loss_weight_end: 0.0
@@ -125,11 +112,11 @@ data:
     f_max: 7040.0
 
   chunking:
-    chunk_frames: 3000          # 30 seconds @ 100 fps
-    overlap_frames: 1500        # 15 seconds overlap
+    chunk_frames: 1000          # 10 seconds @ 100 fps
+    overlap_frames: 500         # 5 seconds overlap
     min_chunk_ratio: 0.5
-    fallback_chunk_frames: 1500
-    fallback_overlap_frames: 750
+    fallback_chunk_frames: 500   # 5s for dense pieces (>1024 tok total)
+    fallback_overlap_frames: 250
 
   augmentation:
     soundfonts:
@@ -142,8 +129,8 @@ data:
 # Training
 # =============================================================================
 training:
-  batch_size: 32
-  gradient_accumulation_steps: 1
+  batch_size: 64
+  gradient_accumulation_steps: 4  # effective BS = 256
   gradient_clip: 1.0
 
   learning_rate: 2.0e-4
@@ -156,6 +143,7 @@ training:
   save_every_n_epochs: 5
   early_stopping_patience: 0
   validate_every_n_steps: 500
+  bucket_boundaries: [600, 700, 800, 900, 1000]  # mel frames; null = use default
 
 # =============================================================================
 # Paths

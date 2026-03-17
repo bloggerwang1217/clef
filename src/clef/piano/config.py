@@ -60,11 +60,8 @@ class ClefPianoConfig(ClefConfig):
     # 0.0 = disabled; recommended range: 10.0 (soft) to 50.0 (strong).
     window_exp_decay_lambda: float = 0.0
 
-    # GRU sequential mode for mamba_full_ca layers.
-    # Replaces Mamba.step() (no backward for SSM internals) with GRUCell (fully differentiable).
-    # Hypothesis validation: does audio-conditioned query (h_{t-1}) push pitch loss < 2?
-    use_gru_sequential: bool = False
-    tbptt_chunk_size: int = 256  # detach GRU hidden every N steps (0 = full BPTT)
+    tbptt_chunk_size: int = 256  # detach Mamba state every N steps for TBPTT (0 = full BPTT)
+    bucket_boundaries: Optional[List[int]] = None  # None = use BucketSampler default
 
     # Gradient checkpointing (trades compute for memory)
     gradient_checkpointing: bool = False
@@ -217,8 +214,8 @@ class ClefPianoConfig(ClefConfig):
             window_time_frames=model_cfg.get("window_time_frames", defaults.window_time_frames),
             window_freq_bins=model_cfg.get("window_freq_bins", defaults.window_freq_bins),
             window_exp_decay_lambda=model_cfg.get("window_exp_decay_lambda", defaults.window_exp_decay_lambda),
-            use_gru_sequential=model_cfg.get("use_gru_sequential", defaults.use_gru_sequential),
             tbptt_chunk_size=model_cfg.get("tbptt_chunk_size", defaults.tbptt_chunk_size),
+            bucket_boundaries=training_cfg.get("bucket_boundaries", defaults.bucket_boundaries),
 
             # Audio
             sample_rate=audio_cfg.get("sample_rate", defaults.sample_rate),

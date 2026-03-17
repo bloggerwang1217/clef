@@ -74,7 +74,7 @@ class DistributedBucketSampler(Sampler[int]):
         self.batch_size = batch_size
         self.num_replicas = num_replicas
         self.rank = rank
-        self.bucket_boundaries = bucket_boundaries or [6000, 12000, 18000, 24000]
+        self.bucket_boundaries = bucket_boundaries or [1500, 2000, 2500, 3000]
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.seed = seed
@@ -216,7 +216,7 @@ class BucketSampler(Sampler[int]):
         """
         self.dataset = dataset
         self.batch_size = batch_size
-        self.bucket_boundaries = bucket_boundaries or [6000, 12000, 18000, 24000]
+        self.bucket_boundaries = bucket_boundaries or [1500, 2000, 2500, 3000]
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.seed = seed

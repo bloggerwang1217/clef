@@ -501,19 +501,28 @@ class MambaOnlyLayer(nn.Module):
 
 
 class MambaFullCALayer(nn.Module):
-    """Mamba + Full Cross-Attention decoder layer.
-    
-    Architecture (Zamba inspired):
-      1. Mamba Block (compresses history, provides temporal/structural context)
-      2. Full Cross-Attention (queries Audio based on Mamba context)
-      3. No FFN (Mamba internally provides non-linear expand/proj FFN equivalents)
-      
-    This fundamentally prevents "Lazy Decoder" (Attention Collapse) because Mamba 
-    has a compressed hidden state and cannot perfectly copy historical tokens.
-    
-    Uses Mamba1 (not Mamba2) to support BPTT sequential mode, where Mamba is called
-    with seqlen=1 per step. Mamba2's causal_conv1d kernel has a stride alignment
-    constraint that fails at seqlen=1 with typical d_model values.
+    """Mamba2 + Full Cross-Attention decoder layer (Zeng-equivalent, single CA).
+
+    Single CA, two-pass (Zeng-style):
+
+      Pass 1:
+        h1        = tgt + Mamba(norm1(tgt))
+        ca        = CA(h1, memory)          ← single CA; Zeng's context_t
+
+      CA-shift:
+        ca_shifted[t] = ca[t-1]             ← Zeng's context_{t-1} → inp_{t}
+
+      Pass 2 (no second CA):
+        inp2      = tgt + ca_shifted
+        h2        = inp2 + Mamba2(norm3(inp2))
+
+      Output:
+        out       = out_proj(cat(h2, ca))   ← Zeng's cat(hidden_t, context_t)
+
+    ca receives gradient from both:
+      - Direct:   CE loss → out_proj → ca
+      - Indirect: ca[t-1] → ca_shifted → inp2 → h2 → out → CE
+    Both push toward temporal grounding.
     """
     def __init__(
         self,
@@ -525,8 +534,7 @@ class MambaFullCALayer(nn.Module):
         dropout: float = 0.1,
         active_ca_levels: Optional[List[int]] = None,
         n_levels: int = 6,
-        use_gru: bool = False,       # use GRUCell instead of Mamba.step() for sequential mode
-        tbptt_chunk_size: int = 256, # detach hidden state every N steps (0 = full BPTT)
+        tbptt_chunk_size: int = 256,
     ):
         super().__init__()
         self.d_model = d_model
@@ -534,37 +542,21 @@ class MambaFullCALayer(nn.Module):
         self.ca_head_dim = d_model // n_heads
         self.active_ca_levels = active_ca_levels if active_ca_levels is not None else list(range(n_levels))
         self.ca_attn_dropout = dropout
-        self.use_gru = use_gru
         self.tbptt_chunk_size = tbptt_chunk_size
 
-        if use_gru:
-            # GRUCell: input = cat(token, ca_out) = 2*d_model, hidden = d_model
-            # Fully differentiable — all parameters receive gradients.
-            self.gru_cell = nn.GRUCell(input_size=2 * d_model, hidden_size=d_model)
-            self.dropout_gru = nn.Dropout(dropout)
-            # No Mamba, norm1, dropout_mamba, or fusion_proj — unused in GRU path.
-        else:
-            # 1. Mamba (processes token history → produces context-rich state y)
-            # Mirrors Zeng's GRU: y_t encodes everything seen up to t-1.
-            # NOTE: Mamba1.step() does NOT support autograd through its SSM internals
-            # (causal_conv1d_update is a CUDA kernel without backward). Only out_proj
-            # receives gradients. Use use_gru=True for a fully-differentiable alternative.
-            self.norm1 = nn.LayerNorm(d_model)
-            from mamba_ssm import Mamba
-            self.mamba = Mamba(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
-            self.dropout_mamba = nn.Dropout(dropout)
-            # Fusion projection: cat([token_t, ca_t]) [2D] → [D] → Mamba input
-            self.fusion_proj = nn.Linear(2 * d_model, d_model)
+        from mamba_ssm import Mamba2
 
-        # 2. Cross-Attention (Q = y = Mamba/GRU output, K/V = Audio)
-        # Mirrors Zeng's:  attn_weights = self.attn(hidden, encoder_outputs)
-        #                  context      = bmm(attn_weights, encoder_outputs)
-        self.norm2 = nn.LayerNorm(d_model)  # pre-norm before CA (applied to y)
+        # Pass 1
+        self.norm1 = nn.LayerNorm(d_model)
+        self.mamba = Mamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.dropout_mamba = nn.Dropout(dropout)
+
+        # Pass 2 (separate weights — input distribution differs from pass 1)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.mamba2 = Mamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+
+        # Cross-Attention shared by both passes (same K/V projections)
+        self.norm2 = nn.LayerNorm(d_model)
         self.ca_q_proj  = nn.Linear(d_model, d_model)
         self.ca_kv_proj = nn.Linear(d_model, 2 * d_model)
         self.ca_out_proj = nn.Linear(d_model, d_model)
@@ -653,83 +645,32 @@ class MambaFullCALayer(nn.Module):
         valid_ratios: torch.Tensor,
         past_state: Optional[Tuple] = None,
         use_cache: bool = False,
-        encoder_hidden: Optional[torch.Tensor] = None,  # [B, 1, D] for sequential mode
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[Tuple]] | torch.Tensor:
+        tgt = tgt.contiguous()
         B, S, D = tgt.shape
-        mamba_state = past_state[1] if past_state is not None else None
+        k_ca, v_ca = self._precompute_kv(memory, spatial_shapes, level_start_index, tgt.device)
 
-        # ── Sequential CA mode (Zeng-style, full BPTT) ────────────────────────
-        # Enabled when encoder_hidden is provided.
-        # Each step: ca_t = CA(h_{t-1}, encoder), h_t = Mamba(token_t + ca_t, state)
-        # Mamba state accumulates across steps (like Zeng's GRU hidden state).
-        # Gradient chain: loss_t → h_t → ca_t → prev_out → h_{t-1} → ... (full BPTT)
-        #
-        # Uses Mamba1.step() directly (no InferenceParams) so that:
-        # (a) conv_state / ssm_state dtype always matches the input (BF16-safe), and
-        # (b) gradient flows through the state tensors without any .copy_() detach.
-        if encoder_hidden is not None:
-            k_ca, v_ca = self._precompute_kv(memory, spatial_shapes, level_start_index, tgt.device)
-            outputs = []
+        # ── Pass 1: Mamba on tgt → single CA ─────────────────────────────────
+        h1 = tgt + self.dropout_mamba(self.mamba(self.norm1(tgt)))          # [B, S, D]
+        ca = self._sdpa(h1, k_ca, v_ca)                                     # [B, S, D]
 
-            if self.use_gru:
-                # ── GRU sequential mode (fully differentiable) ────────────────
-                # All GRUCell parameters receive gradients.
-                # TBPTT: detach hidden state every tbptt_chunk_size steps to
-                # bound gradient chain length (0 = full BPTT, not recommended
-                # for sequences > 512 tokens due to vanishing gradients).
-                h = encoder_hidden.squeeze(1)  # [B, D]
+        # ── CA-shift: position t receives context from position t-1 ──────────
+        # Zeng: context_{t-1} → rnn_input_t
+        ca_shifted = torch.zeros_like(ca)
+        ca_shifted[:, 1:, :] = ca[:, :-1, :]                               # [B, S, D]
 
-                for t in range(S):
-                    if self.tbptt_chunk_size > 0 and t > 0 and t % self.tbptt_chunk_size == 0:
-                        h = h.detach()
+        # ── Pass 2: Mamba on (tgt + ca_shifted), no second CA ─────────────────
+        # Zeng: hidden_t = GRU(cat(token_t, context_{t-1}), hidden_{t-1})
+        inp2 = tgt + ca_shifted                                              # [B, S, D]
+        h2   = inp2 + self.dropout_mamba(self.mamba2(self.norm3(inp2)))     # [B, S, D]
 
-                    # CA: query = previous hidden state (audio-conditioned)
-                    ca_t = self._sdpa(h.unsqueeze(1), k_ca, v_ca)  # [B, 1, D]
-
-                    # GRU step: input = cat(token_t, ca_t)
-                    gru_input = torch.cat([tgt[:, t, :], ca_t.squeeze(1)], dim=-1)  # [B, 2D]
-                    h = self.gru_cell(gru_input, h)                                  # [B, D]
-                    h = self.dropout_gru(h)
-
-                    outputs.append(torch.cat([h.unsqueeze(1), ca_t], dim=-1))  # [B, 1, 2D]
-
-            else:
-                # ── Mamba sequential mode (broken gradients — kept for reference) ──
-                # NOTE: Mamba1.step() has no backward for SSM internals. Only out_proj
-                # receives gradients. Use use_gru=True for hypothesis validation.
-                d_inner = self.mamba.d_model * self.mamba.expand
-                conv_state: Optional[torch.Tensor] = None
-                ssm_state:  Optional[torch.Tensor] = None
-                prev_out = encoder_hidden  # [B, 1, D]
-
-                for t in range(S):
-                    token_t = tgt[:, t:t+1, :]
-                    ca_t = self._sdpa(prev_out, k_ca, v_ca)
-
-                    fused_input = torch.cat([token_t, ca_t], dim=-1)
-                    proj = self.fusion_proj(fused_input)
-
-                    mamba_input = self.norm1(proj)
-                    if conv_state is None:
-                        compute_dtype = (
-                            torch.get_autocast_gpu_dtype()
-                            if torch.is_autocast_enabled()
-                            else mamba_input.dtype
-                        )
-                        conv_state = torch.zeros(B, d_inner, self.mamba.d_conv,  device=tgt.device, dtype=compute_dtype)
-                        ssm_state  = torch.zeros(B, d_inner, self.mamba.d_state, device=tgt.device, dtype=compute_dtype)
-                    mamba_out_t, conv_state, ssm_state = self.mamba.step(mamba_input, conv_state, ssm_state)
-                    h_t = proj + self.dropout_mamba(mamba_out_t)
-
-                    outputs.append(torch.cat([h_t, ca_t], dim=-1))
-                    prev_out = h_t
-
-            fused = torch.cat(outputs, dim=1)            # [B, S, 2D]
-            out   = self.out_proj(fused)                  # [B, S, D]
-            if use_cache:
-                return out, (None, mamba_state)
-            return out
+        # Output: cat(h2, ca) — Zeng's cat(hidden_t, context_t)
+        # ca receives direct CE gradient AND indirect gradient through ca_shifted
+        out = self.out_proj(torch.cat([h2, ca], dim=-1))                    # [B, S, D]
+        if use_cache:
+            return out, (None, None)
+        return out
 
 
 class MambaWindowCALayer(nn.Module):
@@ -1404,9 +1345,7 @@ class ClefDecoder(nn.Module):
         curriculum_warmup_steps: int = 0,     # 0 = disabled; >0 = bar-progressive window expansion
         # Exponential decay soft mask for window CA (sa_window_ca and mamba_window_ca only)
         window_exp_decay_lambda: float = 0.0,
-        # GRU sequential mode for mamba_full_ca layers
-        use_gru_sequential: bool = False,     # replace Mamba.step() with GRUCell (fully differentiable)
-        tbptt_chunk_size: int = 256,          # detach GRU hidden every N steps (0 = full BPTT)
+        tbptt_chunk_size: int = 256,          # detach Mamba state every N steps for TBPTT (0 = full BPTT)
     ):
         super().__init__()
 
@@ -1419,7 +1358,6 @@ class ClefDecoder(nn.Module):
         self.use_rope = use_rope
         self.bar_gru_hidden_size = bar_gru_hidden_size
         self.curriculum_warmup_steps = curriculum_warmup_steps
-        self.use_gru_sequential = use_gru_sequential
         self.tbptt_chunk_size = tbptt_chunk_size
 
         # Shared kwargs passed to all layer constructors (unused keys absorbed by **kwargs)
@@ -1472,7 +1410,6 @@ class ClefDecoder(nn.Module):
                     dropout=dropout,
                     active_ca_levels=ca_levels,
                     n_levels=n_levels,
-                    use_gru=use_gru_sequential,
                     tbptt_chunk_size=tbptt_chunk_size,
                 ))
             elif lt == 'full_ca':
@@ -1571,11 +1508,8 @@ class ClefDecoder(nn.Module):
                 raise ValueError(f"Unknown decoder layer type: {lt!r}")
 
         # Assign layer_idx to Mamba layers (needed for InferenceParams state indexing)
-        # MambaFullCALayer with use_gru=True has no self.mamba — skip those.
         mamba_idx = 0
         for layer in self.layers:
-            if isinstance(layer, MambaFullCALayer) and layer.use_gru:
-                continue
             if isinstance(layer, (MambaOnlyLayer, MambaFullCALayer, MambaWindowCALayer)):
                 layer.mamba.layer_idx = mamba_idx
                 mamba_idx += 1
@@ -1599,7 +1533,6 @@ class ClefDecoder(nn.Module):
         input_ids: Optional[torch.Tensor] = None,        # [B, S] int token IDs
         tf_ratio: float = 1.0,                            # teacher-forcing ratio for note_gru
         pred_embs: Optional[torch.Tensor] = None,        # [B, S, D] predicted embeddings for TF
-        encoder_hidden: Optional[torch.Tensor] = None,   # [B, 1, D] BiMamba final hidden for sequential CA
     ):
         """Forward through all decoder layers.
 
@@ -1826,7 +1759,6 @@ class ClefDecoder(nn.Module):
                 )
                 if isinstance(layer, MambaFullCALayer):
                     layer_kwargs['tgt_query'] = tgt_query
-                    layer_kwargs['encoder_hidden'] = encoder_hidden
                 output = layer(
                     output, memory,
                     spatial_shapes, level_start_index, valid_ratios,

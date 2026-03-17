@@ -141,8 +141,6 @@ class ClefPianoTiny(nn.Module):
             bar_gru_input_dropout=getattr(config, 'bar_gru_input_dropout', 0.1),
             # Curriculum Learning for mamba_full_ca path
             curriculum_warmup_steps=getattr(config, 'curriculum_warmup_steps', 0),
-            # GRU sequential mode (hypothesis validation)
-            use_gru_sequential=getattr(config, 'use_gru_sequential', False),
             tbptt_chunk_size=getattr(config, 'tbptt_chunk_size', 256),
         )
 
@@ -238,28 +236,21 @@ class ClefPianoTiny(nn.Module):
 
         # === Step 4: BiMamba Encoder (time-oriented) ===
         # swin_feat: [B, T_swin, 384] @12.5fps → BiMamba projects to d_model
-        encoder_hidden = None
         if self.use_bimamba:
             feat_bimamba = self.bimamba_encoder(swin_feat)
             # feat_bimamba: [B, T_swin, 384] @12.5fps
-
-            # Extract hidden state (last time step)
-            encoder_hidden = feat_bimamba[:, -1, :].unsqueeze(1)  # [B, 1, 384]
-
-            # BiMamba output as the only memory for decoder
-            memory = feat_bimamba  # [B, T_swin, 384]
+            memory = feat_bimamba
             spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
             level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
             valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
-
-            return memory, spatial_shapes, level_start_index, valid_ratios, encoder_hidden
+            return memory, spatial_shapes, level_start_index, valid_ratios
 
         # Fallback (should not happen since use_bimamba=True by default)
         memory = swin_feat
         spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
         level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
         valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
-        return memory, spatial_shapes, level_start_index, valid_ratios, encoder_hidden
+        return memory, spatial_shapes, level_start_index, valid_ratios
 
     def forward(
         self,
@@ -292,12 +283,8 @@ class ClefPianoTiny(nn.Module):
             total_loss: Same as loss (for compatibility)
         """
         # Encode
-        memory, spatial_shapes, level_start_index, valid_ratios, encoder_hidden = self.encode(mel)
+        memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
 
-        # Embed tokens (pure token embeddings, no encoder hidden added)
-        # Zeng: token embeddings are pure, encoder_hidden only used as:
-        #   1. Initial prev_out in sequential loop
-        #   2. CA query (via prev_out)
         tgt = self.token_embed(input_ids)  # [B, S, D]
 
         # Decode
@@ -309,15 +296,11 @@ class ClefPianoTiny(nn.Module):
                 _decoder_out = self.decoder(
                     tgt, memory, spatial_shapes, level_start_index, valid_ratios,
                     input_ids=input_ids,
-                    tf_ratio=1.0,  # Pure TF for the first pass to get stable predictions
-                    encoder_hidden=encoder_hidden,
+                    tf_ratio=1.0,
                 )
                 _logits = self.output_projection(_decoder_out)
-                # Greedy prediction → embedding
                 _preds = _logits.argmax(dim=-1)
                 pred_embs = self.token_embed(_preds)
-                # (Optional optimization: only compute pred_embs for <bar> positions if we care about speed,
-                # but computing for all is safer and mirrors standard scheduled sampling logic).
 
         decoder_out = self.decoder(
             tgt,
@@ -328,7 +311,6 @@ class ClefPianoTiny(nn.Module):
             input_ids=input_ids,
             tf_ratio=tf_ratio,
             pred_embs=pred_embs,
-            encoder_hidden=encoder_hidden,
         )
         logits = self.output_projection(decoder_out)
 
@@ -383,14 +365,21 @@ class ClefPianoTiny(nn.Module):
         device = mel.device
 
         # Encode once
-        memory, spatial_shapes, level_start_index, valid_ratios, encoder_hidden = self.encode(mel)
+        memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
 
         # Initialize with BOS
         generated = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
 
         for _ in range(max_len - 1):
             # Embed tokens
-            tgt = self.token_embed(generated)
+            tgt = self.token_embed(generated).contiguous()
+
+            # Mamba2 workaround: when S=1, zxbcdt slice has stride(1)=total_dim=1804
+            # which is not a multiple of 8. PyTorch sees [1,1,D] as already-contiguous
+            # (size-1 dims), so ensure_stride's .contiguous() is a no-op → kernel crash.
+            # Fix: repeat last token to make S=2 so .contiguous() actually recomputes strides.
+            if tgt.shape[1] == 1:
+                tgt = tgt.repeat(1, 2, 1)  # [B, 2, D], now S=2 → strides fix correctly
 
             # Decode
             decoder_out = self.decoder(
@@ -400,7 +389,6 @@ class ClefPianoTiny(nn.Module):
                 level_start_index,
                 valid_ratios,
                 input_ids=generated,
-                encoder_hidden=encoder_hidden,
             )
             if isinstance(decoder_out, tuple):
                 decoder_out = decoder_out[0]

@@ -1069,6 +1069,7 @@ def main():
                 num_replicas=world_size,
                 rank=rank,
                 shuffle=True,
+                bucket_boundaries=getattr(config, 'bucket_boundaries', None),
             )
             train_loader = DataLoader(
                 train_dataset,
@@ -1084,6 +1085,7 @@ def main():
                 train_dataset,
                 batch_size=config.batch_size,
                 shuffle=True,
+                bucket_boundaries=getattr(config, 'bucket_boundaries', None),
             )
             train_loader = DataLoader(
                 train_dataset,
