@@ -73,8 +73,10 @@ model:
   bar_token_id: 4       # <bar> token ID in KernTokenizer vocab
   curriculum_warmup_steps: 0  # Disabled
 
-  # tf_anneal_steps: 0 = disabled (always TF 1.0)
-  tf_anneal_steps: 100000
+  # Two-pass soft embedding scheduled sampling (ss_epsilon 0 → ss_max_epsilon, linear from warmup)
+  # ss_max_epsilon: 0.0 = disabled; 0.2 = replace 20% of decoder input positions with soft predictions
+  ss_max_epsilon: 0.2
+  ss_anneal_steps: 10000  # reach 0.2 at step 10k (warmup ends at 1k)
 
   tbptt_chunk_size: 256  # detach Mamba state every 256 steps for TBPTT
 

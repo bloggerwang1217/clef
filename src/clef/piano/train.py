@@ -328,14 +328,12 @@ class Trainer:
         return min_scale + 0.5 * (1.0 - min_scale) * (1.0 + math.cos(math.pi * t))
 
     def _get_tf_ratio(self) -> float:
-        """Linear decay of teacher-forcing ratio for BarGRU scheduled sampling.
+        """Legacy: linear decay of teacher-forcing ratio for BarGRU scheduled sampling.
 
-        Schedule (per bar-gru-redesign.md §TF Ratio Schedule):
+        Schedule:
           step 0 → warmup_steps         : 1.0   (full GT, model still unstable)
           warmup_steps → tf_anneal_steps: 1.0 → 0.0  (linear decay)
-          tf_anneal_steps and beyond    : 0.0   (inference-equivalent, no exposure bias)
-
-        tf_anneal_steps is read from config (default 5000 if not set).
+          tf_anneal_steps and beyond    : 0.0
         """
         tf_anneal_steps = getattr(self.config, 'tf_anneal_steps', 5000)
         if self.global_step <= self.warmup_steps:
@@ -345,6 +343,28 @@ class Trainer:
         decay_steps = max(tf_anneal_steps - self.warmup_steps, 1)
         t = (self.global_step - self.warmup_steps) / decay_steps
         return max(0.0, 1.0 - t)
+
+    def _get_ss_epsilon(self) -> float:
+        """Scheduled sampling epsilon for Two-pass soft embedding (tiny model).
+
+        Schedule:
+          step 0 → warmup_steps          : 0.0               (pure teacher forcing)
+          warmup_steps → ss_anneal_steps : 0.0 → ss_max_epsilon  (linear ramp)
+          ss_anneal_steps and beyond     : ss_max_epsilon     (held constant)
+
+        ss_max_epsilon = 0.0 disables scheduled sampling entirely.
+        """
+        max_eps = getattr(self.config, 'ss_max_epsilon', 0.0)
+        if max_eps <= 0.0:
+            return 0.0
+        ss_anneal_steps = getattr(self.config, 'ss_anneal_steps', 10000)
+        if self.global_step <= self.warmup_steps:
+            return 0.0
+        if self.global_step >= ss_anneal_steps:
+            return max_eps
+        ramp_steps = max(ss_anneal_steps - self.warmup_steps, 1)
+        t = (self.global_step - self.warmup_steps) / ramp_steps
+        return min(max_eps, max_eps * t)
 
     def _build_token_type_masks(self):
         """Build boolean masks over vocab to classify token types.
@@ -520,6 +540,7 @@ class Trainer:
                 # Forward pass with mixed precision
                 current_guidance_weight = self._get_guidance_weight()
                 current_tf_ratio = self._get_tf_ratio()
+                current_ss_epsilon = self._get_ss_epsilon()
                 with torch.amp.autocast('cuda', dtype=self.autocast_dtype):
                     logits, ce_loss, total_loss = self.model(
                         mel=mel,
@@ -531,6 +552,7 @@ class Trainer:
                         chunk_end_frames=batch.get('chunk_end_frames'),
                         guidance_loss_weight=current_guidance_weight,
                         tf_ratio=current_tf_ratio,
+                        ss_epsilon=current_ss_epsilon,
                     )
                     # Scale loss for gradient accumulation
                     total_loss = total_loss / self.gradient_accumulation_steps
@@ -598,6 +620,7 @@ class Trainer:
                         log_dict['train/guidance_loss'] = guidance_loss_cached.item()
                         log_dict['train/guidance_weight'] = current_guidance_weight
                     log_dict['train/tf_ratio'] = current_tf_ratio
+                    log_dict['train/ss_epsilon'] = current_ss_epsilon
 
                     if len(last_lrs) > 1:
                         log_dict['train/lr_swin'] = last_lrs[1]  # group[1]: swin (swin_lr)

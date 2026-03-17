@@ -921,8 +921,6 @@ class SAFullCALayer(nn.Module):
         com_t_all=None,           # ignored
         h_bar_final=None,         # ignored
         h_bar_carried=None,       # ignored
-        tf_ratio=None,            # ignored
-        pred_embs=None,           # ignored
     ):
         """SA + Full MHA on active encoder levels + FFN.
 

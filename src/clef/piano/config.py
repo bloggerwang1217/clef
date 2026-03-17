@@ -46,7 +46,9 @@ class ClefPianoConfig(ClefConfig):
     bar_gru_input_dropout: float = 0.1   # dropout on note_gru output before bar_gru input
     note_gru_hidden_size: int = 256
     note_gru_input_dropout: float = 0.1  # dropout on note_gru input projection
-    tf_anneal_steps: int = 5000          # step at which tf_ratio reaches 0.0 (linear from warmup_steps)
+    tf_anneal_steps: int = 5000          # legacy; use ss_max_epsilon / ss_anneal_steps for tiny model
+    ss_max_epsilon: float = 0.0          # scheduled sampling max mixing ratio (0 = disabled)
+    ss_anneal_steps: int = 10000         # step at which ss_epsilon reaches ss_max_epsilon (linear from warmup_steps)
 
     # Per-layer full_freq config for window_ca layers.
     # Each entry: True (all levels), False (none), or List[int] (specific level IDs).
@@ -188,6 +190,8 @@ class ClefPianoConfig(ClefConfig):
             note_gru_hidden_size=model_cfg.get("note_gru_hidden_size", defaults.note_gru_hidden_size),
             note_gru_input_dropout=model_cfg.get("note_gru_input_dropout", defaults.note_gru_input_dropout),
             tf_anneal_steps=model_cfg.get("tf_anneal_steps", training_cfg.get("tf_anneal_steps", defaults.tf_anneal_steps)),
+            ss_max_epsilon=model_cfg.get("ss_max_epsilon", defaults.ss_max_epsilon),
+            ss_anneal_steps=model_cfg.get("ss_anneal_steps", defaults.ss_anneal_steps),
 
 
             # Guided attention loss

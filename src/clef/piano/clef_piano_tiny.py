@@ -257,12 +257,8 @@ class ClefPianoTiny(nn.Module):
         mel: torch.Tensor,              # [B, 1, 128, T]
         input_ids: torch.Tensor,        # [B, S]
         labels: Optional[torch.Tensor] = None,  # [B, S]
-        mel_valid_ratios: Optional[torch.Tensor] = None,  # Ignored for tiny
-        chunk_audio_measures: Optional[list] = None,      # Ignored for tiny
-        chunk_start_frames: Optional[list] = None,        # Ignored for tiny
-        chunk_end_frames: Optional[list] = None,          # Ignored for tiny
-        guidance_loss_weight: Optional[float] = None,     # Ignored for tiny
-        tf_ratio: float = 1.0,                            # Ignored for tiny
+        ss_epsilon: float = 0.0,                # Scheduled sampling mixing ratio
+        **_,                                    # absorb base-model-only kwargs (mel_valid_ratios, guidance_loss_weight, etc.)
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Forward pass (matches ClefPianoBase signature).
 
@@ -270,12 +266,9 @@ class ClefPianoTiny(nn.Module):
             mel: [B, 1, 128, T] mel spectrogram
             input_ids: [B, S] input token IDs
             labels: [B, S] target labels (for loss computation)
-            mel_valid_ratios: Ignored (for compatibility)
-            chunk_audio_measures: Ignored (no guided attention)
-            chunk_start_frames: Ignored (no guided attention)
-            chunk_end_frames: Ignored (no guided attention)
-            guidance_loss_weight: Ignored (no guided attention)
-            tf_ratio: Ignored (no teacher forcing)
+            ss_epsilon: Two-pass soft embedding scheduled sampling ratio.
+                0.0 = pure teacher forcing (no overhead).
+                0.2 = 20% of decoder input positions replaced with soft predicted embedding.
 
         Returns:
             logits: [B, S, vocab_size]
@@ -287,20 +280,36 @@ class ClefPianoTiny(nn.Module):
 
         tgt = self.token_embed(input_ids)  # [B, S, D]
 
-        # Decode
-        # If scheduled sampling (tf_ratio < 1.0) is active during training, we need
-        # the model's own predictions (pred_embs) to substitute masked bar embeddings.
-        pred_embs = None
-        if self.training and tf_ratio < 1.0:
+        # Two-pass soft embedding scheduled sampling.
+        #
+        # Pass 1 (no_grad): run decoder on gold embeddings to get soft predicted embeddings.
+        # Pass 2 (with grad): run decoder on mixed input (gold + soft predictions).
+        #
+        # Mixing rule (Two-pass, Mihaylova & Martins 2019 adapted for Mamba):
+        #   position i input = soft_emb[i-1]  with prob ss_epsilon
+        #                    = gold_emb[i]     with prob 1 - ss_epsilon
+        # Shift by 1 so that position i sees the model's prediction for position i-1,
+        # matching the sequential error propagation that occurs during AR inference.
+        # Position 0 (SOS) is never replaced to keep the start token anchored.
+        if self.training and ss_epsilon > 0.0:
             with torch.no_grad():
                 _decoder_out = self.decoder(
                     tgt, memory, spatial_shapes, level_start_index, valid_ratios,
                     input_ids=input_ids,
-                    tf_ratio=1.0,
                 )
                 _logits = self.output_projection(_decoder_out)
-                _preds = _logits.argmax(dim=-1)
-                pred_embs = self.token_embed(_preds)
+                # Soft embedding: weighted sum over vocab (fully differentiable via Pass 2)
+                _probs = torch.softmax(_logits.float(), dim=-1).to(tgt.dtype)  # [B, S, V]
+                soft_embs = _probs @ self.token_embed.weight                   # [B, S, D]
+
+            # Shift: position i gets soft_emb[i-1]
+            B, S, D = tgt.shape
+            soft_shifted = torch.cat([tgt[:, :1, :], soft_embs[:, :-1, :]], dim=1)  # [B, S, D]
+
+            # Sample replacement mask; never replace position 0 (SOS)
+            mask = torch.zeros(B, S, dtype=torch.bool, device=tgt.device)
+            mask[:, 1:] = torch.rand(B, S - 1, device=tgt.device) < ss_epsilon
+            tgt = torch.where(mask.unsqueeze(-1), soft_shifted, tgt)
 
         decoder_out = self.decoder(
             tgt,
@@ -309,8 +318,6 @@ class ClefPianoTiny(nn.Module):
             level_start_index,
             valid_ratios,
             input_ids=input_ids,
-            tf_ratio=tf_ratio,
-            pred_embs=pred_embs,
         )
         logits = self.output_projection(decoder_out)
 

@@ -651,6 +651,7 @@ class ClefPianoBase(nn.Module):
         chunk_end_frames: Optional[list] = None,      # per-sample int or None
         guidance_loss_weight: Optional[float] = None, # overrides config (for schedule)
         tf_ratio: float = 1.0,                        # scheduled sampling ratio for BarGRU
+        ss_epsilon: float = 0.0,                      # ignored in base model (used in tiny)
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Full forward pass.
 
