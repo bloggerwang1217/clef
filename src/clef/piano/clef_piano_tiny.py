@@ -25,10 +25,71 @@ import torch.nn.functional as F
 from transformers import Swinv2Model
 
 from .config import ClefPianoConfig
+from .tokenizer import CWT_INFO
 from ..bimamba import BiMambaEncoder
 from ..decoder import ClefDecoder
 from ..flow import HarmonizingFlow, Octopus2D
 from ..swin import SwinEncoder
+
+
+class CWTEmbedding(nn.Module):
+    """Compound Word Transformer-style embedding + weight-tied logit computation.
+
+    Note tokens (compound dur+pitch): embed = pitch_embed[j] + dur_embed[i]
+    All other tokens (struct, schema, special): embed = other_embed[k]
+
+    Weight-tied output:
+        logit("dur_i pitch_j") = h · (pitch_embed[j] + dur_embed[i])^T
+                               = h·pitch_embed[j]^T + h·dur_embed[i]^T
+        → computed as outer sum: O((n_dur + n_pitch) × D) not O(n_note × D)
+
+    Vocab layout (required for cat-based logit assembly):
+        IDs 0..n_special-1       : SPECIAL tokens  (→ other_embed[:n_special])
+        IDs note_start_id..+n_note-1 : NOTE tokens  (→ CWT outer sum)
+        IDs note_start_id+n_note.. : remaining other (→ other_embed[n_special:])
+    """
+
+    def __init__(self, n_dur: int, n_pitch: int, n_other: int, n_special: int,
+                 note_start_id: int, d_model: int,
+                 is_note: "torch.Tensor",
+                 note_dur_idx: "torch.Tensor",
+                 note_pitch_idx: "torch.Tensor",
+                 other_idx: "torch.Tensor"):
+        super().__init__()
+        self.n_dur        = n_dur
+        self.n_pitch      = n_pitch
+        self.n_note       = n_dur * n_pitch
+        self.n_special    = n_special
+        self.note_start_id = note_start_id
+
+        self.dur_embed   = nn.Embedding(n_dur,   d_model)
+        self.pitch_embed = nn.Embedding(n_pitch, d_model)
+        self.other_embed = nn.Embedding(n_other, d_model)
+
+        self.register_buffer('is_note',        is_note)
+        self.register_buffer('note_dur_idx',   note_dur_idx)
+        self.register_buffer('note_pitch_idx', note_pitch_idx)
+        self.register_buffer('other_idx',      other_idx)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Embed token IDs → [*, d_model]."""
+        note_mask  = self.is_note[token_ids]
+        other_mask = ~note_mask
+
+        out = torch.empty(*token_ids.shape, self.dur_embed.embedding_dim,
+                          device=token_ids.device, dtype=self.dur_embed.weight.dtype)
+
+        if note_mask.any():
+            t = token_ids[note_mask]
+            out[note_mask] = (self.dur_embed(self.note_dur_idx[t]) +
+                              self.pitch_embed(self.note_pitch_idx[t]))
+
+        if other_mask.any():
+            t = token_ids[other_mask]
+            out[other_mask] = self.other_embed(self.other_idx[t])
+
+        return out
+
 
 
 class ClefPianoTiny(nn.Module):
@@ -145,10 +206,20 @@ class ClefPianoTiny(nn.Module):
         )
 
 
-        # === Token embedding ===
-        self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
-
-        # Output projection: decoder output is [B, S, D] (MambaFullCALayer.out_proj handles 2D→D)
+        # === Token embedding (CWT-style compound word) ===
+        self.token_embed = CWTEmbedding(
+            n_dur         = CWT_INFO['n_dur'],
+            n_pitch       = CWT_INFO['n_pitch'],
+            n_other       = CWT_INFO['n_other'],
+            n_special     = CWT_INFO['n_special'],
+            note_start_id = CWT_INFO['note_start_id'],
+            d_model       = config.d_model,
+            is_note        = CWT_INFO['is_note'],
+            note_dur_idx   = CWT_INFO['note_dur_idx'],
+            note_pitch_idx = CWT_INFO['note_pitch_idx'],
+            other_idx      = CWT_INFO['other_idx'],
+        )
+        # Output projection: direct Linear, no weight tying (following Zeng / a2s-transformer)
         self.output_projection = nn.Linear(config.d_model, config.vocab_size)
 
         # Gradient checkpointing (enabled via config)

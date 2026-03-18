@@ -349,82 +349,52 @@ class Trainer:
     def _build_token_type_masks(self):
         """Build boolean masks over vocab to classify token types.
 
-        Creates four 1-D boolean tensors of shape [vocab_size]:
-        - pitch_mask: pitch tokens (e.g. C, D#, ee, GG, r)
-        - duration_mask: duration tokens (e.g. 4, 8., 16, q)
-        - struct_mask: structural tokens (<coc>, <bar>, <nl>, ...)
-        - schema_mask: schema tokens (<ts:N>, <key:X>) — isolated for fair comparison
+        With compound tokenization, pitch and duration are fused into a single
+        note token (e.g. "4c#"). Token families:
+        - note_mask:   compound note tokens (dur+pitch, e.g. "4c#", "8r")
+        - struct_mask: structural tokens (<coc>, <bar>, <nl>, ., [, ], q, ...)
+        - schema_mask: schema tokens (<4>, <key:0>, ...) + standalone durations
+                       (standalone durations only appear as schema denominators)
 
-        Used for per-type loss breakdown logged to wandb (monitoring only,
-        does not affect training).
+        Used for per-type loss breakdown logged to wandb (monitoring only).
         """
+        from .tokenizer import NOTE_TOKENS, SPECIAL_TOKENS, METER_NUMERATOR_TOKENS, KEY_TOKENS, DURATION_TOKENS
         tokenizer = KernTokenizer()
         V = self.config.vocab_size
 
-        struct_names = {
-            '<pad>', '<sos>', '<eos>', '<coc>', '<bar>',
-            '<continue>', '<nl>', '<split>', '<merge>', '<*>',
-            '(', ')',    # slur start/end
-            '{', '}',    # phrase start/end
-            'L', 'J',    # beam start/end
-            ';',         # fermata
-        }
-        duration_names = {
-            '0', '00',  # breve, longa
-            '1', '2', '4', '8', '16', '32', '64', '128',
-            '0.', '00.', '1.', '2.', '4.', '8.', '16.', '32.', '64.',
-            '3', '6', '12', '24', '48', '96',
-            '20', '40', '112', '176',  # tuplet durations
-            '.', 'q', 'Q', 'P',
-            '[', ']', '_',  # tie start/end/continue (onset vs sustain)
-            '\t', '\n',  # whitespace (should not appear in labels)
-        }
-        # Schema tokens: time signature numerators + key signatures
-        # Isolated so they don't inflate/deflate struct or pitch loss
-        schema_names = {
-            # Time signature numerators
-            '<2>', '<3>', '<4>', '<5>', '<6>', '<7>',
-            '<8>', '<9>', '<10>', '<12>', '<17>',
-            # Key signatures
-            '<key:0>',
-            '<key:1#>', '<key:2#>', '<key:3#>', '<key:4#>',
-            '<key:5#>', '<key:6#>', '<key:7#>',
-            '<key:1b>', '<key:2b>', '<key:3b>', '<key:4b>',
-            '<key:5b>', '<key:6b>', '<key:7b>',
-        }
-        # r (rest) stays in pitch: it's the "no pitch" decision, needs audio
-
+        note_ids   = set()
         struct_ids = set()
-        duration_ids = set()
-        pitch_ids = set()
         schema_ids = set()
 
+        note_set   = set(NOTE_TOKENS)
+        schema_set = (
+            set(METER_NUMERATOR_TOKENS) |
+            set(KEY_TOKENS) |
+            set(DURATION_TOKENS)          # standalone durations = schema denominators
+        )
+        struct_set = set(tokenizer.vocab.keys()) - note_set - schema_set
+
         for tok_str, tok_id in tokenizer.vocab.items():
-            if tok_str in schema_names:
+            if tok_str in note_set:
+                note_ids.add(tok_id)
+            elif tok_str in schema_set:
                 schema_ids.add(tok_id)
-            elif tok_str in struct_names:
+            else:
                 struct_ids.add(tok_id)
-            elif tok_str in duration_names:
-                duration_ids.add(tok_id)
 
-        # Everything else is a pitch token (note names, r, accidentals)
-        classified = struct_ids | duration_ids | schema_ids
-        for tok_id in range(V):
-            if tok_id not in classified:
-                pitch_ids.add(tok_id)
-
+        self._note_mask   = torch.zeros(V, dtype=torch.bool)
         self._struct_mask = torch.zeros(V, dtype=torch.bool)
-        self._duration_mask = torch.zeros(V, dtype=torch.bool)
-        self._pitch_mask = torch.zeros(V, dtype=torch.bool)
         self._schema_mask = torch.zeros(V, dtype=torch.bool)
+        for i in note_ids:
+            self._note_mask[i] = True
         for i in struct_ids:
             self._struct_mask[i] = True
-        for i in duration_ids:
-            self._duration_mask[i] = True
-        for i in pitch_ids:
-            self._pitch_mask[i] = True
         for i in schema_ids:
             self._schema_mask[i] = True
+
+        # Keep backward-compat aliases (empty — compound vocab has no separate pitch/duration)
+        self._pitch_mask    = torch.zeros(V, dtype=torch.bool)
+        self._duration_mask = torch.zeros(V, dtype=torch.bool)
 
         if self.rank == 0:
             logger.info(
@@ -446,22 +416,18 @@ class Trainer:
         flat_labels = labels.view(-1)
 
         # Map each label to its type using pre-built masks
-        pitch_mask = self._pitch_mask.to(flat_labels.device)
-        duration_mask = self._duration_mask.to(flat_labels.device)
+        note_mask   = self._note_mask.to(flat_labels.device)
         struct_mask = self._struct_mask.to(flat_labels.device)
         schema_mask = self._schema_mask.to(flat_labels.device)
 
-        non_pad = flat_labels != 0
-        is_pitch = pitch_mask[flat_labels] & non_pad
-        is_duration = duration_mask[flat_labels] & non_pad
-        is_struct = struct_mask[flat_labels] & non_pad
-        is_schema = schema_mask[flat_labels] & non_pad
+        non_pad    = flat_labels != 0
+        is_note    = note_mask[flat_labels]   & non_pad
+        is_struct  = struct_mask[flat_labels] & non_pad
+        is_schema  = schema_mask[flat_labels] & non_pad
 
         result = {}
-        if is_pitch.any():
-            result['loss_pitch'] = per_token[is_pitch].mean().item()
-        if is_duration.any():
-            result['loss_duration'] = per_token[is_duration].mean().item()
+        if is_note.any():
+            result['loss_note'] = per_token[is_note].mean().item()
         if is_struct.any():
             result['loss_struct'] = per_token[is_struct].mean().item()
         if is_schema.any():
@@ -625,7 +591,7 @@ class Trainer:
                         logger.info(f'Step {self.global_step}: valid_loss={valid_metrics["valid_loss"]:.4f}')
                         if self.use_wandb:
                             valid_log = {'valid/loss': valid_metrics['valid_loss']}
-                            for k in ('loss_pitch', 'loss_duration', 'loss_struct', 'loss_schema'):
+                            for k in ('loss_note', 'loss_struct', 'loss_schema'):
                                 if k in valid_metrics:
                                     valid_log[f'valid/{k}'] = valid_metrics[k]
                             wandb.log(valid_log, step=self.global_step)
@@ -646,8 +612,8 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
         # Accumulators for per-type loss breakdown
-        type_loss_sums = {'loss_pitch': 0.0, 'loss_duration': 0.0, 'loss_struct': 0.0, 'loss_schema': 0.0}
-        type_loss_counts = {'loss_pitch': 0, 'loss_duration': 0, 'loss_struct': 0, 'loss_schema': 0}
+        type_loss_sums = {'loss_note': 0.0, 'loss_struct': 0.0, 'loss_schema': 0.0}
+        type_loss_counts = {'loss_note': 0, 'loss_struct': 0, 'loss_schema': 0}
 
         for batch_idx, batch in enumerate(self.valid_loader):
             # DDP-safe skip (same as train_epoch)
@@ -808,7 +774,7 @@ class Trainer:
                     }
                     if 'valid_loss' in valid_metrics:
                         epoch_log['epoch/valid_loss'] = valid_metrics['valid_loss']
-                    for k in ('loss_pitch', 'loss_duration', 'loss_struct', 'loss_schema'):
+                    for k in ('loss_note', 'loss_struct', 'loss_schema'):
                         if k in valid_metrics:
                             epoch_log[f'epoch/valid_{k}'] = valid_metrics[k]
                     wandb.log(epoch_log, step=self.global_step)
@@ -907,9 +873,9 @@ def sanity_check(model: ClefPianoBase, train_loader: DataLoader, device: torch.d
 
     dur_chars = set('0123456789')
     pitch_chars = set('abcdefgrABCDEFGR')
-    dur_mask   = _mask(lambda t: bool(t) and t[0] in dur_chars and t not in ('<sos>','<eos>','<pad>','<bar>','<nl>','<coc>','<continue>'))
+    dur_mask   = _mask(lambda t: bool(t) and t[0] in dur_chars and t not in ('<sos>','<eos>','<pad>','<bar>','<nl>','<coc>','<cont>','<prev>'))
     pitch_mask = _mask(lambda t: bool(t) and t[0] in pitch_chars)
-    struct_mask= _mask(lambda t: t in ('<bar>','<nl>','<coc>','<split>','<merge>','<*>','<sos>','<eos>'))
+    struct_mask= _mask(lambda t: t in ('<bar>','<nl>','<coc>','<split>','<merge>','<*>','<sos>','<eos>','<cont>','<prev>'))
 
     model.eval()
     with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):

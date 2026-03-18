@@ -84,7 +84,7 @@ model:
   mamba_expand: 2
 
   max_seq_len: 768   # 10s chunks: p95=657, p99=815; dense chunks fall back to 5s
-  vocab_size: 271
+  vocab_size: 5589
 
   label_smoothing: 0.0
 

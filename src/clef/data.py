@@ -381,13 +381,19 @@ class ChunkedDataset(Dataset):
                         )
                         return None
 
-                    # tokenizer.encode() always appends <eos>.
-                    # For non-final chunks, replace <eos> with <continue>
-                    # so the model learns "this chunk ends but the piece
-                    # continues" vs "the piece is finished".
+                    # tokenizer.encode() always wraps with <sos>...<eos>.
+                    # Non-first chunks: replace leading <sos> with <prev> so
+                    # the model knows the piece started in a previous chunk.
+                    # Non-final chunks: replace trailing <eos> with <cont> so
+                    # the model knows the piece continues in the next chunk.
+                    if start_frame > 0 and tokens:
+                        sos_id = self.tokenizer.vocab["<sos>"]
+                        prev_id = self.tokenizer.vocab["<prev>"]
+                        if tokens[0] == sos_id:
+                            tokens[0] = prev_id
                     if not is_last_chunk and tokens:
                         eos_id = self.tokenizer.vocab["<eos>"]
-                        cont_id = self.tokenizer.vocab["<continue>"]
+                        cont_id = self.tokenizer.vocab["<cont>"]
                         if tokens[-1] == eos_id:
                             tokens[-1] = cont_id
             else:

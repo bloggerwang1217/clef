@@ -1,34 +1,32 @@
 """
-Kern Tokenizer - Factorized Encoding for **kern format
-=======================================================
+Kern Tokenizer - Compound Word Encoding for **kern format
+==========================================================
 
-Converts **kern tokens to factorized representation where duration and pitch
-are separate tokens. This follows Zeng et al.'s approach for vocabulary efficiency.
+Converts **kern tokens to compound representation where each note event
+is a single atomic token (duration+pitch combined), following the
+Compound Word Transformer (Hsiao et al. 2021) design.
 
 Example:
-    "4c#" -> ["4", "c#"]      (quarter note C#)
-    "8.G"  -> ["8.", "G"]     (dotted eighth G)
-    "16r"  -> ["16", "r"]     (sixteenth rest)
-    "[4E"  -> ["[", "4", "E"] (tie start + quarter E)
+    "4c#" -> ["4c#"]         (quarter note C# — single compound token)
+    "8.G"  -> ["8.G"]        (dotted eighth G)
+    "16r"  -> ["16r"]        (sixteenth rest)
+    "[4E"  -> ["[", "4E"]    (tie start modifier + compound note)
 
-Schema-first design (Mamba decoder):
-    After each <bar>, schema tokens are injected:
-    <bar> <4> 4 <key:3b> 8E- <coc> 8B- ...
-           ^  ^    ^
-    numerator | key signature
-         denominator (reuses existing duration token)
+Embedding Design (CWT-style):
+    embed("4c#") = pitch_embed("c#") + dur_embed("4")
+    embed(".")   = other_embed(".")   (struct token)
+    embed("<bar>") = other_embed("<bar>")  (struct token)
+
+    Weight-tied output logits:
+    logit("dur_i pitch_j") = h · (pitch_embed[j] + dur_embed[i])^T
+                           = h·pitch_embed[j]^T + h·dur_embed[i]^T
 
 Vocabulary Design:
-    - Special tokens: <pad>, <sos>, <eos>, <coc>, <bar>, etc.
+    - Special tokens (IDs 0-10): <pad>, <sos>, <eos>, <coc>, <bar>, etc.
+    - Note tokens (IDs 11..11+N_NOTE-1): all dur×pitch compound tokens
     - Schema tokens: <2>~<17> (numerator), <key:0>~<key:7#>/<key:1b>~<key:7b>
-    - Duration tokens: 1, 2, 4, 8, 16, 32, 64, 128, dotted, triplets
-    - Pitch tokens: CC, C, c, cc, ccc (octave notation) with accidentals
-    - Modifiers: ties ([, ], _), grace notes (q, Q, P)
-
-Benefits of Factorized Encoding:
-    - Small vocab (~512) vs single-token (~9000+)
-    - Compositional generalization
-    - Rare combinations don't need fallback tokens
+    - Duration tokens (standalone): schema denominators (2, 4, 8, ...)
+    - Structural/modifier tokens: ., [, ], q, Q, P, etc.
 """
 
 import re
@@ -47,11 +45,12 @@ SPECIAL_TOKENS = {
     "<eos>": 2,
     "<coc>": 3,      # Change of Column (multi-track separator)
     "<bar>": 4,      # Bar line
-    "<continue>": 5, # Chunk boundary (piece continues in next chunk)
+    "<cont>": 5,     # Chunk boundary (piece continues in next chunk)
     "<nl>": 6,       # Newline (line separator within measure)
     "<split>": 7,    # Spine split (*^)
     "<merge>": 8,    # Spine merge (*v)
     "<*>": 9,        # Null interpretation (* in split/merge lines)
+    "<prev>": 10,    # Non-first chunk start (piece started in a previous chunk)
 }
 
 # Schema tokens: time signature numerators (beats per measure)
@@ -139,6 +138,10 @@ DURATION_TOKENS = [
     "20", "40", "112", "176",
 ]
 
+# Grace note durations — only included in vocab when include_grace_notes=True.
+# All grace durations are normalised to one of these two canonical values.
+GRACE_DURATION_TOKENS = ["8q", "16q"]
+
 # Pitch tokens - Humdrum kern notation
 # Octave notation: CC=C2, C=C3, c=C4, cc=C5, ccc=C6, cccc=C7
 PITCH_LETTERS = ["C", "D", "E", "F", "G", "A", "B"]
@@ -200,6 +203,54 @@ def generate_pitch_tokens() -> List[str]:
 
 PITCH_TOKENS = generate_pitch_tokens()
 
+
+# =============================================================================
+# Compound Note Tokens (CWT-style)
+# =============================================================================
+
+def generate_note_tokens() -> List[str]:
+    """Generate compound note tokens: all (duration, pitch) combinations.
+
+    Ordering: dur[i] × pitch[j] → index i*N_PITCH + j.
+    This ordering is required by CWTEmbedding's weight-tied output.
+    """
+    tokens = []
+    for dur in DURATION_TOKENS:
+        for pitch in PITCH_TOKENS:
+            tokens.append(dur + pitch)
+    return tokens
+
+
+NOTE_TOKENS: List[str] = generate_note_tokens()
+NOTE_START_ID: int = max(SPECIAL_TOKENS.values()) + 1  # = 11 (right after SPECIAL)
+N_DUR:   int = len(DURATION_TOKENS)   # number of duration types
+N_PITCH: int = len(PITCH_TOKENS)      # number of pitch types (including rest)
+N_NOTE:  int = N_DUR * N_PITCH        # total compound note tokens
+
+# Lookup: compound note string → (dur_index, pitch_index) within their tables
+_PITCH_TO_IDX: Dict[str, int] = {p: i for i, p in enumerate(PITCH_TOKENS)}
+_DUR_TO_IDX:   Dict[str, int] = {d: i for i, d in enumerate(DURATION_TOKENS)}
+# Sorted durations by length descending for unambiguous prefix parsing
+_DUR_SORTED: List[str] = sorted(DURATION_TOKENS, key=len, reverse=True)
+
+
+def _parse_note_token(token: str) -> Tuple[str, str]:
+    """Parse compound note token into (duration, pitch) strings.
+
+    Returns:
+        (dur_str, pitch_str) such that dur_str + pitch_str == token.
+
+    Raises:
+        ValueError if token is not a valid compound note.
+    """
+    for dur in _DUR_SORTED:
+        if token.startswith(dur):
+            pitch = token[len(dur):]
+            if pitch in _PITCH_TO_IDX:
+                return dur, pitch
+    raise ValueError(f"Cannot parse compound note token: {token!r}")
+
+
 # Kern pitch to MIDI mapping
 _KERN_BASE_SEMITONES = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
 
@@ -253,10 +304,8 @@ MODIFIER_TOKENS = [
     "]",    # Tie end
     "_",    # Tie continue (not commonly used in kern)
 
-    # Grace notes
-    "q",    # Short appoggiatura
-    "Q",    # Long appoggiatura
-    "P",    # Acciaccatura (grace note)
+    # Grace notes: q/Q/P are now incorporated into compound note duration ("8q"/"16q"),
+    # so they are NOT emitted as standalone modifier tokens.
 
     # Phrase/slur markers (often in kern)
     "(",    # Phrase/slur start
@@ -281,54 +330,57 @@ STRUCTURAL_TOKENS = [
 
 
 def build_vocab() -> Tuple[Dict[str, int], Dict[int, str]]:
-    """Build vocabulary mapping.
+    """Build vocabulary mapping (compound note token scheme).
+
+    Vocab ordering (required by CWTEmbedding weight-tied output):
+        0  .. 10           : SPECIAL tokens (fixed IDs)
+        11 .. 11+N_NOTE-1  : NOTE tokens (compound dur+pitch, dur-major order)
+        11+N_NOTE ..       : other tokens (standalone dur, meter, key, struct, modifier)
 
     Returns:
         Tuple of (token_to_id, id_to_token) dictionaries
     """
     token_to_id = {}
-    idx = 0
 
-    # Special tokens first
+    # 1. Special tokens (fixed IDs 0-10)
     for token, special_idx in SPECIAL_TOKENS.items():
         token_to_id[token] = special_idx
-        idx = max(idx, special_idx + 1)
+    idx = NOTE_START_ID  # = 11
 
-    # Schema tokens (meter numerators + key signatures)
-    for token in METER_NUMERATOR_TOKENS:
-        token_to_id[token] = idx
-        idx += 1
-    for token in KEY_TOKENS:
+    # 2. Note tokens (compound) — ordered dur[i]*N_PITCH + pitch[j]
+    for token in NOTE_TOKENS:
         token_to_id[token] = idx
         idx += 1
 
-    # Structural tokens
-    for token in STRUCTURAL_TOKENS:
-        if token not in token_to_id:
-            token_to_id[token] = idx
-            idx += 1
-
-    # Duration tokens
+    # 3. Standalone duration tokens (used as schema denominators: *M4/4 → "4")
     for token in DURATION_TOKENS:
         if token not in token_to_id:
             token_to_id[token] = idx
             idx += 1
 
-    # Pitch tokens
-    for token in PITCH_TOKENS:
+    # 4. Schema tokens (meter numerators + key signatures)
+    for token in METER_NUMERATOR_TOKENS:
+        if token not in token_to_id:
+            token_to_id[token] = idx
+            idx += 1
+    for token in KEY_TOKENS:
         if token not in token_to_id:
             token_to_id[token] = idx
             idx += 1
 
-    # Modifier tokens
+    # 5. Structural tokens (., \t, \n)
+    for token in STRUCTURAL_TOKENS:
+        if token not in token_to_id:
+            token_to_id[token] = idx
+            idx += 1
+
+    # 6. Modifier tokens ([, ], q, Q, P, etc.)
     for token in MODIFIER_TOKENS:
         if token not in token_to_id:
             token_to_id[token] = idx
             idx += 1
 
-    # Reverse mapping
     id_to_token = {v: k for k, v in token_to_id.items()}
-
     return token_to_id, id_to_token
 
 
@@ -337,14 +389,80 @@ VOCAB, ID_TO_TOKEN = build_vocab()
 VOCAB_SIZE = len(VOCAB)
 
 
+def build_cwt_info(vocab: Dict[str, int]):
+    """Build CWTEmbedding dispatch tensors from a vocabulary.
+
+    Returns a dict with:
+        n_dur, n_pitch, n_note, n_other, n_special, note_start_id : int
+        is_note        : BoolTensor  [vocab_size] — True for note tokens
+        note_dur_idx   : LongTensor  [vocab_size] — dur table index (0..N_DUR-1)
+        note_pitch_idx : LongTensor  [vocab_size] — pitch table index (0..N_PITCH-1)
+        other_idx      : LongTensor  [vocab_size] — other_embed index for non-note tokens
+
+    other_embed has n_other = vocab_size - N_NOTE entries, laid out as:
+        indices 0..n_special-1 → SPECIAL tokens (vocab IDs 0..n_special-1)
+        indices n_special..    → non-special non-note tokens (in vocab-ID order)
+    """
+    import torch as _torch
+    vocab_size = max(vocab.values()) + 1
+    n_special = len(SPECIAL_TOKENS)  # = NOTE_START_ID = 11
+
+    is_note        = _torch.zeros(vocab_size, dtype=_torch.bool)
+    note_dur_idx   = _torch.zeros(vocab_size, dtype=_torch.long)
+    note_pitch_idx = _torch.zeros(vocab_size, dtype=_torch.long)
+    other_idx      = _torch.zeros(vocab_size, dtype=_torch.long)
+
+    note_set = set(NOTE_TOKENS)
+    for token, token_id in vocab.items():
+        if token in note_set:
+            is_note[token_id] = True
+            dur, pitch = _parse_note_token(token)
+            note_dur_idx[token_id]   = _DUR_TO_IDX[dur]
+            note_pitch_idx[token_id] = _PITCH_TO_IDX[pitch]
+
+    # Build other_idx: contiguous indices for all non-note tokens
+    # Layout: SPECIAL first (IDs 0..n_special-1), then the rest in vocab-ID order
+    other_tokens_sorted = sorted(
+        [(tid, tok) for tok, tid in vocab.items() if not is_note[tid]],
+        key=lambda x: x[0]
+    )
+    for local_idx, (token_id, _) in enumerate(other_tokens_sorted):
+        other_idx[token_id] = local_idx
+    n_other = len(other_tokens_sorted)
+
+    return {
+        'n_dur':        N_DUR,
+        'n_pitch':      N_PITCH,
+        'n_note':       N_NOTE,
+        'n_other':      n_other,
+        'n_special':    n_special,
+        'note_start_id': NOTE_START_ID,
+        'is_note':        is_note,
+        'note_dur_idx':   note_dur_idx,
+        'note_pitch_idx': note_pitch_idx,
+        'other_idx':      other_idx,
+    }
+
+
+# Pre-computed CWT info for the default vocabulary
+CWT_INFO = build_cwt_info(VOCAB)
+
+
 # =============================================================================
 # Tokenizer Class
 # =============================================================================
 
 class KernTokenizer:
-    """Tokenizer for **kern format with factorized encoding.
+    """Tokenizer for **kern format with compound word encoding.
 
-    Converts kern tokens like "4c#" into factorized form ["4", "c#"].
+    Converts kern tokens like "4c#" into compound form ["4c#"].
+
+    Example:
+        >>> tokenizer = KernTokenizer()
+        >>> tokenizer.tokenize_kern_token("4c#")
+        ['4c#']
+        >>> tokenizer.encode("4c# 8d")
+        [token_ids...]
 
     Example:
         >>> tokenizer = KernTokenizer()
@@ -356,13 +474,18 @@ class KernTokenizer:
         "4c# 8d"
     """
 
-    def __init__(self, vocab: Optional[Dict[str, int]] = None):
+    def __init__(self, vocab: Optional[Dict[str, int]] = None,
+                 include_grace_notes: bool = False):
         """Initialize tokenizer.
 
         Args:
             vocab: Optional custom vocabulary. Uses default if None.
+            include_grace_notes: If True, encode grace notes as compound tokens
+                ("8q"/"16q" + pitch). If False (default), skip grace notes entirely —
+                consistent with Zeng and a2s-transformer baselines.
         """
         self.vocab = vocab or VOCAB
+        self.include_grace_notes = include_grace_notes
         self.id_to_token = {v: k for k, v in self.vocab.items()}
         self.vocab_size = len(self.vocab)
 
@@ -380,9 +503,10 @@ class KernTokenizer:
         self._grace_pattern = re.compile(r'[qQP]')
         self._beam_pattern = re.compile(r'[LJKk]+$')
 
-        # Build duration and pitch sets for validation
+        # Build token-type sets for validation and reconstruction
         self._valid_durations = set(DURATION_TOKENS)
         self._valid_pitches = set(PITCH_TOKENS)
+        self._valid_notes = set(NOTE_TOKENS)  # compound note tokens
 
     @staticmethod
     def _clean_pitch(pitch: str) -> str:
@@ -415,14 +539,22 @@ class KernTokenizer:
             '24ffd#' -> ['24ffd#']         (pitch splitting handled in tokenize_kern_token)
         """
         clean = self._beam_pattern.sub('', token)
-        # Split at boundaries: after pitch/accidental/rest, before digit (new duration)
-        parts = re.split(r'(?<=[A-Ga-gr#\-n])(?=\d)', clean)
+        # Split at note boundaries: after pitch/accidental, before a digit that starts a
+        # NEW note (next segment has digit + pitch letter).
+        # This avoids splitting pitch-then-duration tokens like 'dd8q' → ['dd', '8q'].
+        parts = re.split(r'(?<=[A-Ga-gr#\-n])(?=\d+\.?[A-Ga-gr])', clean)
+        # Strip trailing stray digits after a pitch/accidental (data quality: '16c#0' → '16c#').
+        parts = [re.sub(r'(?<=[A-Ga-gr#\-n])\d+\.?$', '', p) for p in parts]
         # Keep only parts that contain a pitch character (discard stray numbers)
         result = [p for p in parts if re.search(r'[A-Ga-gr]', p)]
         return result if result else [clean]
 
-    def tokenize_kern_token(self, token: str) -> List[str]:
-        """Tokenize a single kern token into factorized components.
+    def tokenize_kern_token(self, token: str, default_duration: Optional[str] = None) -> List[str]:
+        """Tokenize a single kern token into compound form.
+
+        Each note event becomes one atomic compound token (duration+pitch).
+        Prefix modifiers ([, q, Q, P) are emitted as separate preceding tokens.
+        Trailing tie markers (], _, )) are emitted as separate following tokens.
 
         Handles malformed kern data: concatenated chord notes (e.g. '24ffd#'),
         natural accidentals (e.g. 'bbn'), and conflicting accidentals (e.g. 'ccc#-').
@@ -431,7 +563,7 @@ class KernTokenizer:
             token: A single kern token like "4c#", "[8.G", "16r"
 
         Returns:
-            List of factorized tokens: ["4", "c#"], ["[", "8.", "G"], etc.
+            Compound tokens: ["4c#"], ["[", "8.G"], ["4c#", "]"], etc.
         """
         if not token or token == ".":
             return ["."]
@@ -439,65 +571,84 @@ class KernTokenizer:
         result = []
         remaining = token
 
-        # 1. Extract leading tie/phrase markers
+        # 1. Extract leading tie/phrase markers ([, (, {)
         tie_start_match = self._tie_start_pattern.match(remaining)
         if tie_start_match:
             for char in tie_start_match.group():
                 result.append(char)
             remaining = remaining[tie_start_match.end():]
 
-        # 2. Strip beam markers early (L, J, K, k) - never included in output
+        # 2. Strip beam markers (L, J, K, k) — never included in output
         remaining = self._beam_pattern.sub('', remaining)
 
-        # 3. Extract grace note marker (q, Q, P) from anywhere
+        # 3. Extract grace note marker (q, Q, P).
+        # Grace notes are encoded as compound note tokens with duration "8q" or "16q"
+        # (all grace durations normalised to one of these two).
+        #
+        # Special cases in training data:
+        #   '8qqe'  — double-q (long appoggiatura); only the first q is consumed here,
+        #             the second q stays in `remaining` but is ignored by pitch/dur parsing.
+        #   '12qfff#' — triplet-quarter grace (12 < 16) → maps to "8q".
         grace_match = self._grace_pattern.search(remaining)
-        grace_token = None
+        is_grace = grace_match is not None
+        if is_grace and not self.include_grace_notes:
+            return []
         if grace_match:
-            grace_token = grace_match.group()
             remaining = remaining[:grace_match.start()] + remaining[grace_match.end():]
 
-        # 4. Extract ALL valid pitches using backreference regex.
-        #    This handles concatenated chord notes like 'ffd#' -> ['ff', 'd#']
-        #    where the greedy [A-Ga-g]+ would incorrectly match 'ffd#' as one pitch.
+        # 4. Extract trailing tie markers (], ), })
+        trailing_markers = []
+        tie_end_match = self._tie_end_pattern.search(remaining)
+        if tie_end_match:
+            for char in tie_end_match.group():
+                trailing_markers.append(char)
+            remaining = remaining[:tie_end_match.start()]
+
+        # 4b. Remove stray digits embedded between a pitch letter and its accidental.
+        # Kern pitch tokens never contain digits; numbers are duration-only.
+        # Data quality: 'A0-' → 'A-', '8A0-' → '8A-'.
+        remaining = re.sub(r'([A-Ga-g])\d+([#\-n])', r'\1\2', remaining)
+
+        # 5. Extract ALL valid pitches (handles concatenated chord notes)
         pitches = []
         for pm in self._single_pitch_re.finditer(remaining):
             pitch = self._clean_pitch(pm.group(0))
             if pitch:
                 pitches.append(pitch)
-        # Remove all pitch material from remaining to isolate duration
         remaining = self._single_pitch_re.sub('', remaining)
 
-        # 5. Extract duration (from what's left — may be at start or after
-        #    removing pitch/grace from non-standard orderings like "a8q")
+        # 6. Extract duration; fall back to chord-inherited duration if absent.
         dur_match = re.search(r'(\d+\.?)', remaining)
-        duration = None
-        if dur_match:
-            duration = dur_match.group(1)
-            remaining = remaining[:dur_match.start()] + remaining[dur_match.end():]
+        duration = dur_match.group(1) if dur_match else default_duration
 
-        # 6. Emit tokens: [duration] [grace] pitch for each pitch found.
-        #    For concatenated chords (multiple pitches), duration is repeated.
-        for i, pitch in enumerate(pitches):
-            if i == 0:
-                if duration:
-                    result.append(duration)
-                if grace_token:
-                    result.append(grace_token)
+        # 6b. Normalise grace note duration to "8q" or "16q".
+        # All grace durations map to one of two canonical values:
+        #   numeric part >= 16 (16th or shorter) → "16q"
+        #   numeric part <  16 (8th or longer)   → "8q"
+        #   durationless grace                   → "8q"
+        if is_grace:
+            if duration is not None:
+                num = int(re.match(r'\d+', duration).group())
+                duration = "16q" if num >= 16 else "8q"
             else:
-                # Chord note from concatenated data: repeat duration
+                duration = "8q"
+
+        # 7. Emit compound note tokens (one per pitch, duration repeated for chords)
+        for pitch in pitches:
+            note = (duration or "") + pitch
+            if note in self._valid_notes:
+                result.append(note)
+            else:
+                # Fallback: emit standalone duration + pitch (OOV compound)
                 if duration:
                     result.append(duration)
-            result.append(pitch)
+                result.append(pitch)
 
-        # 7. If no pitches found but we have a duration, emit just the duration
+        # 8. If no pitches but have duration (schema denominator or bare duration)
         if not pitches and duration:
             result.append(duration)
 
-        # 8. Extract trailing tie markers from what's left
-        tie_end_match = self._tie_end_pattern.search(remaining)
-        if tie_end_match:
-            for char in tie_end_match.group():
-                result.append(char)
+        result.extend(trailing_markers)
 
         if not result:
             raise ValueError(f"Cannot tokenize kern token: {token!r}")
@@ -577,13 +728,32 @@ class KernTokenizer:
                 result.append("<coc>")
 
             # Handle chord (space-separated notes in same spine)
+            # Kern convention: subsequent chord notes may omit duration (inherits from first note).
             notes_raw = spine.split()
+            chord_duration: Optional[str] = None  # inherited duration for this spine token
 
             for note in notes_raw:
                 # Split concatenated notes (data quality fix: e.g. '4r4G-' -> ['4r', '4G-'])
                 split_notes = self._split_kern_token(note)
+
+                # Pre-scan: find any explicit duration in the split parts for forward/backward
+                # propagation within this concatenated token (handles 'A4e' -> ['A', '4e']
+                # where the duration only appears in a later part).
+                local_duration = chord_duration
                 for sn in split_notes:
-                    tokens = self.tokenize_kern_token(sn)
+                    stripped = re.sub(r'^[\[({qQP]+', '', sn)
+                    dm = re.search(r'\d+\.?', stripped)
+                    if dm:
+                        local_duration = dm.group(0)
+                        break
+
+                for sn in split_notes:
+                    # Update chord_duration from this note if it carries an explicit duration.
+                    stripped = re.sub(r'^[\[({qQP]+', '', sn)
+                    dur_m = re.search(r'\d+\.?', stripped)
+                    if dur_m:
+                        chord_duration = dur_m.group(0)
+                    tokens = self.tokenize_kern_token(sn, default_duration=local_duration)
                     result.extend(tokens)
 
         return result
@@ -700,14 +870,21 @@ class KernTokenizer:
         return ids
 
     def is_duration_id(self, token_id: int) -> bool:
-        """Check if a token ID is a duration token."""
+        """Check if a token ID is a standalone duration token (schema denominator)."""
         token = self.id_to_token.get(token_id, "")
         return token in self._valid_durations
 
-    def is_pitch_id(self, token_id: int) -> bool:
-        """Check if a token ID is a pitch token (including rest 'r')."""
+    def is_note_id(self, token_id: int) -> bool:
+        """Check if a token ID is a compound note token (dur+pitch)."""
         token = self.id_to_token.get(token_id, "")
-        return token in self._valid_pitches
+        return token in self._valid_notes
+
+    def is_pitch_id(self, token_id: int) -> bool:
+        """Check if a token ID represents a pitch/note event.
+
+        Returns True for compound note tokens (the new primary note representation).
+        """
+        return self.is_note_id(token_id)
 
     def decode(self, token_ids: List[int], skip_special: bool = True) -> str:
         """Decode token IDs back to kern format.
@@ -722,7 +899,7 @@ class KernTokenizer:
         tokens = []
         for tid in token_ids:
             token = self.id_to_token.get(tid, f"<UNK:{tid}>")
-            if skip_special and token in ["<pad>", "<sos>", "<eos>", "<continue>"]:
+            if skip_special and token in ["<pad>", "<sos>", "<eos>", "<cont>", "<prev>"]:
                 continue
             tokens.append(token)
 
@@ -790,19 +967,23 @@ class KernTokenizer:
                     result.append("".join(current_note))
                     current_note = []
                 result.append(".")
+            elif token in self._valid_notes:
+                # Compound note token: flush any accumulated prefix, emit note
+                current_note.append(token)
+                result.append("".join(current_note))
+                current_note = []
             elif token in self._valid_durations:
-                # Only flush if current_note already contains a duration
-                # (i.e. a previous note is in progress). Pure prefix modifiers
-                # like "[" must stay attached to their following duration.
-                if current_note and any(c in self._valid_durations for c in current_note):
-                    result.append("".join(current_note))
-                    current_note = [token]
+                # Standalone duration (schema denominator — shouldn't normally reach here)
+                current_note.append(token)
+            elif token in ["[", "(", "{"]:
+                # Prefix modifiers: accumulate before the compound note
+                current_note.append(token)
+            elif token in ["]", ")", "}", "_", ";"]:
+                # Trailing modifiers: append to last emitted kern token
+                if result:
+                    result[-1] = result[-1] + token
                 else:
                     current_note.append(token)
-            elif token in self._valid_pitches:
-                current_note.append(token)
-            elif token in ["[", "]", "(", ")", "{", "}", "q", "Q", "P", ";"]:
-                current_note.append(token)
             elif token in ("<split>", "<merge>", "<*>"):
                 if current_note:
                     result.append("".join(current_note))

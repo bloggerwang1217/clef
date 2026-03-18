@@ -83,6 +83,7 @@ def generate_kern_chunk(
     tokenizer: KernTokenizer,
     max_length: int = 16384,
     device: str = 'cuda',
+    is_first_chunk: bool = True,
 ) -> List[int]:
     """Generate token IDs from a single mel chunk.
 
@@ -98,13 +99,15 @@ def generate_kern_chunk(
         tokenizer: KernTokenizer instance
         max_length: Maximum sequence length for this chunk
         device: Device to run on
+        is_first_chunk: If False, use <prev> instead of <sos> as the start
+            token, signalling that the piece started in a previous chunk.
 
     Returns:
-        List of generated token IDs (excluding <sos>).
+        List of generated token IDs (excluding the start token).
     """
-    sos_id = tokenizer.vocab['<sos>']
+    start_id = tokenizer.vocab['<sos>'] if is_first_chunk else tokenizer.vocab['<prev>']
     eos_id = tokenizer.vocab['<eos>']
-    continue_id = tokenizer.vocab['<continue>']
+    cont_id = tokenizer.vocab['<cont>']
 
     # Encode mel once (Swin + Bridge)
     memory, spatial_shapes, level_start_index, valid_ratios = model.encode(mel_chunk)
@@ -115,8 +118,8 @@ def generate_kern_chunk(
     # Initialize inference states (Mamba InferenceParams + SA KV-cache)
     past_states = model._init_inference_states(1, max_length, device)
 
-    # First step: decode <sos>
-    input_ids = torch.tensor([[sos_id]], device=device)
+    # First step: decode <sos> or <prev>
+    input_ids = torch.tensor([[start_id]], device=device)
     logits, past_states = model.decode(
         input_ids, memory, spatial_shapes, level_start_index, valid_ratios,
         past_states=past_states, use_cache=True, value_cache=value_cache,
@@ -125,7 +128,7 @@ def generate_kern_chunk(
     next_id = logits[:, -1, :].argmax(dim=-1).item()
     generated: List[int] = []
 
-    if next_id in (eos_id, continue_id):
+    if next_id in (eos_id, cont_id):
         return generated
 
     generated.append(next_id)
@@ -145,8 +148,8 @@ def generate_kern_chunk(
             logger.debug(f'Chunk: generated {step + 1} tokens, stopped at <eos>')
             break
 
-        if next_id == continue_id:
-            logger.debug(f'Chunk: generated {step + 1} tokens, stopped at <continue>')
+        if next_id == cont_id:
+            logger.debug(f'Chunk: generated {step + 1} tokens, stopped at <cont>')
             break
 
         generated.append(next_id)
@@ -155,7 +158,7 @@ def generate_kern_chunk(
             logger.info(f'    Token progress: {step + 1}/{max_length}...')
 
     if len(generated) >= max_length - 1:
-        logger.warning(f'Chunk hit max_length={max_length} without <eos>/<continue>')
+        logger.warning(f'Chunk hit max_length={max_length} without <eos>/<cont>')
 
     return generated
 
@@ -388,12 +391,13 @@ def generate_kern(
             tokenizer=tokenizer,
             max_length=max_length,
             device=device,
+            is_first_chunk=(i == 0),
         )
 
-        # Strip trailing <eos>/<continue> before splitting by barline
+        # Strip trailing <eos>/<cont> before splitting by barline
         eos_id = tokenizer.vocab['<eos>']
-        continue_id = tokenizer.vocab['<continue>']
-        while chunk_tokens and chunk_tokens[-1] in (eos_id, continue_id):
+        cont_id = tokenizer.vocab['<cont>']
+        while chunk_tokens and chunk_tokens[-1] in (eos_id, cont_id):
             chunk_tokens.pop()
 
         measures = split_tokens_by_bar(chunk_tokens, bar_id)

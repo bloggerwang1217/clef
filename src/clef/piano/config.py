@@ -24,7 +24,7 @@ class ClefPianoConfig(ClefConfig):
     name: str = "clef-piano-base"
 
     # Piano-specific defaults
-    vocab_size: int = 512   # ~220 factorized tokens + padding
+    vocab_size: int = 5589  # compound note tokens (N_DUR×N_PITCH + struct/schema/special)
 
     # Guided attention loss weight schedule.
     # Weight held constant at guidance_loss_weight during warmup, then cosine-decays
