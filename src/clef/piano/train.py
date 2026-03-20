@@ -353,12 +353,11 @@ class Trainer:
         note token (e.g. "4c#"). Token families:
         - note_mask:   compound note tokens (dur+pitch, e.g. "4c#", "8r")
         - struct_mask: structural tokens (<coc>, <bar>, <nl>, ., [, ], q, ...)
-        - schema_mask: schema tokens (<4>, <key:0>, ...) + standalone durations
-                       (standalone durations only appear as schema denominators)
+        - schema_mask: schema tokens (<M4/4>, <key:0>, ...)
 
         Used for per-type loss breakdown logged to wandb (monitoring only).
         """
-        from .tokenizer import NOTE_TOKENS, SPECIAL_TOKENS, METER_NUMERATOR_TOKENS, KEY_TOKENS, DURATION_TOKENS
+        from .tokenizer import NOTE_TOKENS, SPECIAL_TOKENS, METER_TOKENS, KEY_TOKENS
         tokenizer = KernTokenizer()
         V = self.config.vocab_size
 
@@ -367,11 +366,7 @@ class Trainer:
         schema_ids = set()
 
         note_set   = set(NOTE_TOKENS)
-        schema_set = (
-            set(METER_NUMERATOR_TOKENS) |
-            set(KEY_TOKENS) |
-            set(DURATION_TOKENS)          # standalone durations = schema denominators
-        )
+        schema_set = set(METER_TOKENS) | set(KEY_TOKENS)
         struct_set = set(tokenizer.vocab.keys()) - note_set - schema_set
 
         for tok_str, tok_id in tokenizer.vocab.items():

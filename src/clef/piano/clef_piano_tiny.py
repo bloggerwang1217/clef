@@ -35,46 +35,53 @@ from ..swin import SwinEncoder
 class CWTEmbedding(nn.Module):
     """Compound Word Transformer-style embedding + weight-tied logit computation.
 
-    Note tokens (compound dur+pitch): embed = pitch_embed[j] + dur_embed[i]
-    All other tokens (struct, schema, special): embed = other_embed[k]
+    Note tokens  (compound dur+pitch):  embed = dur_embed[i]       + pitch_embed[j]
+    Meter tokens (compound num/den):    embed = meter_num_embed[k] + dur_embed[i]
+    All other tokens (struct, key, special): embed = other_embed[m]
 
-    Weight-tied output:
-        logit("dur_i pitch_j") = h · (pitch_embed[j] + dur_embed[i])^T
-                               = h·pitch_embed[j]^T + h·dur_embed[i]^T
-        → computed as outer sum: O((n_dur + n_pitch) × D) not O(n_note × D)
+    The dur_embed table is shared between notes and meter tokens.
 
     Vocab layout (required for cat-based logit assembly):
-        IDs 0..n_special-1       : SPECIAL tokens  (→ other_embed[:n_special])
-        IDs note_start_id..+n_note-1 : NOTE tokens  (→ CWT outer sum)
-        IDs note_start_id+n_note.. : remaining other (→ other_embed[n_special:])
+        IDs 0..n_special-1           : SPECIAL tokens  (→ other_embed[:n_special])
+        IDs note_start_id..+n_note-1 : NOTE tokens     (→ dur+pitch sum)
+        IDs note_start_id+n_note..   : METER + KEY + DURATION + STRUCT tokens
     """
 
-    def __init__(self, n_dur: int, n_pitch: int, n_other: int, n_special: int,
-                 note_start_id: int, d_model: int,
+    def __init__(self, n_dur: int, n_pitch: int, n_meter_num: int, n_other: int,
+                 n_special: int, note_start_id: int, d_model: int,
                  is_note: "torch.Tensor",
                  note_dur_idx: "torch.Tensor",
                  note_pitch_idx: "torch.Tensor",
+                 is_meter: "torch.Tensor",
+                 meter_num_idx: "torch.Tensor",
+                 meter_dur_idx: "torch.Tensor",
                  other_idx: "torch.Tensor"):
         super().__init__()
-        self.n_dur        = n_dur
-        self.n_pitch      = n_pitch
-        self.n_note       = n_dur * n_pitch
-        self.n_special    = n_special
+        self.n_dur         = n_dur
+        self.n_pitch       = n_pitch
+        self.n_note        = n_dur * n_pitch
+        self.n_meter_num   = n_meter_num
+        self.n_special     = n_special
         self.note_start_id = note_start_id
 
-        self.dur_embed   = nn.Embedding(n_dur,   d_model)
-        self.pitch_embed = nn.Embedding(n_pitch, d_model)
-        self.other_embed = nn.Embedding(n_other, d_model)
+        self.dur_embed       = nn.Embedding(n_dur,       d_model)
+        self.pitch_embed     = nn.Embedding(n_pitch,     d_model)
+        self.meter_num_embed = nn.Embedding(n_meter_num, d_model)
+        self.other_embed     = nn.Embedding(n_other,     d_model)
 
         self.register_buffer('is_note',        is_note)
         self.register_buffer('note_dur_idx',   note_dur_idx)
         self.register_buffer('note_pitch_idx', note_pitch_idx)
+        self.register_buffer('is_meter',       is_meter)
+        self.register_buffer('meter_num_idx',  meter_num_idx)
+        self.register_buffer('meter_dur_idx',  meter_dur_idx)
         self.register_buffer('other_idx',      other_idx)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Embed token IDs → [*, d_model]."""
         note_mask  = self.is_note[token_ids]
-        other_mask = ~note_mask
+        meter_mask = self.is_meter[token_ids]
+        other_mask = ~note_mask & ~meter_mask
 
         out = torch.empty(*token_ids.shape, self.dur_embed.embedding_dim,
                           device=token_ids.device, dtype=self.dur_embed.weight.dtype)
@@ -83,6 +90,11 @@ class CWTEmbedding(nn.Module):
             t = token_ids[note_mask]
             out[note_mask] = (self.dur_embed(self.note_dur_idx[t]) +
                               self.pitch_embed(self.note_pitch_idx[t]))
+
+        if meter_mask.any():
+            t = token_ids[meter_mask]
+            out[meter_mask] = (self.meter_num_embed(self.meter_num_idx[t]) +
+                               self.dur_embed(self.meter_dur_idx[t]))
 
         if other_mask.any():
             t = token_ids[other_mask]
@@ -210,6 +222,7 @@ class ClefPianoTiny(nn.Module):
         self.token_embed = CWTEmbedding(
             n_dur         = CWT_INFO['n_dur'],
             n_pitch       = CWT_INFO['n_pitch'],
+            n_meter_num   = CWT_INFO['n_meter_num'],
             n_other       = CWT_INFO['n_other'],
             n_special     = CWT_INFO['n_special'],
             note_start_id = CWT_INFO['note_start_id'],
@@ -217,6 +230,9 @@ class ClefPianoTiny(nn.Module):
             is_note        = CWT_INFO['is_note'],
             note_dur_idx   = CWT_INFO['note_dur_idx'],
             note_pitch_idx = CWT_INFO['note_pitch_idx'],
+            is_meter       = CWT_INFO['is_meter'],
+            meter_num_idx  = CWT_INFO['meter_num_idx'],
+            meter_dur_idx  = CWT_INFO['meter_dur_idx'],
             other_idx      = CWT_INFO['other_idx'],
         )
         # Output projection: direct Linear, no weight tying (following Zeng / a2s-transformer)

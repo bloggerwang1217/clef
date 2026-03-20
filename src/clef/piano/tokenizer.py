@@ -13,9 +13,10 @@ Example:
     "[4E"  -> ["[", "4E"]    (tie start modifier + compound note)
 
 Embedding Design (CWT-style):
-    embed("4c#") = pitch_embed("c#") + dur_embed("4")
-    embed(".")   = other_embed(".")   (struct token)
-    embed("<bar>") = other_embed("<bar>")  (struct token)
+    embed("4c#")    = pitch_embed("c#") + dur_embed("4")
+    embed("<M3/4>") = meter_num_embed("3") + dur_embed("4")  (compound meter)
+    embed(".")      = other_embed(".")   (struct token)
+    embed("<bar>")  = other_embed("<bar>")  (struct token)
 
     Weight-tied output logits:
     logit("dur_i pitch_j") = h · (pitch_embed[j] + dur_embed[i])^T
@@ -24,8 +25,9 @@ Embedding Design (CWT-style):
 Vocabulary Design:
     - Special tokens (IDs 0-10): <pad>, <sos>, <eos>, <coc>, <bar>, etc.
     - Note tokens (IDs 11..11+N_NOTE-1): all dur×pitch compound tokens
-    - Schema tokens: <2>~<17> (numerator), <key:0>~<key:7#>/<key:1b>~<key:7b>
-    - Duration tokens (standalone): schema denominators (2, 4, 8, ...)
+    - Meter tokens: <M{num}/{den}> compound time signature tokens
+    - Key tokens: <key:0>~<key:7#>/<key:1b>~<key:7b>
+    - Duration tokens (standalone): still in vocab (used as note durations)
     - Structural/modifier tokens: ., [, ], q, Q, P, etc.
 """
 
@@ -53,12 +55,27 @@ SPECIAL_TOKENS = {
     "<prev>": 10,    # Non-first chunk start (piece started in a previous chunk)
 }
 
-# Schema tokens: time signature numerators (beats per measure)
-# Denominator reuses existing duration tokens (2, 4, 8, 16, 32)
-METER_NUMERATOR_TOKENS = [
-    "<2>", "<3>", "<4>", "<5>", "<6>", "<7>",
-    "<8>", "<9>", "<10>", "<12>", "<17>",
-]
+# Compound time signature tokens: <M{num}/{den}>
+# Embedding: meter_num_embed[num_idx] + dur_embed[den_idx]  (shared dur_embed with notes)
+METER_NUM_STRS: List[str] = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "12", "17"]
+METER_DEN_STRS: List[str] = ["2", "4", "8", "16", "32"]  # subset of DURATION_TOKENS
+
+
+def generate_meter_tokens() -> List[str]:
+    """Generate all compound meter tokens: <M{num}/{den}>."""
+    return [f"<M{num}/{den}>" for num in METER_NUM_STRS for den in METER_DEN_STRS]
+
+
+METER_TOKENS: List[str] = generate_meter_tokens()
+N_METER_NUM: int = len(METER_NUM_STRS)   # 11
+N_METER: int = N_METER_NUM * len(METER_DEN_STRS)  # 55
+
+# Lookup tables for meter compound tokens
+_METER_NUM_TO_IDX: Dict[str, int] = {n: i for i, n in enumerate(METER_NUM_STRS)}
+_METER_TOKEN_TO_PARTS: Dict[str, Tuple[str, str]] = {}
+for _mt in METER_TOKENS:
+    _mm = re.match(r'<M(\d+)/(\d+)>', _mt)
+    _METER_TOKEN_TO_PARTS[_mt] = (_mm.group(1), _mm.group(2))
 
 # Schema tokens: key signatures (circle of fifths)
 KEY_TOKENS = [
@@ -335,7 +352,7 @@ def build_vocab() -> Tuple[Dict[str, int], Dict[int, str]]:
     Vocab ordering (required by CWTEmbedding weight-tied output):
         0  .. 10           : SPECIAL tokens (fixed IDs)
         11 .. 11+N_NOTE-1  : NOTE tokens (compound dur+pitch, dur-major order)
-        11+N_NOTE ..       : other tokens (standalone dur, meter, key, struct, modifier)
+        11+N_NOTE ..       : other tokens (meter, key, struct, modifier)
 
     Returns:
         Tuple of (token_to_id, id_to_token) dictionaries
@@ -352,17 +369,13 @@ def build_vocab() -> Tuple[Dict[str, int], Dict[int, str]]:
         token_to_id[token] = idx
         idx += 1
 
-    # 3. Standalone duration tokens (used as schema denominators: *M4/4 → "4")
-    for token in DURATION_TOKENS:
+    # 3. Compound meter tokens (<M{num}/{den}>)
+    for token in METER_TOKENS:
         if token not in token_to_id:
             token_to_id[token] = idx
             idx += 1
 
-    # 4. Schema tokens (meter numerators + key signatures)
-    for token in METER_NUMERATOR_TOKENS:
-        if token not in token_to_id:
-            token_to_id[token] = idx
-            idx += 1
+    # 5-orig. Key signature tokens
     for token in KEY_TOKENS:
         if token not in token_to_id:
             token_to_id[token] = idx
@@ -393,15 +406,18 @@ def build_cwt_info(vocab: Dict[str, int]):
     """Build CWTEmbedding dispatch tensors from a vocabulary.
 
     Returns a dict with:
-        n_dur, n_pitch, n_note, n_other, n_special, note_start_id : int
+        n_dur, n_pitch, n_note, n_meter_num, n_other, n_special, note_start_id : int
         is_note        : BoolTensor  [vocab_size] — True for note tokens
         note_dur_idx   : LongTensor  [vocab_size] — dur table index (0..N_DUR-1)
         note_pitch_idx : LongTensor  [vocab_size] — pitch table index (0..N_PITCH-1)
-        other_idx      : LongTensor  [vocab_size] — other_embed index for non-note tokens
+        is_meter       : BoolTensor  [vocab_size] — True for compound meter tokens
+        meter_num_idx  : LongTensor  [vocab_size] — meter numerator table index
+        meter_dur_idx  : LongTensor  [vocab_size] — dur table index (shared with notes)
+        other_idx      : LongTensor  [vocab_size] — other_embed index for remaining tokens
 
-    other_embed has n_other = vocab_size - N_NOTE entries, laid out as:
+    other_embed covers: SPECIAL + KEY + DURATION (standalone) + STRUCTURAL + MODIFIER
         indices 0..n_special-1 → SPECIAL tokens (vocab IDs 0..n_special-1)
-        indices n_special..    → non-special non-note tokens (in vocab-ID order)
+        indices n_special..    → remaining non-note non-meter tokens (in vocab-ID order)
     """
     import torch as _torch
     vocab_size = max(vocab.values()) + 1
@@ -410,20 +426,30 @@ def build_cwt_info(vocab: Dict[str, int]):
     is_note        = _torch.zeros(vocab_size, dtype=_torch.bool)
     note_dur_idx   = _torch.zeros(vocab_size, dtype=_torch.long)
     note_pitch_idx = _torch.zeros(vocab_size, dtype=_torch.long)
+    is_meter       = _torch.zeros(vocab_size, dtype=_torch.bool)
+    meter_num_idx  = _torch.zeros(vocab_size, dtype=_torch.long)
+    meter_dur_idx  = _torch.zeros(vocab_size, dtype=_torch.long)
     other_idx      = _torch.zeros(vocab_size, dtype=_torch.long)
 
-    note_set = set(NOTE_TOKENS)
+    note_set  = set(NOTE_TOKENS)
+    meter_set = set(METER_TOKENS)
     for token, token_id in vocab.items():
         if token in note_set:
             is_note[token_id] = True
             dur, pitch = _parse_note_token(token)
             note_dur_idx[token_id]   = _DUR_TO_IDX[dur]
             note_pitch_idx[token_id] = _PITCH_TO_IDX[pitch]
+        elif token in meter_set:
+            is_meter[token_id] = True
+            num, den = _METER_TOKEN_TO_PARTS[token]
+            meter_num_idx[token_id] = _METER_NUM_TO_IDX[num]
+            meter_dur_idx[token_id] = _DUR_TO_IDX[den]
 
-    # Build other_idx: contiguous indices for all non-note tokens
+    # Build other_idx: contiguous indices for all non-note, non-meter tokens
     # Layout: SPECIAL first (IDs 0..n_special-1), then the rest in vocab-ID order
     other_tokens_sorted = sorted(
-        [(tid, tok) for tok, tid in vocab.items() if not is_note[tid]],
+        [(tid, tok) for tok, tid in vocab.items()
+         if not is_note[tid] and not is_meter[tid]],
         key=lambda x: x[0]
     )
     for local_idx, (token_id, _) in enumerate(other_tokens_sorted):
@@ -434,12 +460,16 @@ def build_cwt_info(vocab: Dict[str, int]):
         'n_dur':        N_DUR,
         'n_pitch':      N_PITCH,
         'n_note':       N_NOTE,
+        'n_meter_num':  N_METER_NUM,
         'n_other':      n_other,
         'n_special':    n_special,
         'note_start_id': NOTE_START_ID,
         'is_note':        is_note,
         'note_dur_idx':   note_dur_idx,
         'note_pitch_idx': note_pitch_idx,
+        'is_meter':       is_meter,
+        'meter_num_idx':  meter_num_idx,
+        'meter_dur_idx':  meter_dur_idx,
         'other_idx':      other_idx,
     }
 
@@ -504,7 +534,6 @@ class KernTokenizer:
         self._beam_pattern = re.compile(r'[LJKk]+$')
 
         # Build token-type sets for validation and reconstruction
-        self._valid_durations = set(DURATION_TOKENS)
         self._valid_pitches = set(PITCH_TOKENS)
         self._valid_notes = set(NOTE_TOKENS)  # compound note tokens
 
@@ -638,15 +667,7 @@ class KernTokenizer:
             note = (duration or "") + pitch
             if note in self._valid_notes:
                 result.append(note)
-            else:
-                # Fallback: emit standalone duration + pitch (OOV compound)
-                if duration:
-                    result.append(duration)
-                result.append(pitch)
-
-        # 8. If no pitches but have duration (schema denominator or bare duration)
-        if not pitches and duration:
-            result.append(duration)
+            # OOV compound (duration or pitch not in vocab): silently skip
 
         result.extend(trailing_markers)
 
@@ -766,17 +787,13 @@ class KernTokenizer:
         """
         tokens = []
 
-        # Time signature: extract numerator and denominator
+        # Time signature: emit single compound meter token <M{num}/{den}>
         if self._current_time_sig:
-            # Parse *M4/4 -> numerator=4, denominator=4
             m = re.match(r'\*M(\d+)/(\d+)', self._current_time_sig)
             if m:
-                numerator = m.group(1)
-                denominator = m.group(2)
-                num_token = f'<{numerator}>'
-                if num_token in VOCAB:
-                    tokens.append(num_token)
-                    tokens.append(denominator)  # reuse duration token
+                meter_token = f'<M{m.group(1)}/{m.group(2)}>'
+                if meter_token in VOCAB:
+                    tokens.append(meter_token)
 
         # Key signature
         if self._current_key_sig:
@@ -869,11 +886,6 @@ class KernTokenizer:
             ids.append(self.vocab[t])
         return ids
 
-    def is_duration_id(self, token_id: int) -> bool:
-        """Check if a token ID is a standalone duration token (schema denominator)."""
-        token = self.id_to_token.get(token_id, "")
-        return token in self._valid_durations
-
     def is_note_id(self, token_id: int) -> bool:
         """Check if a token ID is a compound note token (dur+pitch)."""
         token = self.id_to_token.get(token_id, "")
@@ -914,35 +926,25 @@ class KernTokenizer:
         to track state but not emitted as note content.
         """
         # Schema token sets for detection
-        _numerator_set = set(METER_NUMERATOR_TOKENS)
+        _meter_set = set(METER_TOKENS)
         _key_set = set(KEY_TOKENS)
 
         result = []
         current_note = []
         # State machine: after <bar>, consume schema tokens before note data
         consuming_schema = False
-        schema_expect_denom = False  # after numerator, expect denominator
 
         for token in tokens:
             # Schema consumption: after <bar> (or at start), eat schema tokens
             if consuming_schema:
-                if token in _numerator_set:
-                    schema_expect_denom = True
-                    continue
-                if schema_expect_denom and token in self._valid_durations:
-                    schema_expect_denom = False
-                    continue
-                if token in _key_set:
+                if token in _meter_set or token in _key_set:
                     continue
                 # Not a schema token — stop consuming, process normally
                 consuming_schema = False
-                schema_expect_denom = False
 
-            if token in _numerator_set or token in _key_set:
+            if token in _meter_set or token in _key_set:
                 # Schema token outside of post-bar context (e.g. after <sos>)
                 consuming_schema = True
-                if token in _numerator_set:
-                    schema_expect_denom = True
                 continue
 
             if token == "<nl>":
@@ -961,7 +963,6 @@ class KernTokenizer:
                     current_note = []
                 result.append("\n=\n")
                 consuming_schema = True
-                schema_expect_denom = False
             elif token == ".":
                 if current_note:
                     result.append("".join(current_note))
@@ -972,9 +973,6 @@ class KernTokenizer:
                 current_note.append(token)
                 result.append("".join(current_note))
                 current_note = []
-            elif token in self._valid_durations:
-                # Standalone duration (schema denominator — shouldn't normally reach here)
-                current_note.append(token)
             elif token in ["[", "(", "{"]:
                 # Prefix modifiers: accumulate before the compound note
                 current_note.append(token)
