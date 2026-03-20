@@ -23,10 +23,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import ClefPianoConfig
+from .tokenizer import CWT_INFO
 from ..bimamba import BiMambaEncoder
 from ..decoder import ClefDecoder
 from ..flow import HarmonizingFlow, Octopus2D
 from ..swin import SwinEncoder
+
 
 
 class OnsetDetector(nn.Module):
@@ -63,6 +65,76 @@ class OnsetDetector(nn.Module):
         h = self.conv(x.permute(0, 2, 1)).permute(0, 2, 1) + x   # [B, T, D]  DWConv + residual
         h = F.relu(self.dense(self.norm(h)))                       # [B, T, hidden]
         return self.proj(h).squeeze(-1)                            # [B, T] logits
+
+class CWTEmbedding(nn.Module):
+    """Compound Word Transformer-style embedding + weight-tied logit computation.
+
+    Note tokens  (compound dur+pitch):  embed = dur_embed[i]       + pitch_embed[j]
+    Meter tokens (compound num/den):    embed = meter_num_embed[k] + dur_embed[i]
+    All other tokens (struct, key, special): embed = other_embed[m]
+
+    The dur_embed table is shared between notes and meter tokens.
+
+    Vocab layout (required for cat-based logit assembly):
+        IDs 0..n_special-1           : SPECIAL tokens  (→ other_embed[:n_special])
+        IDs note_start_id..+n_note-1 : NOTE tokens     (→ dur+pitch sum)
+        IDs note_start_id+n_note..   : METER + KEY + DURATION + STRUCT tokens
+    """
+
+    def __init__(self, n_dur: int, n_pitch: int, n_meter_num: int, n_other: int,
+                 n_special: int, note_start_id: int, d_model: int,
+                 is_note: "torch.Tensor",
+                 note_dur_idx: "torch.Tensor",
+                 note_pitch_idx: "torch.Tensor",
+                 is_meter: "torch.Tensor",
+                 meter_num_idx: "torch.Tensor",
+                 meter_dur_idx: "torch.Tensor",
+                 other_idx: "torch.Tensor"):
+        super().__init__()
+        self.n_dur         = n_dur
+        self.n_pitch       = n_pitch
+        self.n_note        = n_dur * n_pitch
+        self.n_meter_num   = n_meter_num
+        self.n_special     = n_special
+        self.note_start_id = note_start_id
+
+        self.dur_embed       = nn.Embedding(n_dur,       d_model)
+        self.pitch_embed     = nn.Embedding(n_pitch,     d_model)
+        self.meter_num_embed = nn.Embedding(n_meter_num, d_model)
+        self.other_embed     = nn.Embedding(n_other,     d_model)
+
+        self.register_buffer('is_note',        is_note)
+        self.register_buffer('note_dur_idx',   note_dur_idx)
+        self.register_buffer('note_pitch_idx', note_pitch_idx)
+        self.register_buffer('is_meter',       is_meter)
+        self.register_buffer('meter_num_idx',  meter_num_idx)
+        self.register_buffer('meter_dur_idx',  meter_dur_idx)
+        self.register_buffer('other_idx',      other_idx)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Embed token IDs → [*, d_model]."""
+        note_mask  = self.is_note[token_ids]
+        meter_mask = self.is_meter[token_ids]
+        other_mask = ~note_mask & ~meter_mask
+
+        out = torch.empty(*token_ids.shape, self.dur_embed.embedding_dim,
+                          device=token_ids.device, dtype=self.dur_embed.weight.dtype)
+
+        if note_mask.any():
+            t = token_ids[note_mask]
+            out[note_mask] = (self.dur_embed(self.note_dur_idx[t]) +
+                              self.pitch_embed(self.note_pitch_idx[t]))
+
+        if meter_mask.any():
+            t = token_ids[meter_mask]
+            out[meter_mask] = (self.meter_num_embed(self.meter_num_idx[t]) +
+                               self.dur_embed(self.meter_dur_idx[t]))
+
+        if other_mask.any():
+            t = token_ids[other_mask]
+            out[other_mask] = self.other_embed(self.other_idx[t])
+
+        return out
 
 
 class ClefPianoTiny(nn.Module):
@@ -154,12 +226,35 @@ class ClefPianoTiny(nn.Module):
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
             use_rope=True,
-            bar_token_id=None,  # MambaIsotonicAttnLayer handles alignment, no BarMamba needed
-            onset_1d_channels=octopus_channels,
+            # Bar/Note GRU config
+            bar_token_id=getattr(config, 'bar_token_id', None),
+            onset_1d_channels=getattr(config, 'octopus_channels', 32),
+            bar_gru_hidden_size=getattr(config, 'bar_gru_hidden_size', 256),
+            bar_gru_input_dropout=getattr(config, 'bar_gru_input_dropout', 0.1),
+            # Curriculum Learning for mamba_full_ca path
+            curriculum_warmup_steps=getattr(config, 'curriculum_warmup_steps', 0),
+            tbptt_chunk_size=getattr(config, 'tbptt_chunk_size', 256),
         )
 
-        # === Token embedding + output projection ===
-        self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
+
+        # === Token embedding (CWT-style compound word) ===
+        self.token_embed = CWTEmbedding(
+            n_dur         = CWT_INFO['n_dur'],
+            n_pitch       = CWT_INFO['n_pitch'],
+            n_meter_num   = CWT_INFO['n_meter_num'],
+            n_other       = CWT_INFO['n_other'],
+            n_special     = CWT_INFO['n_special'],
+            note_start_id = CWT_INFO['note_start_id'],
+            d_model       = config.d_model,
+            is_note        = CWT_INFO['is_note'],
+            note_dur_idx   = CWT_INFO['note_dur_idx'],
+            note_pitch_idx = CWT_INFO['note_pitch_idx'],
+            is_meter       = CWT_INFO['is_meter'],
+            meter_num_idx  = CWT_INFO['meter_num_idx'],
+            meter_dur_idx  = CWT_INFO['meter_dur_idx'],
+            other_idx      = CWT_INFO['other_idx'],
+        )
+        # Output projection: direct Linear, no weight tying (following Zeng / a2s-transformer)
         self.output_projection = nn.Linear(config.d_model, config.vocab_size)
 
         # === Dual variable for cardinality relaxation (Eq. dual_ascent_z) ===
@@ -213,12 +308,48 @@ class ClefPianoTiny(nn.Module):
         # Step 5: BiMamba → h_j (decoder memory, bidirectional temporal context)
         h = self.bimamba_encoder(swin_feat)                             # [B, T_swin, D]
 
-        memory = h
+        # === Step 2.5: Integrate onset into pitch space ===
+        onset_signal = self.onset_to_pitch(onset_raw).squeeze(1)  # [B, 128, T]
+        onset_signal = onset_signal.permute(0, 2, 1)  # [B, T, 128]
+        onset_in_pitch = onset_signal @ self.flow.transform.T  # [B, T, 128]
+        flow_with_onset = flow_feat + onset_in_pitch
+
+        features.append(flow_with_onset)
+        spatial_shapes_list.append((1, T_flow))
+        valid_ratios_list.append([1.0, 1.0])
+
+        # === Step 3: SwinEncoder (S0 + S1) ===
+        # flow_with_onset: [B, T, 128] @100fps
+        # SwinEncoder: patch_embed (4x) + S0 downsample (2x) = 8x temporal reduction
+        # Output: [B, H, W, 192] @12.5fps where W = T/8
+        swin_s0, swin_s1 = self.swin(flow_with_onset)  # each [B, H, W, 192]
+        B_swin, H_swin, W_swin, D_swin = swin_s0.shape
+        T_swin = W_swin  # time dimension
+
+        # Concat S0+S1 along channel dim, then conv along freq axis.
+        # [B, H, W, 192] × 2 → [B, H, W, 384] → [B, 384, H, W] → freq_conv → [B, bimamba_d_model, 1, W]
+        swin_2d = torch.cat([swin_s0, swin_s1], dim=-1)          # [B, H, W, 384]
+        swin_2d = swin_2d.permute(0, 3, 1, 2)                    # [B, 384, H, W]
+        swin_2d = self.freq_conv(swin_2d)                         # [B, bimamba_d_model, 1, W]
+        swin_feat = swin_2d.squeeze(2).permute(0, 2, 1)          # [B, W, bimamba_d_model]
+
+        # === Step 4: BiMamba Encoder (time-oriented) ===
+        # swin_feat: [B, T_swin, 384] @12.5fps → BiMamba projects to d_model
+        if self.use_bimamba:
+            feat_bimamba = self.bimamba_encoder(swin_feat)
+            # feat_bimamba: [B, T_swin, 384] @12.5fps
+            memory = feat_bimamba
+            spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
+            level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
+            valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
+            return memory, spatial_shapes, level_start_index, valid_ratios
+
+        # Fallback (should not happen since use_bimamba=True by default)
+        memory = swin_feat
         spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
         level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
         valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
-
-        return memory, spatial_shapes, level_start_index, valid_ratios, onset_logit_bias, p_onset_hires
+        return memory, spatial_shapes, level_start_index, valid_ratios
 
     def forward(
         self,
@@ -240,6 +371,7 @@ class ClefPianoTiny(nn.Module):
             total_loss: CE loss + qty_weight * |Σσ(ℓ_j) - N|
                         dual_mu (updated externally) enforces Σσ(ℓ-μ)=N in decoder
         """
+
         memory, spatial_shapes, level_start_index, valid_ratios, onset_logit_bias, p_onset_hires = self.encode(mel)
 
         # Cardinality relaxation: p_s = σ(ℓ_s - μ), where μ is updated by the
@@ -309,10 +441,20 @@ class ClefPianoTiny(nn.Module):
 
         memory, spatial_shapes, level_start_index, valid_ratios, onset_logit_bias, _ = self.encode(mel)
 
+
         generated = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
 
         for _ in range(max_len - 1):
-            tgt = self.token_embed(generated)                         # [B, S, D]
+
+            # Embed tokens
+            tgt = self.token_embed(generated)
+
+            # Mamba2 workaround: when S=1, zxbcdt slice has stride(1)=total_dim=1804
+            # which is not a multiple of 8. PyTorch sees [1,1,D] as already-contiguous
+            # (size-1 dims), so ensure_stride's .contiguous() is a no-op → kernel crash.
+            # Fix: repeat last token to make S=2 so .contiguous() actually recomputes strides.
+            if tgt.shape[1] == 1:
+                tgt = tgt.repeat(1, 2, 1)  # [B, 2, D], now S=2 → strides fix correctly
 
             decoder_out = self.decoder(
                 tgt, memory,
@@ -320,6 +462,11 @@ class ClefPianoTiny(nn.Module):
                 input_ids=generated,
                 p_onset=onset_logit_bias,
             )                                                         # [B, S, D]
+
+            if isinstance(decoder_out, tuple):
+                decoder_out = decoder_out[0]
+            logits = self.output_projection(decoder_out[:, -1:, :])  # [B, 1, vocab]
+            next_token = logits.argmax(dim=-1)  # [B, 1]
 
             logits      = self.output_projection(decoder_out[:, -1]) # [B, vocab]
             next_token  = logits.argmax(dim=-1, keepdim=True)        # [B, 1]

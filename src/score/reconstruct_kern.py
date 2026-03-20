@@ -21,96 +21,51 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Valid duration tokens (Zeng vocab only — must match tokenizer)
-VALID_DURATIONS = {
-    "0", "00", "1", "2", "4", "8", "16", "32", "64", "128",
-    "0.", "00.", "1.", "2.", "4.", "8.", "16.", "32.", "64.",
-    "3", "6", "12", "24", "48", "96",
-    "20", "40", "112", "176",
-}
-
 # Schema token detection
 from src.clef.piano.tokenizer import (
-    METER_NUMERATOR_TOKENS, KEY_TOKENS,
-    _TOKEN_TO_KEY_SIG,
+    METER_TOKENS, KEY_TOKENS,
+    _TOKEN_TO_KEY_SIG, _METER_TOKEN_TO_PARTS,
 )
-_NUMERATOR_SET = set(METER_NUMERATOR_TOKENS)
+_METER_SET = set(METER_TOKENS)
 _KEY_SET = set(KEY_TOKENS)
 
 
 def _assemble_spine_content(tokens: List[str]) -> str:
     """Assemble factorized tokens into kern spine content (notes/chords).
 
-    Combines consecutive duration + pitch + modifier tokens into kern tokens,
-    space-separated within one spine slot.
+    Compound note tokens (e.g. "4c#", "[8.G") are atomic — each one becomes
+    a kern token. Pre-modifiers ([, (, {) accumulate before the compound note;
+    post-modifiers (], ), }, ;) append to the previous token.
 
-    A kern note has the structure: [pre-modifiers] duration pitch [post-modifiers]
-    For chords (multiple pitches): duration pitch pitch ... (space between pitches)
-    
-    Pre-modifiers: [ ( { q Q P
+    Pre-modifiers: [ ( {
     Post-modifiers: ] ) } ;
     """
-    PRE_MODIFIERS = {"[", "(", "{", "q", "Q", "P"}
+    PRE_MODIFIERS  = {"[", "(", "{"}
     POST_MODIFIERS = {"]", ")", "}", ";", "_"}
 
     result = []
-    current_note = []
-    has_pitch = False  # whether current_note already has a pitch
-    has_duration = False  # whether current_note has a duration yet
+    pending_pre = []  # pre-modifiers waiting for the next note token
 
     for token in tokens:
-        if token in VALID_DURATIONS:
-            # New duration: flush current_note UNLESS it only has pre-modifiers
-            if current_note and has_pitch:
-                result.append("".join(current_note))
-                current_note = [token]
-                has_pitch = False
-                has_duration = True
-            elif current_note and all(t in PRE_MODIFIERS for t in current_note):
-                # Pre-modifiers waiting for duration — keep them
-                current_note.append(token)
-                has_duration = True
-            else:
-                if current_note:
-                    result.append("".join(current_note))
-                current_note = [token]
-                has_pitch = False
-                has_duration = True
-        elif token == 'r' or re.match(r'^[A-Ga-g]+[#\-]*$', token):
-            # This is a pitch token
-            if has_pitch and has_duration:
-                # We already have a pitch for this duration (chord note)
-                # Space-separate it from the previous pitch
-                result.append("".join(current_note))
-                current_note = [token]
-                has_pitch = True
-                # Keep has_duration = True since this is still the same duration
-            else:
-                # First pitch for this duration, add to current_note
-                current_note.append(token)
-                has_pitch = True
-        elif token == '.':
-            if current_note:
-                result.append("".join(current_note))
-                current_note = []
-                has_pitch = False
-                has_duration = False
+        if token == '.':
+            if pending_pre:
+                result.append("".join(pending_pre))
+                pending_pre = []
             result.append(".")
         elif token in PRE_MODIFIERS:
-            # Pre-modifier: if we already have a pitch, flush first (new note)
-            if has_pitch:
-                result.append("".join(current_note))
-                current_note = []
-                has_pitch = False
-                has_duration = False
-            current_note.append(token)
+            pending_pre.append(token)
         elif token in POST_MODIFIERS:
-            current_note.append(token)
+            if result:
+                result[-1] = result[-1] + token
+            elif pending_pre:
+                pending_pre.append(token)
         else:
-            current_note.append(token)
+            # Compound note token or unknown: emit with any pending pre-modifiers
+            result.append("".join(pending_pre) + token)
+            pending_pre = []
 
-    if current_note:
-        result.append("".join(current_note))
+    if pending_pre:
+        result.append("".join(pending_pre))
 
     return " ".join(result)
 
@@ -206,10 +161,8 @@ def reconstruct_kern_from_tokens(
     bar_schema_changes = {}   # bar_idx -> {'time_sig': ..., 'key_sig': ...}
     bar_count = 0
     consuming_schema = False
-    schema_expect_denom = False
     pending_time_sig = None
     pending_key_sig = None
-    schema_time_sig_num = None
 
     def _flush_schema():
         """Record schema changes at current bar.
@@ -254,13 +207,9 @@ def reconstruct_kern_from_tokens(
 
         # Schema consumption: after <bar> or at start
         if consuming_schema:
-            if t in _NUMERATOR_SET:
-                schema_expect_denom = True
-                schema_time_sig_num = t[1:-1]
-                continue
-            if schema_expect_denom and t in VALID_DURATIONS:
-                schema_expect_denom = False
-                pending_time_sig = f'*M{schema_time_sig_num}/{t}'
+            if t in _METER_SET:
+                num, den = _METER_TOKEN_TO_PARTS[t]
+                pending_time_sig = f'*M{num}/{den}'
                 continue
             if t in _KEY_SET:
                 pending_key_sig = _TOKEN_TO_KEY_SIG.get(t, '*k[]')
@@ -268,12 +217,11 @@ def reconstruct_kern_from_tokens(
             # Not a schema token — flush pending schema and stop consuming
             _flush_schema()
             consuming_schema = False
-            schema_expect_denom = False
 
-        if t in _NUMERATOR_SET:
+        if t in _METER_SET:
             consuming_schema = True
-            schema_expect_denom = True
-            schema_time_sig_num = t[1:-1]
+            num, den = _METER_TOKEN_TO_PARTS[t]
+            pending_time_sig = f'*M{num}/{den}'
             continue
         if t in _KEY_SET:
             consuming_schema = True
@@ -284,7 +232,6 @@ def reconstruct_kern_from_tokens(
             if consuming_schema:
                 _flush_schema()
             consuming_schema = True
-            schema_expect_denom = False
             bar_count += 1
 
         filtered.append(t)

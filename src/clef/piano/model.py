@@ -22,7 +22,7 @@ from transformers import Swinv2Model
 from .config import ClefPianoConfig
 from .guided_attn import build_guidance_bounds
 from ..bridge import MultiScaleBridge
-from ..decoder import ClefDecoder, MambaOnlyLayer, MambaWindowCALayer
+from ..decoder import ClefDecoder, MambaOnlyLayer
 from ..flow import HarmonizingFlow, Octopus2D
 
 

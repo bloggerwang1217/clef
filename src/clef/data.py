@@ -177,36 +177,77 @@ class ChunkedDataset(Dataset):
         for idx in range(len(self.base_dataset)):
             length = self._get_audio_length(idx)
 
-            # Decide chunking params based on full-piece token count
-            use_fallback = False
-            if self.max_seq_len is not None:
-                _, tokens, _ = self.base_dataset[idx]
-                if len(tokens) > self.max_seq_len:
-                    use_fallback = True
+            # Generate primary (chunk_frames) boundaries first, then check
+            # each chunk's actual token count. Dense chunks (> max_seq_len)
+            # are replaced with fallback sub-chunks; sparse chunks keep 1000f.
+            # No data is wasted — dense regions just use a shorter window.
+            base = self.base_dataset
+            item = base.manifest[idx]
+            item_id = item.get('id', Path(item.get('mel_path', '')).stem)
+            kern_key = 'kern_path' if 'kern_path' in item else 'kern_gt_path'
+            kern_path = base._resolve_path(item[kern_key], base.kern_dir)
+            aug_info = base.aug_meta.get(item_id, {})
+            audio_measures = aug_info.get('audio_measures', [])
+            kern_measures = aug_info.get('kern_measures', [])
 
-            if use_fallback:
-                chunk = self.fallback_chunk_frames
-                stride = self.fallback_stride
-                min_chunk = self.fallback_min_chunk_frames
-                n_fallback += 1
-            else:
-                chunk = self.chunk_frames
-                stride = self.stride
-                min_chunk = self.min_chunk_frames
-                n_primary += 1
+            try:
+                all_lines = kern_path.read_text(
+                    encoding='utf-8', errors='replace'
+                ).splitlines(keepends=True)
+                has_alignment = bool(audio_measures and kern_measures)
+            except Exception:
+                all_lines = []
+                has_alignment = False
 
-            if length <= chunk and not use_fallback:
-                # Short piece that fits in one primary chunk: keep as-is
-                chunks.append((idx, 0, length))
-            else:
-                # Long piece, or short piece that needs fallback chunking
-                start = 0
-                while start + min_chunk <= length:
-                    end = min(start + chunk, length)
+            def _n_tokens_for_chunk(s: int, e: int) -> Optional[int]:
+                """Return token count for a frame range, or None if unknown."""
+                if not has_alignment:
+                    return None
+                start_sec, end_sec = s / 100.0, e / 100.0
+                first_m = last_m = None
+                for i, am in enumerate(audio_measures):
+                    if am['end_sec'] > start_sec and am['start_sec'] < end_sec:
+                        if first_m is None:
+                            first_m = i
+                        last_m = i
+                if first_m is None or last_m is None or last_m >= len(kern_measures):
+                    return None
+                line_start = kern_measures[first_m]['line_start']
+                line_end   = kern_measures[last_m]['line_end']
+                chunk_kern = ''.join(all_lines[line_start - 1:line_end])
+                try:
+                    return len(base.tokenizer.encode(chunk_kern))
+                except Exception:
+                    return None
+
+            # Walk primary chunks; dense ones are split into fallback sub-chunks
+            start = 0
+            while start + self.min_chunk_frames <= length:
+                end = min(start + self.chunk_frames, length)
+
+                use_fallback = False
+                if self.max_seq_len is not None:
+                    n_tok = _n_tokens_for_chunk(start, end)
+                    if n_tok is not None and n_tok > self.max_seq_len:
+                        use_fallback = True
+
+                if use_fallback:
+                    # Replace this primary chunk with fallback sub-chunks
+                    fb_start = start
+                    while fb_start + self.fallback_min_chunk_frames <= end:
+                        fb_end = min(fb_start + self.fallback_chunk_frames, end)
+                        chunks.append((idx, fb_start, fb_end))
+                        n_fallback += 1
+                        if fb_end >= end:
+                            break
+                        fb_start += self.fallback_stride
+                else:
                     chunks.append((idx, start, end))
-                    if end >= length:
-                        break
-                    start += stride
+                    n_primary += 1
+
+                if end >= length:
+                    break
+                start += self.stride
 
         if self.max_seq_len is not None:
             logger.info(
@@ -353,13 +394,19 @@ class ChunkedDataset(Dataset):
                         )
                         return None
 
-                    # tokenizer.encode() always appends <eos>.
-                    # For non-final chunks, replace <eos> with <continue>
-                    # so the model learns "this chunk ends but the piece
-                    # continues" vs "the piece is finished".
+                    # tokenizer.encode() always wraps with <sos>...<eos>.
+                    # Non-first chunks: replace leading <sos> with <prev> so
+                    # the model knows the piece started in a previous chunk.
+                    # Non-final chunks: replace trailing <eos> with <cont> so
+                    # the model knows the piece continues in the next chunk.
+                    if start_frame > 0 and tokens:
+                        sos_id = self.tokenizer.vocab["<sos>"]
+                        prev_id = self.tokenizer.vocab["<prev>"]
+                        if tokens[0] == sos_id:
+                            tokens[0] = prev_id
                     if not is_last_chunk and tokens:
                         eos_id = self.tokenizer.vocab["<eos>"]
-                        cont_id = self.tokenizer.vocab["<continue>"]
+                        cont_id = self.tokenizer.vocab["<cont>"]
                         if tokens[-1] == eos_id:
                             tokens[-1] = cont_id
             else:
