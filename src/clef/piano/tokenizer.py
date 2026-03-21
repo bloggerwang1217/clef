@@ -489,9 +489,11 @@ class KernTokenizer:
                     result.append(duration)
             result.append(pitch)
 
-        # 7. If no pitches found but we have a duration, emit just the duration
+        # 7. If no pitches found but we have a duration, treat as invisible rest.
+        # Humdrum uses bare duration (e.g. "4") as an invisible rest placeholder.
         if not pitches and duration:
             result.append(duration)
+            result.append("r")
 
         # 8. Extract trailing tie markers from what's left
         tie_end_match = self._tie_end_pattern.search(remaining)

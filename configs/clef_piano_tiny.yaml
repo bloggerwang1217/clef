@@ -90,6 +90,9 @@ model:
 
   label_smoothing: 0.0
 
+  # CTC auxiliary loss (hierarchical decoding: bar + duration-rest targets)
+  ctc_loss_weight: 0.2         # α: weight for CTC auxiliary loss (Watanabe 2017 / Kim 2023 style)
+
   # Gradient checkpointing
   # decoder: off — Mamba custom CUDA autograd (selective_scan_fn) is incompatible
   #   with use_reentrant=False checkpoint (saved tensor metadata mismatch on recompute)

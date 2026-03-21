@@ -25,6 +25,10 @@ import torch.nn.functional as F
 from transformers import Swinv2Model
 
 from .config import ClefPianoConfig
+from .ctc_target import (
+    CTC_FULL_TO_COMPACT, CTC_VOCAB_SIZE,
+    labels_to_ctc_targets,
+)
 from ..bimamba import BiMambaEncoder
 from ..decoder import ClefDecoder
 from ..flow import HarmonizingFlow, Octopus2D
@@ -145,6 +149,10 @@ class ClefPianoTiny(nn.Module):
         )
 
 
+        # === CTC head (on BiMamba encoder output) ===
+        # h [B, W, bimamba_d_model] → ctc_head → ctc_logits [B, W, CTC_VOCAB_SIZE]
+        self.ctc_head = nn.Linear(bimamba_d_model, CTC_VOCAB_SIZE)
+
         # === Token embedding ===
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
 
@@ -243,14 +251,17 @@ class ClefPianoTiny(nn.Module):
             spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
             level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
             valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
-            return memory, spatial_shapes, level_start_index, valid_ratios
+            # CTC head: bar+duration saliency for cross-attention bias
+            ctc_logits = self.ctc_head(memory)                                   # [B, W, CTC_VOCAB_SIZE]
+            return memory, spatial_shapes, level_start_index, valid_ratios, ctc_logits
 
         # Fallback (should not happen since use_bimamba=True by default)
         memory = swin_feat
         spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
         level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
         valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
-        return memory, spatial_shapes, level_start_index, valid_ratios
+        ctc_logits = self.ctc_head(memory)
+        return memory, spatial_shapes, level_start_index, valid_ratios, ctc_logits
 
     def forward(
         self,
@@ -276,7 +287,7 @@ class ClefPianoTiny(nn.Module):
             total_loss: Same as loss (for compatibility)
         """
         # Encode
-        memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
+        memory, spatial_shapes, level_start_index, valid_ratios, ctc_logits = self.encode(mel)
 
         tgt = self.token_embed(input_ids)  # [B, S, D]
 
@@ -341,7 +352,28 @@ class ClefPianoTiny(nn.Module):
                 labels.reshape(-1)
             )
 
-        return logits, loss, loss
+        # CTC loss
+        total_loss = loss
+        if labels is not None and ctc_logits is not None:
+            ctc_weight = getattr(self.config, 'ctc_loss_weight', 0.0)
+            if ctc_weight > 0.0:
+                ctc_targets, ctc_target_lengths = labels_to_ctc_targets(labels, CTC_FULL_TO_COMPACT)
+                ctc_log_probs = F.log_softmax(ctc_logits, dim=-1).permute(1, 0, 2)  # [T, B, C]
+                ctc_input_lengths = torch.full(
+                    (ctc_log_probs.size(1),), ctc_log_probs.size(0),
+                    dtype=torch.long, device=ctc_log_probs.device,
+                )
+                ctc_loss = F.ctc_loss(
+                    ctc_log_probs,
+                    ctc_targets.to(ctc_log_probs.device),
+                    ctc_input_lengths,
+                    ctc_target_lengths.to(ctc_log_probs.device),
+                    blank=0, reduction='mean', zero_infinity=True,
+                )
+                total_loss = loss + ctc_weight * ctc_loss
+                self._ctc_loss = ctc_loss.detach()
+
+        return logits, loss, total_loss
 
     def get_num_params(self, trainable_only: bool = True) -> int:
         """Count model parameters."""

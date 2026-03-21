@@ -622,6 +622,12 @@ class Trainer:
                     log_dict['train/tf_ratio'] = current_tf_ratio
                     log_dict['train/ss_epsilon'] = current_ss_epsilon
 
+                    # CTC auxiliary loss (if enabled)
+                    model_inner = self.model.module if hasattr(self.model, 'module') else self.model
+                    ctc_loss_cached = getattr(model_inner, '_ctc_loss', None)
+                    if ctc_loss_cached is not None:
+                        log_dict['train/ctc_loss'] = ctc_loss_cached.item()
+
                     if len(last_lrs) > 1:
                         log_dict['train/lr_swin'] = last_lrs[1]  # group[1]: swin (swin_lr)
 
@@ -651,6 +657,8 @@ class Trainer:
                             for k in ('loss_pitch', 'loss_duration', 'loss_struct', 'loss_schema'):
                                 if k in valid_metrics:
                                     valid_log[f'valid/{k}'] = valid_metrics[k]
+                            if 'valid_ctc_loss' in valid_metrics:
+                                valid_log['valid/ctc_loss'] = valid_metrics['valid_ctc_loss']
                             wandb.log(valid_log, step=self.global_step)
                     self.model.train()
 
@@ -667,6 +675,8 @@ class Trainer:
         self.model.eval()
 
         total_loss = 0.0
+        total_ctc_loss = 0.0
+        ctc_loss_count = 0
         num_batches = 0
         # Accumulators for per-type loss breakdown
         type_loss_sums = {'loss_pitch': 0.0, 'loss_duration': 0.0, 'loss_struct': 0.0, 'loss_schema': 0.0}
@@ -703,6 +713,13 @@ class Trainer:
             total_loss += ce_loss.item()
             num_batches += 1
 
+            # Accumulate CTC loss if available
+            model_inner = self.model.module if hasattr(self.model, 'module') else self.model
+            ctc_loss_cached = getattr(model_inner, '_ctc_loss', None)
+            if ctc_loss_cached is not None:
+                total_ctc_loss += ctc_loss_cached.item()
+                ctc_loss_count += 1
+
             # Accumulate per-type losses
             breakdown = self._compute_loss_breakdown(logits, labels)
             for k, v in breakdown.items():
@@ -715,6 +732,8 @@ class Trainer:
         for k in type_loss_sums:
             if type_loss_counts[k] > 0:
                 result[k] = type_loss_sums[k] / type_loss_counts[k]
+        if ctc_loss_count > 0:
+            result['valid_ctc_loss'] = total_ctc_loss / ctc_loss_count
 
         return result
 
@@ -834,6 +853,8 @@ class Trainer:
                     for k in ('loss_pitch', 'loss_duration', 'loss_struct', 'loss_schema'):
                         if k in valid_metrics:
                             epoch_log[f'epoch/valid_{k}'] = valid_metrics[k]
+                    if 'valid_ctc_loss' in valid_metrics:
+                        epoch_log['epoch/valid_ctc_loss'] = valid_metrics['valid_ctc_loss']
                     wandb.log(epoch_log, step=self.global_step)
 
             # Save checkpoint and check early stopping

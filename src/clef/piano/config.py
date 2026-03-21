@@ -50,6 +50,9 @@ class ClefPianoConfig(ClefConfig):
     ss_max_epsilon: float = 0.0          # scheduled sampling max mixing ratio (0 = disabled)
     ss_anneal_steps: int = 10000         # step at which ss_epsilon reaches ss_max_epsilon (linear from warmup_steps)
 
+    # CTC auxiliary loss (hierarchical decoding)
+    ctc_loss_weight: float = 0.0         # α: weight for CTC loss (0 = disabled)
+
     # Per-layer full_freq config for window_ca layers.
     # Each entry: True (all levels), False (none), or List[int] (specific level IDs).
     decoder_layer_full_freq: Optional[List] = None
@@ -193,6 +196,8 @@ class ClefPianoConfig(ClefConfig):
             ss_max_epsilon=model_cfg.get("ss_max_epsilon", defaults.ss_max_epsilon),
             ss_anneal_steps=model_cfg.get("ss_anneal_steps", defaults.ss_anneal_steps),
 
+            # CTC auxiliary loss
+            ctc_loss_weight=model_cfg.get("ctc_loss_weight", defaults.ctc_loss_weight),
 
             # Guided attention loss
             guidance_loss_weight=model_cfg.get("guidance_loss_weight", defaults.guidance_loss_weight),
