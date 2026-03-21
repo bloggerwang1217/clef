@@ -171,6 +171,20 @@ def generate_kern_chunk(
     return ids
 
 
+def truncate_token_ids_to_n_bars(token_ids: List[int], bar_id: int, n_bars: int) -> List[int]:
+    """Keep only the first n_bars bars from a token sequence.
+
+    Counts <bar> tokens; once n_bars have been seen, drops everything after.
+    """
+    count = 0
+    for i, tok in enumerate(token_ids):
+        if tok == bar_id:
+            count += 1
+            if count > n_bars:
+                return token_ids[:i]
+    return token_ids
+
+
 def split_tokens_by_bar(token_ids: List[int], bar_id: int) -> List[List[int]]:
     """Split token sequence into measures at <bar> tokens."""
     measures: List[List[int]] = []
@@ -508,6 +522,8 @@ def run_bar5_mode(args) -> None:
             token_ids = generate_kern_chunk(
                 model, mel_input, tokenizer, args.max_len, args.num_beams, args.device
             )
+            bar_id = tokenizer.vocab["<bar>"]
+            token_ids = truncate_token_ids_to_n_bars(token_ids, bar_id, n_bars)
             pred_kern = reconstruct_kern_from_token_ids(token_ids, tokenizer)
 
             with open(kern_out, "w") as f:
