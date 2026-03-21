@@ -74,14 +74,74 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> ClefPianoTiny:
 
 
 @torch.no_grad()
+def _beam_search(
+    model: ClefPianoTiny,
+    mel_chunk: torch.Tensor,
+    bos_id: int,
+    eos_id: int,
+    max_len: int,
+    num_beams: int,
+    length_penalty: float = 1.0,
+) -> List[int]:
+    """Beam search for ClefPianoTiny (O(n²) decoder, correct).
+
+    Encoder outputs are constant across beams — expanded each step from
+    the original single-batch tensors, so no beam-reorder needed on encoder.
+    """
+    NEG_INF = float("-inf")
+    device = mel_chunk.device
+
+    memory, ss, lsi, vr = model.encode(mel_chunk)  # [1, N_kv, D]
+
+    seqs = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
+    scores = torch.zeros(1, device=device)
+
+    for _ in range(max_len - 1):
+        B_cur = seqs.shape[0]
+        mem_b = memory.expand(B_cur, -1, -1).contiguous()
+        vr_b = vr.expand(B_cur, -1, -1).contiguous()
+
+        tgt = model.token_embed(seqs).contiguous()
+        if tgt.shape[1] == 1:
+            tgt = tgt.repeat(1, 2, 1)  # Mamba2 S=1 stride workaround
+        dec_out = model.decoder(tgt, mem_b, ss, lsi, vr_b, input_ids=seqs)
+        if isinstance(dec_out, tuple):
+            dec_out = dec_out[0]
+
+        logits = model.output_projection(dec_out[:, -1:, :])  # [B, 1, vocab]
+        log_p = torch.log_softmax(logits[:, 0, :], dim=-1)    # [B, vocab]
+
+        done = seqs[:, -1].eq(eos_id)
+        log_p[done, :] = NEG_INF
+        log_p[done, eos_id] = 0.0
+
+        cand = scores.unsqueeze(1) + log_p
+        flat = cand.reshape(-1)
+        top_scores, top_idx = flat.topk(num_beams)
+        beam_idx = top_idx // logits.shape[-1]
+        token_idx = top_idx % logits.shape[-1]
+
+        seqs = torch.cat([seqs[beam_idx], token_idx.unsqueeze(1)], dim=1)
+        scores = top_scores
+
+        if seqs[:, -1].eq(eos_id).all():
+            break
+
+    pen_scores = scores / (seqs.shape[1] ** length_penalty)
+    best = pen_scores.argmax()
+    return seqs[best].tolist()
+
+
+@torch.no_grad()
 def generate_kern_chunk(
     model: ClefPianoTiny,
     mel_chunk: torch.Tensor,
     tokenizer: KernTokenizer,
     max_len: int = DEFAULT_MAX_LEN,
+    num_beams: int = 1,
     device: str = "cuda",
 ) -> List[int]:
-    """Run greedy generation on a single mel chunk [1, 1, 128, T].
+    """Run greedy (num_beams=1) or beam search generation on a single mel chunk [1, 1, 128, T].
 
     Returns:
         Token IDs excluding BOS/EOS/continue.
@@ -91,10 +151,14 @@ def generate_kern_chunk(
     continue_id = tokenizer.vocab.get("<continue>", -1)
 
     mel_chunk = mel_chunk.to(device)
-    generated_ids = model.generate(
-        mel_chunk, max_len=max_len, bos_token_id=bos_id, eos_token_id=eos_id
-    )
-    ids = generated_ids[0].tolist()
+
+    if num_beams > 1:
+        ids = _beam_search(model, mel_chunk, bos_id, eos_id, max_len, num_beams)
+    else:
+        generated_ids = model.generate(
+            mel_chunk, max_len=max_len, bos_token_id=bos_id, eos_token_id=eos_id
+        )
+        ids = generated_ids[0].tolist()
 
     if ids and ids[0] == bos_id:
         ids = ids[1:]
@@ -227,6 +291,7 @@ def generate_kern_time(
     chunk_frames: int = DEFAULT_CHUNK_FRAMES,
     overlap_frames: int = DEFAULT_OVERLAP_FRAMES,
     max_len: int = DEFAULT_MAX_LEN,
+    num_beams: int = 1,
     device: str = "cuda",
 ) -> str:
     """Generate full-song **kern using overlapping time-based chunks.
@@ -264,7 +329,7 @@ def generate_kern_time(
     for i, (start_f, end_f, mel_chunk) in enumerate(chunks):
         start_sec = start_f / MEL_FPS
         end_sec = end_f / MEL_FPS
-        token_ids = generate_kern_chunk(model, mel_chunk, tokenizer, max_len, device)
+        token_ids = generate_kern_chunk(model, mel_chunk, tokenizer, max_len, num_beams, device)
         measures = split_tokens_by_bar(token_ids, bar_id)
         logger.debug(
             f"  Chunk {i + 1}/{len(chunks)} [{start_sec:.1f} s-{end_sec:.1f} s]: "
@@ -327,6 +392,7 @@ def run_time_mode(args) -> None:
             chunk_frames=args.chunk_frames,
             overlap_frames=args.overlap_frames,
             max_len=args.max_len,
+            num_beams=args.num_beams,
             device=args.device,
         )
 
@@ -440,7 +506,7 @@ def run_bar5_mode(args) -> None:
             mel_input = mel_slice.unsqueeze(0)  # [1, 1, 128, chunk_frames]
 
             token_ids = generate_kern_chunk(
-                model, mel_input, tokenizer, args.max_len, args.device
+                model, mel_input, tokenizer, args.max_len, args.num_beams, args.device
             )
             pred_kern = reconstruct_kern_from_token_ids(token_ids, tokenizer)
 
@@ -525,6 +591,12 @@ def main() -> None:
         type=int,
         default=5,
         help="(bar5 mode) Bars per chunk (default 5)",
+    )
+    parser.add_argument(
+        "--num-beams",
+        type=int,
+        default=1,
+        help="Beam search width (1 = greedy)",
     )
     parser.add_argument(
         "--max-samples",
