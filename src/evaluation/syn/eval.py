@@ -79,6 +79,7 @@ def main():
         default="results/clef_tiny_syn_test.csv",
     )
     parser.add_argument("--mv2h-bin", default="MV2H/bin")
+    parser.add_argument("--mv2h-timeout", type=int, default=30)
     parser.add_argument("--n-bars", type=int, default=5)
     parser.add_argument("--max-chunks", type=int, default=None, help="Limit for quick test")
     args = parser.parse_args()
@@ -92,7 +93,7 @@ def main():
         kern_gt_dir=args.kern_gt_dir,
         manifest_dir=args.manifest_dir,
     )
-    evaluator = MV2HEvaluator(args.mv2h_bin, timeout=10)
+    evaluator = MV2HEvaluator(args.mv2h_bin, timeout=args.mv2h_timeout)
 
     total = success = 0
 
@@ -131,7 +132,15 @@ def main():
                 continue
 
             # MV2H evaluation
-            result = evaluator.evaluate(gt_midi, str(pred_midi))
+            import subprocess
+            try:
+                result = evaluator.evaluate(gt_midi, str(pred_midi))
+            except subprocess.TimeoutExpired:
+                row["status"] = "mv2h_timeout"
+                writer.writerow(row)
+                total += 1
+                continue
+
             if result is not None:
                 row.update(
                     {

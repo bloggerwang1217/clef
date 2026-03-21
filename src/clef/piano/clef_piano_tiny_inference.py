@@ -98,8 +98,12 @@ def generate_kern_chunk(
 
     if ids and ids[0] == bos_id:
         ids = ids[1:]
-    while ids and ids[-1] in (eos_id, continue_id):
-        ids.pop()
+    # Truncate at the first <eos> or <continue> token.
+    stop_ids = {eos_id, continue_id}
+    for i, tok in enumerate(ids):
+        if tok in stop_ids:
+            ids = ids[:i]
+            break
     return ids
 
 
