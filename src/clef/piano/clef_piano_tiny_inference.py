@@ -161,7 +161,7 @@ def _beam_search(
     memory, memory_v, ss, lsi, vr = encode_out[:5]  # [1, N_kv, D]
 
     # CTC setup
-    use_ctc = ctc_lambda > 0.0 and len(encode_out) > 5
+    use_ctc = ctc_lambda > 0.0 and len(encode_out) > 5 and encode_out[5] is not None
     if use_ctc:
         ctc_logits    = encode_out[5]                                      # [1, T', C_ctc]
         ctc_log_probs = F.log_softmax(ctc_logits[0], dim=-1)              # [T', C_ctc]

@@ -351,7 +351,8 @@ class ClefPianoTiny(nn.Module):
             spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
             level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
             valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
-            ctc_logits = self.ctc_head(memory)
+            ctc_weight = getattr(self.config, 'ctc_loss_weight', 0.0)
+            ctc_logits = self.ctc_head(memory) if ctc_weight > 0.0 else None
             return memory, memory_v, spatial_shapes, level_start_index, valid_ratios, ctc_logits
 
         # Fallback (use_bimamba=False, should not happen with default config)
@@ -359,7 +360,8 @@ class ClefPianoTiny(nn.Module):
         spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
         level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
         valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
-        ctc_logits = self.ctc_head(memory)
+        ctc_weight = getattr(self.config, 'ctc_loss_weight', 0.0)
+        ctc_logits = self.ctc_head(memory) if ctc_weight > 0.0 else None
         return memory, memory_v, spatial_shapes, level_start_index, valid_ratios, ctc_logits
 
     def forward(

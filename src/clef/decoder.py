@@ -501,28 +501,27 @@ class MambaOnlyLayer(nn.Module):
 
 
 class MambaFullCALayer(nn.Module):
-    """Mamba2 + Full Cross-Attention decoder layer (Zeng-equivalent, single CA).
+    """Mamba2 + Full Cross-Attention decoder layer (dual CA, two-pass).
 
-    Single CA, two-pass (Zeng-style):
+    Two CA calls, two-pass:
 
       Pass 1:
         h1        = tgt + Mamba(norm1(tgt))
-        ca        = CA(h1, memory)          ← single CA; Zeng's context_t
+        ca1       = CA(h1, memory)          ← first CA; temporal grounding
 
       CA-shift:
-        ca_shifted[t] = ca[t-1]             ← Zeng's context_{t-1} → inp_{t}
+        ca1_shifted[t] = ca1[t-1]           ← context_{t-1} → inp_{t}
 
-      Pass 2 (no second CA):
-        inp2      = tgt + ca_shifted
+      Pass 2:
+        inp2      = tgt + ca1_shifted
         h2        = inp2 + Mamba2(norm3(inp2))
+        ca2       = CA(h2, memory)          ← second CA; h2 has seen shifted context
 
       Output:
-        out       = out_proj(cat(h2, ca))   ← Zeng's cat(hidden_t, context_t)
+        out       = out_proj(cat(h2, ca2))
 
-    ca receives gradient from both:
-      - Direct:   CE loss → out_proj → ca
-      - Indirect: ca[t-1] → ca_shifted → inp2 → h2 → out → CE
-    Both push toward temporal grounding.
+    ca2 gradient path: CE → out_proj → ca2 (direct)
+    ca1 gradient path: ca1[t-1] → ca1_shifted → h2 → ca2 → out → CE (indirect)
     """
     def __init__(
         self,
@@ -676,14 +675,14 @@ class MambaFullCALayer(nn.Module):
         ca_shifted = torch.zeros_like(ca)
         ca_shifted[:, 1:, :] = ca[:, :-1, :]                               # [B, S, D]
 
-        # ── Pass 2: Mamba on (tgt + ca_shifted), no second CA ─────────────────
-        # Zeng: hidden_t = GRU(cat(token_t, context_{t-1}), hidden_{t-1})
+        # ── Pass 2: Mamba on (tgt + ca_shifted) → second CA ──────────────────
+        # h2 uses ca_shifted (context from t-1) as input, then attends again with updated hidden
         inp2 = tgt + ca_shifted                                              # [B, S, D]
         h2   = inp2 + self.dropout_mamba(self.mamba2(self.norm3(inp2)))     # [B, S, D]
+        ca2  = self._sdpa(h2, k_ca, v_ca)                                   # [B, S, D]
 
-        # Output: cat(h2, ca) — Zeng's cat(hidden_t, context_t)
-        # ca receives direct CE gradient AND indirect gradient through ca_shifted
-        out = self.out_proj(torch.cat([h2, ca], dim=-1))                    # [B, S, D]
+        # Output: cat(h2, ca2) — h2 has seen ca_shifted, ca2 is the fresh attend from h2
+        out = self.out_proj(torch.cat([h2, ca2], dim=-1))                   # [B, S, D]
         if use_cache:
             return out, (None, None)
         return out
