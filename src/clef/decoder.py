@@ -555,10 +555,15 @@ class MambaFullCALayer(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
         self.mamba2 = Mamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
 
-        # Cross-Attention shared by both passes (same K/V projections)
+        # Cross-Attention shared by both passes.
+        # Separate K/V projections support decoupled sources (FreqHopfield):
+        #   K from memory   (temporal: BiMamba-processed mean pool)
+        #   V from memory_v (pitch: FreqHopfield pitch-query output)
+        # When memory_v=None, both K and V project from memory (standard behavior).
         self.norm2 = nn.LayerNorm(d_model)
         self.ca_q_proj  = nn.Linear(d_model, d_model)
-        self.ca_kv_proj = nn.Linear(d_model, 2 * d_model)
+        self.ca_k_proj  = nn.Linear(d_model, d_model)
+        self.ca_v_proj  = nn.Linear(d_model, d_model)
         self.ca_out_proj = nn.Linear(d_model, d_model)
         self.dropout_ca  = nn.Dropout(dropout)
 
@@ -592,29 +597,39 @@ class MambaFullCALayer(nn.Module):
         spatial_shapes: torch.Tensor,
         level_start_index: torch.Tensor,
         device: torch.device,
+        memory_v: Optional[torch.Tensor] = None,
     ):
-        """Precompute K, V and time PE from encoder memory (reused every step in sequential mode)."""
-        memory_ca = []
+        """Precompute K, V and time PE from encoder memory.
+
+        When memory_v is provided (FreqHopfield decoupled K/V):
+          K ← ca_k_proj(memory)   — temporal grounding (BiMamba mean-pool output)
+          V ← ca_v_proj(memory_v) — pitch content (FreqHopfield pitch-query output)
+        Otherwise both K and V project from memory (standard behavior).
+        """
+        memory_ca_k = []
+        memory_ca_v = []
         time_norm_list = []
         for lvl in self.active_ca_levels:
             start = level_start_index[lvl].item()
             end   = (level_start_index[lvl + 1].item()
                      if lvl < spatial_shapes.shape[0] - 1
                      else memory.shape[1])
-            memory_ca.append(memory[:, start:end])
+            memory_ca_k.append(memory[:, start:end])
+            v_src = memory_v if memory_v is not None else memory
+            memory_ca_v.append(v_src[:, start:end])
             H_l = int(spatial_shapes[lvl, 0].item())
             W_l = int(spatial_shapes[lvl, 1].item())
             w_norm = torch.arange(W_l, device=device, dtype=torch.float32) / max(W_l - 1, 1)
             time_norm_list.append(w_norm.unsqueeze(0).expand(H_l, -1).reshape(-1))
 
-        memory_ca = torch.cat(memory_ca, dim=1)   # [B, N_kv, D]
-        time_norm  = torch.cat(time_norm_list)     # [N_kv]
-        N_kv = memory_ca.shape[1]
+        memory_ca_k = torch.cat(memory_ca_k, dim=1)   # [B, N_kv, D]
+        memory_ca_v = torch.cat(memory_ca_v, dim=1)   # [B, N_kv, D]
+        time_norm   = torch.cat(time_norm_list)        # [N_kv]
+        N_kv = memory_ca_k.shape[1]
         B = memory.shape[0]
 
-        kv = self.ca_kv_proj(memory_ca).reshape(B, N_kv, 2, self.n_heads, self.ca_head_dim)
-        k_ca = kv[:, :, 0].permute(0, 2, 1, 3).contiguous()  # [B, H, N_kv, D_head]
-        v_ca = kv[:, :, 1].permute(0, 2, 1, 3).contiguous()  # [B, H, N_kv, D_head]
+        k_ca = self.ca_k_proj(memory_ca_k).reshape(B, N_kv, self.n_heads, self.ca_head_dim).permute(0, 2, 1, 3).contiguous()
+        v_ca = self.ca_v_proj(memory_ca_v).reshape(B, N_kv, self.n_heads, self.ca_head_dim).permute(0, 2, 1, 3).contiguous()
 
         time_pe   = self._sinusoidal_time_pe(time_norm)
         time_pe_k = (time_pe.view(N_kv, self.n_heads, self.ca_head_dim)
@@ -645,11 +660,12 @@ class MambaFullCALayer(nn.Module):
         valid_ratios: torch.Tensor,
         past_state: Optional[Tuple] = None,
         use_cache: bool = False,
+        memory_v: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[Tuple]] | torch.Tensor:
         tgt = tgt.contiguous()
         B, S, D = tgt.shape
-        k_ca, v_ca = self._precompute_kv(memory, spatial_shapes, level_start_index, tgt.device)
+        k_ca, v_ca = self._precompute_kv(memory, spatial_shapes, level_start_index, tgt.device, memory_v=memory_v)
 
         # ── Pass 1: Mamba on tgt → single CA ─────────────────────────────────
         h1 = tgt + self.dropout_mamba(self.mamba(self.norm1(tgt)))          # [B, S, D]
@@ -1531,6 +1547,7 @@ class ClefDecoder(nn.Module):
         input_ids: Optional[torch.Tensor] = None,        # [B, S] int token IDs
         tf_ratio: float = 1.0,                            # teacher-forcing ratio for note_gru
         pred_embs: Optional[torch.Tensor] = None,        # [B, S, D] predicted embeddings for TF
+        memory_v: Optional[torch.Tensor] = None,         # [B, N, D] pitch-content V source (FreqHopfield)
     ):
         """Forward through all decoder layers.
 
@@ -1718,6 +1735,7 @@ class ClefDecoder(nn.Module):
                 )
                 if isinstance(layer, MambaFullCALayer):
                     layer_kwargs['tgt_query'] = tgt_query
+                    layer_kwargs['memory_v'] = memory_v
                 output, new_state = layer(
                     output, memory,
                     spatial_shapes, level_start_index, valid_ratios,
@@ -1757,6 +1775,7 @@ class ClefDecoder(nn.Module):
                 )
                 if isinstance(layer, MambaFullCALayer):
                     layer_kwargs['tgt_query'] = tgt_query
+                    layer_kwargs['memory_v'] = memory_v
                 output = layer(
                     output, memory,
                     spatial_shapes, level_start_index, valid_ratios,

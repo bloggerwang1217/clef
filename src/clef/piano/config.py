@@ -140,7 +140,7 @@ class ClefPianoConfig(ClefConfig):
             # Swin
             swin_model=model_cfg.get("swin_model", defaults.swin_model),
             swin_dims=model_cfg.get("swin_dims", defaults.swin_dims),
-            freeze_encoder=model_cfg.get("freeze_encoder", defaults.freeze_encoder),
+            freeze_swin=model_cfg.get("freeze_swin", defaults.freeze_swin),
             swin_use_gradient_checkpointing=model_cfg.get("swin_use_gradient_checkpointing", defaults.swin_use_gradient_checkpointing),
             swin_unfreeze=model_cfg.get("swin_unfreeze", defaults.swin_unfreeze),
             swin_lr_scale=model_cfg.get("swin_lr_scale", defaults.swin_lr_scale),

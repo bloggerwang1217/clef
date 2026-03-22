@@ -91,7 +91,7 @@ def _beam_search(
     NEG_INF = float("-inf")
     device = mel_chunk.device
 
-    memory, ss, lsi, vr = model.encode(mel_chunk)  # [1, N_kv, D]
+    memory, memory_v, ss, lsi, vr, _ = model.encode(mel_chunk)  # [1, N_kv, D]
 
     seqs = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
     scores = torch.zeros(1, device=device)
@@ -99,12 +99,13 @@ def _beam_search(
     for _ in range(max_len - 1):
         B_cur = seqs.shape[0]
         mem_b = memory.expand(B_cur, -1, -1).contiguous()
+        memv_b = memory_v.expand(B_cur, -1, -1).contiguous()
         vr_b = vr.expand(B_cur, -1, -1).contiguous()
 
         tgt = model.token_embed(seqs).contiguous()
         if tgt.shape[1] == 1:
             tgt = tgt.repeat(1, 2, 1)  # Mamba2 S=1 stride workaround
-        dec_out = model.decoder(tgt, mem_b, ss, lsi, vr_b, input_ids=seqs)
+        dec_out = model.decoder(tgt, mem_b, ss, lsi, vr_b, input_ids=seqs, memory_v=memv_b)
         if isinstance(dec_out, tuple):
             dec_out = dec_out[0]
 

@@ -24,7 +24,7 @@ model:
   swin_model: "microsoft/swinv2-tiny-patch4-window8-256"
   swin_dims: []  # Not used (Swin handles internally)
   swin_use_gradient_checkpointing: false
-  freeze_encoder: true
+  freeze_swin: false
   swin_start_stage: 0
   swin_pool_strides: []
 

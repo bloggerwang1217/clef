@@ -35,6 +35,108 @@ from ..flow import HarmonizingFlow, Octopus2D
 from ..swin import SwinEncoder
 
 
+class FreqHopfield(nn.Module):
+    """Frequency-axis Hopfield attention for structured pitch pooling.
+
+    Replaces freq_conv. Input: Swin 2D output [B, H, W, D] (H = freq patches).
+
+    Two-stage freq aggregation:
+      1. Freq SA (Hopfield settling): H freq patches attend each other per time step.
+         Harmonics that co-activate get wired together (Hebbian principle).
+      2. Learnable aggregation:
+         - K: Linear(H×D → D) — learns which harmonic combinations indicate time position.
+              Decoder uses this to locate the right time frame (includes pitch content).
+         - V: n_heads pitch queries × H freq patches — each head retrieves one pitch dimension.
+              Decoder uses this to read pitch content without positional mixing.
+
+    Motivation: "map freq→1D as late as possible" (after Swin 2D integration).
+    Corresponds to Zeng's Linear(freq_bins×channels → hidden) but applied post-Swin.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, max_H: int = 32, max_W: int = 512):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+
+        # 2D sinusoidal PE (A2S Transformer style), applied to Swin output before freq SA.
+        # First D/2 channels: time (W axis); last D/2 channels: freq (H axis).
+        # Registered as buffer — no grad, device-tracked.
+        pe = torch.zeros(1, max_H, max_W, d_model)
+        pos_h = torch.arange(max_H, dtype=torch.float).unsqueeze(1)  # [H, 1]
+        pos_w = torch.arange(max_W, dtype=torch.float).unsqueeze(1)  # [W, 1]
+        den = torch.pow(10000, torch.arange(0, d_model // 2, 2, dtype=torch.float) / d_model)
+        half = d_model // 2
+        # sin(pos_w / den): [W, D/4] → expand to [H, W, D/4]
+        pe[0, :, :, 0:half:2]   = torch.sin(pos_w / den).unsqueeze(0).expand(max_H, -1, -1)
+        pe[0, :, :, 1:half:2]   = torch.cos(pos_w / den).unsqueeze(0).expand(max_H, -1, -1)
+        # sin(pos_h / den): [H, D/4] → expand to [H, W, D/4]
+        pe[0, :, :, half::2]    = torch.sin(pos_h / den).unsqueeze(1).expand(-1, max_W, -1)
+        pe[0, :, :, half+1::2]  = torch.cos(pos_h / den).unsqueeze(1).expand(-1, max_W, -1)
+        self.register_buffer("pe_2d", pe)  # [1, max_H, max_W, D]
+
+        # Freq-axis SA: H freq patches attend each other (Hopfield settling)
+        self.freq_norm = nn.LayerNorm(d_model)
+        self.freq_sa = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=0.0)
+
+        # K: depthwise Conv1d over H settled bins (kernel_size=H, groups=D).
+        # After freq SA, each bin already carries global harmonic info — a single-step
+        # learned weighted sum over H is sufficient (no hierarchy or nonlinearity needed).
+        # Built lazily once H is known (H = n_mels // swin_downsample = 128 // 8 = 16).
+        self.k_pool = None  # set in build()
+        self._d_model = d_model
+
+        # V: n_heads learnable pitch queries, each cross-attends H freq patches
+        self.pitch_queries = nn.Parameter(torch.zeros(n_heads, self.d_head))
+        nn.init.normal_(self.pitch_queries, std=0.02)
+        self.pitch_k_proj = nn.Linear(d_model, d_model)
+        self.pitch_v_proj = nn.Linear(d_model, d_model)
+
+        self.v_norm = nn.LayerNorm(d_model)
+
+    def build(self, H: int):
+        """Initialize k_pool once H (freq patch count) is known."""
+        if self.k_pool is None:
+            self.k_pool = nn.Conv1d(self._d_model, self._d_model, kernel_size=H, groups=self._d_model)
+            nn.init.normal_(self.k_pool.weight, std=0.02)
+            nn.init.zeros_(self.k_pool.bias)
+            self.k_pool = self.k_pool.to(self.pitch_k_proj.weight.device)
+
+    def forward(self, swin_2d: torch.Tensor):
+        """
+        Args:
+            swin_2d: [B, H, W, D]
+        Returns:
+            memory_k: [B, W, D] — temporal+content grounding for decoder K
+            memory_v: [B, W, D] — pitch-structured content for decoder V
+        """
+        B, H, W, D = swin_2d.shape
+        n_heads, d_head = self.n_heads, self.d_head
+
+        self.build(H)
+
+        # 2D PE: add absolute time+freq position before freq SA
+        swin_2d = swin_2d + self.pe_2d[:, :H, :W, :].to(swin_2d.dtype)
+
+        # Freq SA (Hopfield settling): [B, H, W, D] → [B*W, H, D] → SA → [B, H, W, D]
+        x = swin_2d.permute(0, 2, 1, 3).reshape(B * W, H, D)  # [B*W, H, D]
+        x_sa, _ = self.freq_sa(self.freq_norm(x), x, x)
+        x = x + x_sa  # [B*W, H, D]
+
+        # K: depthwise Conv1d — learned weighted sum over H settled bins, per channel
+        # [B*W, H, D] → [B*W, D, H] → Conv1d(groups=D, kernel_size=H) → [B*W, D] → [B, W, D]
+        memory_k = self.k_pool(x.permute(0, 2, 1)).squeeze(-1).reshape(B, W, D)
+
+        # V: pitch queries cross-attend H freq patches
+        k_freq = self.pitch_k_proj(x).reshape(B * W, H, n_heads, d_head).permute(0, 2, 1, 3)
+        v_freq = self.pitch_v_proj(x).reshape(B * W, H, n_heads, d_head).permute(0, 2, 1, 3)
+        q = self.pitch_queries.unsqueeze(0).unsqueeze(2).expand(B * W, -1, 1, -1)
+        pitch_out = F.scaled_dot_product_attention(q, k_freq, v_freq).squeeze(2)  # [B*W, n_heads, d_head]
+        memory_v = self.v_norm(pitch_out.reshape(B, W, D))  # [B, W, D]
+
+        return memory_k, memory_v
+
+
 class ClefPianoTiny(nn.Module):
     """Minimal Clef Piano model for 30-second audio clips (Zeng-style).
 
@@ -85,20 +187,18 @@ class ClefPianoTiny(nn.Module):
             swin_model=getattr(config, 'swin_model', "microsoft/swinv2-tiny-patch4-window8-256"),
             use_gradient_checkpointing=getattr(config, 'swin_use_gradient_checkpointing', False),
         )
+        if getattr(config, 'freeze_swin', False):
+            for p in self.swin.parameters():
+                p.requires_grad = False
 
-        # Conv along freq axis to aggregate harmonic structure.
-        # Concat S0+S1: [B, H=16, W, 384] → permute → [B, 384, H=16, W]
-        # Two strided Conv2d: H=16 → 4 → 1 (each layer has local receptive field of 4 bins)
-        # Harmonic intervals are fixed in log-mel space, so local conv can learn them.
+        # FreqHopfield: replaces freq_conv.
+        # Swin 2D [B, H=16, W, 384] → (memory_k, memory_v) each [B, W, 384]
+        #   memory_k: Linear(H×D → D) — temporal+content grounding (K source)
+        #   memory_v: pitch queries × H freq patches — pitch content (V source)
+        # k_proj is built lazily on first forward (H known then).
         bimamba_d_model = getattr(config, 'bimamba_d_model', config.d_model)
         swin_concat_dim = self.swin.output_dim * 2  # 192 * 2 = 384
-        self.freq_conv = nn.Sequential(
-            # [B, 384, H=16, W] → [B, bimamba_d_model, 4, W]
-            nn.Conv2d(swin_concat_dim, bimamba_d_model, kernel_size=(4, 1), stride=(4, 1)),
-            nn.GELU(),
-            # [B, bimamba_d_model, 4, W] → [B, bimamba_d_model, 1, W]
-            nn.Conv2d(bimamba_d_model, bimamba_d_model, kernel_size=(4, 1), stride=(4, 1)),
-        )
+        self.freq_hopfield = FreqHopfield(d_model=bimamba_d_model, n_heads=config.n_heads)
 
         # === BiMamba Encoder (time-oriented, after Swin) ===
         # swin_proj output [B, T/8, bimamba_d_model] → BiMamba temporal modeling
@@ -235,33 +335,32 @@ class ClefPianoTiny(nn.Module):
         B_swin, H_swin, W_swin, D_swin = swin_s0.shape
         T_swin = W_swin  # time dimension
 
-        # Concat S0+S1 along channel dim, then conv along freq axis.
-        # [B, H, W, 192] × 2 → [B, H, W, 384] → [B, 384, H, W] → freq_conv → [B, bimamba_d_model, 1, W]
-        swin_2d = torch.cat([swin_s0, swin_s1], dim=-1)          # [B, H, W, 384]
-        swin_2d = swin_2d.permute(0, 3, 1, 2)                    # [B, 384, H, W]
-        swin_2d = self.freq_conv(swin_2d)                         # [B, bimamba_d_model, 1, W]
-        swin_feat = swin_2d.squeeze(2).permute(0, 2, 1)          # [B, W, bimamba_d_model]
+        # FreqHopfield: freq SA (Hopfield settling) + decoupled K/V aggregation.
+        # [B, H, W, 192] × 2 → [B, H, W, 384] → FreqHopfield → memory_k, memory_v each [B, W, 384]
+        swin_2d = torch.cat([swin_s0, swin_s1], dim=-1)                    # [B, H, W, 384]
+        memory_k_raw, memory_v = self.freq_hopfield(swin_2d)               # each [B, W, 384]
+        swin_feat = memory_k_raw                                            # [B, W, 384] → BiMamba
 
         # === Step 4: BiMamba Encoder (time-oriented) ===
         # swin_feat: [B, T_swin, 384] @12.5fps → BiMamba projects to d_model
         if self.use_bimamba:
             feat_bimamba = self.bimamba_encoder(swin_feat)
-            # feat_bimamba: [B, T_swin, 384] @12.5fps
+            # feat_bimamba: [B, T_swin, 384] @12.5fps — decoder K source
+            # memory_v:     [B, T_swin, 384] @12.5fps — decoder V source (pitch, no BiMamba)
             memory = feat_bimamba
             spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
             level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
             valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
-            # CTC head: bar+duration saliency for cross-attention bias
-            ctc_logits = self.ctc_head(memory)                                   # [B, W, CTC_VOCAB_SIZE]
-            return memory, spatial_shapes, level_start_index, valid_ratios, ctc_logits
+            ctc_logits = self.ctc_head(memory)
+            return memory, memory_v, spatial_shapes, level_start_index, valid_ratios, ctc_logits
 
-        # Fallback (should not happen since use_bimamba=True by default)
+        # Fallback (use_bimamba=False, should not happen with default config)
         memory = swin_feat
         spatial_shapes = torch.tensor([[1, T_swin]], dtype=torch.long, device=mel.device)
         level_start_index = torch.tensor([0], dtype=torch.long, device=mel.device)
         valid_ratios = torch.ones(B, 1, 2, dtype=torch.float32, device=mel.device)
         ctc_logits = self.ctc_head(memory)
-        return memory, spatial_shapes, level_start_index, valid_ratios, ctc_logits
+        return memory, memory_v, spatial_shapes, level_start_index, valid_ratios, ctc_logits
 
     def forward(
         self,
@@ -287,7 +386,7 @@ class ClefPianoTiny(nn.Module):
             total_loss: Same as loss (for compatibility)
         """
         # Encode
-        memory, spatial_shapes, level_start_index, valid_ratios, ctc_logits = self.encode(mel)
+        memory, memory_v, spatial_shapes, level_start_index, valid_ratios, ctc_logits = self.encode(mel)
 
         tgt = self.token_embed(input_ids)  # [B, S, D]
 
@@ -307,6 +406,7 @@ class ClefPianoTiny(nn.Module):
                 _decoder_out = self.decoder(
                     tgt, memory, spatial_shapes, level_start_index, valid_ratios,
                     input_ids=input_ids,
+                    memory_v=memory_v,
                 )
                 _logits = self.output_projection(_decoder_out)
                 # Soft embedding: weighted sum over vocab (fully differentiable via Pass 2)
@@ -329,6 +429,7 @@ class ClefPianoTiny(nn.Module):
             level_start_index,
             valid_ratios,
             input_ids=input_ids,
+            memory_v=memory_v,
         )
         logits = self.output_projection(decoder_out)
 
@@ -404,7 +505,7 @@ class ClefPianoTiny(nn.Module):
         device = mel.device
 
         # Encode once
-        memory, spatial_shapes, level_start_index, valid_ratios = self.encode(mel)
+        memory, memory_v, spatial_shapes, level_start_index, valid_ratios, _ = self.encode(mel)
 
         # Initialize with BOS
         generated = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
@@ -428,6 +529,7 @@ class ClefPianoTiny(nn.Module):
                 level_start_index,
                 valid_ratios,
                 input_ids=generated,
+                memory_v=memory_v,
             )
             if isinstance(decoder_out, tuple):
                 decoder_out = decoder_out[0]
