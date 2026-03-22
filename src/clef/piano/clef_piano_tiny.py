@@ -35,19 +35,20 @@ from ..flow import HarmonizingFlow, Octopus2D
 from ..swin import SwinEncoder
 
 
-class FreqHopfield(nn.Module):
-    """Frequency-axis Hopfield attention for structured pitch pooling.
+class FreqPerceiver(nn.Module):
+    """Frequency-axis Perceiver for structured pitch pooling.
 
     Replaces freq_conv. Input: Swin 2D output [B, H, W, D] (H = freq patches).
 
-    Two-stage freq aggregation:
-      1. Freq SA (Hopfield settling): H freq patches attend each other per time step.
-         Harmonics that co-activate get wired together (Hebbian principle).
-      2. Learnable aggregation:
-         - K: Linear(H×D → D) — learns which harmonic combinations indicate time position.
-              Decoder uses this to locate the right time frame (includes pitch content).
-         - V: n_heads pitch queries × H freq patches — each head retrieves one pitch dimension.
-              Decoder uses this to read pitch content without positional mixing.
+    Goal: "select T first, then force decoder to see all H freq patches" (Perceiver-style).
+    - K: depthwise Conv1d over H bins → temporal grounding for decoder K
+    - V: n_heads learned queries cross-attend H freq patches → pitch content for decoder V
+
+    Worst case: all queries learn the same thing → equivalent to mean pooling (= freq_conv).
+    Best case: queries specialize per frequency register → richer pitch representation.
+
+    No freq SA: self-attention on H bins increases inter-bin similarity (measured: 0.316→0.439),
+    making queries harder to differentiate. Raw Swin output has more structure.
 
     Motivation: "map freq→1D as late as possible" (after Swin 2D integration).
     Corresponds to Zeng's Linear(freq_bins×channels → hidden) but applied post-Swin.
@@ -59,34 +60,26 @@ class FreqHopfield(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
 
-        # 2D sinusoidal PE (A2S Transformer style), applied to Swin output before freq SA.
+        # 2D sinusoidal PE (A2S Transformer style).
         # First D/2 channels: time (W axis); last D/2 channels: freq (H axis).
-        # Registered as buffer — no grad, device-tracked.
         pe = torch.zeros(1, max_H, max_W, d_model)
         pos_h = torch.arange(max_H, dtype=torch.float).unsqueeze(1)  # [H, 1]
         pos_w = torch.arange(max_W, dtype=torch.float).unsqueeze(1)  # [W, 1]
         den = torch.pow(10000, torch.arange(0, d_model // 2, 2, dtype=torch.float) / d_model)
         half = d_model // 2
-        # sin(pos_w / den): [W, D/4] → expand to [H, W, D/4]
         pe[0, :, :, 0:half:2]   = torch.sin(pos_w / den).unsqueeze(0).expand(max_H, -1, -1)
         pe[0, :, :, 1:half:2]   = torch.cos(pos_w / den).unsqueeze(0).expand(max_H, -1, -1)
-        # sin(pos_h / den): [H, D/4] → expand to [H, W, D/4]
         pe[0, :, :, half::2]    = torch.sin(pos_h / den).unsqueeze(1).expand(-1, max_W, -1)
         pe[0, :, :, half+1::2]  = torch.cos(pos_h / den).unsqueeze(1).expand(-1, max_W, -1)
         self.register_buffer("pe_2d", pe)  # [1, max_H, max_W, D]
 
-        # Freq-axis SA: H freq patches attend each other (Hopfield settling)
-        self.freq_norm = nn.LayerNorm(d_model)
-        self.freq_sa = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=0.0)
-
-        # K: depthwise Conv1d over H settled bins (kernel_size=H, groups=D).
-        # After freq SA, each bin already carries global harmonic info — a single-step
-        # learned weighted sum over H is sufficient (no hierarchy or nonlinearity needed).
+        # K: depthwise Conv1d over H bins (kernel_size=H, groups=D).
         # Built lazily once H is known (H = n_mels // swin_downsample = 128 // 8 = 16).
         self.k_pool = None  # set in build()
         self._d_model = d_model
 
-        # V: n_heads learnable pitch queries, each cross-attends H freq patches
+        # V: n_heads learned queries (Perceiver latent), each cross-attends H freq patches.
+        # K and V of the cross-attn both come from the same Swin bins (standard Perceiver).
         self.pitch_queries = nn.Parameter(torch.zeros(n_heads, self.d_head))
         nn.init.normal_(self.pitch_queries, std=0.02)
         self.pitch_k_proj = nn.Linear(d_model, d_model)
@@ -115,15 +108,13 @@ class FreqHopfield(nn.Module):
 
         self.build(H)
 
-        # 2D PE: add absolute time+freq position before freq SA
+        # 2D PE: add absolute time+freq position
         swin_2d = swin_2d + self.pe_2d[:, :H, :W, :].to(swin_2d.dtype)
 
-        # Freq SA (Hopfield settling): [B, H, W, D] → [B*W, H, D] → SA → [B, H, W, D]
+        # Reshape to [B*W, H, D] for per-time-step freq aggregation
         x = swin_2d.permute(0, 2, 1, 3).reshape(B * W, H, D)  # [B*W, H, D]
-        x_sa, _ = self.freq_sa(self.freq_norm(x), x, x)
-        x = x + x_sa  # [B*W, H, D]
 
-        # K: depthwise Conv1d — learned weighted sum over H settled bins, per channel
+        # K: depthwise Conv1d — learned weighted sum over H bins, per channel
         # [B*W, H, D] → [B*W, D, H] → Conv1d(groups=D, kernel_size=H) → [B*W, D] → [B, W, D]
         memory_k = self.k_pool(x.permute(0, 2, 1)).squeeze(-1).reshape(B, W, D)
 
@@ -191,14 +182,14 @@ class ClefPianoTiny(nn.Module):
             for p in self.swin.parameters():
                 p.requires_grad = False
 
-        # FreqHopfield: replaces freq_conv.
+        # FreqPerceiver: replaces freq_conv.
         # Swin 2D [B, H=16, W, 384] → (memory_k, memory_v) each [B, W, 384]
         #   memory_k: Linear(H×D → D) — temporal+content grounding (K source)
         #   memory_v: pitch queries × H freq patches — pitch content (V source)
         # k_proj is built lazily on first forward (H known then).
         bimamba_d_model = getattr(config, 'bimamba_d_model', config.d_model)
         swin_concat_dim = self.swin.output_dim * 2  # 192 * 2 = 384
-        self.freq_hopfield = FreqHopfield(d_model=bimamba_d_model, n_heads=config.n_heads)
+        self.freq_perceiver = FreqPerceiver(d_model=bimamba_d_model, n_heads=config.n_heads)
 
         # === BiMamba Encoder (time-oriented, after Swin) ===
         # swin_proj output [B, T/8, bimamba_d_model] → BiMamba temporal modeling
@@ -335,10 +326,10 @@ class ClefPianoTiny(nn.Module):
         B_swin, H_swin, W_swin, D_swin = swin_s0.shape
         T_swin = W_swin  # time dimension
 
-        # FreqHopfield: freq SA (Hopfield settling) + decoupled K/V aggregation.
-        # [B, H, W, 192] × 2 → [B, H, W, 384] → FreqHopfield → memory_k, memory_v each [B, W, 384]
+        # FreqPerceiver: freq SA (Hopfield settling) + decoupled K/V aggregation.
+        # [B, H, W, 192] × 2 → [B, H, W, 384] → FreqPerceiver → memory_k, memory_v each [B, W, 384]
         swin_2d = torch.cat([swin_s0, swin_s1], dim=-1)                    # [B, H, W, 384]
-        memory_k_raw, memory_v = self.freq_hopfield(swin_2d)               # each [B, W, 384]
+        memory_k_raw, memory_v = self.freq_perceiver(swin_2d)               # each [B, W, 384]
         swin_feat = memory_k_raw                                            # [B, W, 384] → BiMamba
 
         # === Step 4: BiMamba Encoder (time-oriented) ===

@@ -555,9 +555,9 @@ class MambaFullCALayer(nn.Module):
         self.mamba2 = Mamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
 
         # Cross-Attention shared by both passes.
-        # Separate K/V projections support decoupled sources (FreqHopfield):
+        # Separate K/V projections support decoupled sources (FreqPerceiver):
         #   K from memory   (temporal: BiMamba-processed mean pool)
-        #   V from memory_v (pitch: FreqHopfield pitch-query output)
+        #   V from memory_v (pitch: FreqPerceiver pitch-query output)
         # When memory_v=None, both K and V project from memory (standard behavior).
         self.norm2 = nn.LayerNorm(d_model)
         self.ca_q_proj  = nn.Linear(d_model, d_model)
@@ -600,9 +600,9 @@ class MambaFullCALayer(nn.Module):
     ):
         """Precompute K, V and time PE from encoder memory.
 
-        When memory_v is provided (FreqHopfield decoupled K/V):
+        When memory_v is provided (FreqPerceiver decoupled K/V):
           K ← ca_k_proj(memory)   — temporal grounding (BiMamba mean-pool output)
-          V ← ca_v_proj(memory_v) — pitch content (FreqHopfield pitch-query output)
+          V ← ca_v_proj(memory_v) — pitch content (FreqPerceiver pitch-query output)
         Otherwise both K and V project from memory (standard behavior).
         """
         memory_ca_k = []
@@ -1546,7 +1546,7 @@ class ClefDecoder(nn.Module):
         input_ids: Optional[torch.Tensor] = None,        # [B, S] int token IDs
         tf_ratio: float = 1.0,                            # teacher-forcing ratio for note_gru
         pred_embs: Optional[torch.Tensor] = None,        # [B, S, D] predicted embeddings for TF
-        memory_v: Optional[torch.Tensor] = None,         # [B, N, D] pitch-content V source (FreqHopfield)
+        memory_v: Optional[torch.Tensor] = None,         # [B, N, D] pitch-content V source (FreqPerceiver)
     ):
         """Forward through all decoder layers.
 
