@@ -30,10 +30,12 @@ from typing import List, Optional, Tuple
 import converter21
 import music21
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from src.clef.piano.clef_piano_tiny import ClefPianoTiny
 from src.clef.piano.tokenizer import KernTokenizer
+from src.clef.piano.ctc_target import CTC_FULL_TO_COMPACT
 from src.score.reconstruct_kern import reconstruct_kern_from_token_ids
 
 converter21.register()
@@ -74,6 +76,64 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> ClefPianoTiny:
 
 
 @torch.no_grad()
+# =============================================================================
+# CTC prefix state helpers for hybrid CTC-CE beam search
+# =============================================================================
+
+def _ctc_init_state(ctc_log_probs: torch.Tensor):
+    """Initialize CTC forward state for empty prefix.
+
+    Returns (log_p_b, log_p_nb) where:
+      log_p_b[t]  = log P(alignment[0..t] collapses to ε, ends with blank at t)
+      log_p_nb[t] = -inf (empty prefix can't end with non-blank)
+    """
+    T = ctc_log_probs.shape[0]
+    log_p_b  = torch.cumsum(ctc_log_probs[:, 0], dim=0)       # cumsum of log P(blank)
+    log_p_nb = torch.full((T,), float('-inf'), device=ctc_log_probs.device)
+    return log_p_b, log_p_nb
+
+
+def _ctc_extend_state(
+    log_p_b: torch.Tensor,
+    log_p_nb: torch.Tensor,
+    ctc_log_probs: torch.Tensor,
+    c: int,
+    last: int,
+):
+    """Extend CTC prefix state by appending compact rhythm token c.
+
+    Args:
+        log_p_b, log_p_nb: [T'] current state for prefix r
+        ctc_log_probs: [T', C_ctc] log probabilities from CTC head
+        c: compact CTC token ID to append (non-blank, 1-indexed)
+        last: last non-blank token in current prefix (-1 if empty prefix)
+
+    Returns: new (log_p_b, log_p_nb) for prefix r + [c]
+    """
+    NEG_INF = float('-inf')
+    dev = ctc_log_probs.device
+    # Prepend virtual t=-1: p_b[-1]=0.0, p_nb[-1]=-inf
+    prev_b  = torch.cat([log_p_b.new_tensor([0.0]),     log_p_b[:-1]])
+    prev_nb = torch.cat([log_p_nb.new_tensor([NEG_INF]), log_p_nb[:-1]])
+    prev_total = torch.logaddexp(prev_b, prev_nb)
+
+    new_p_b  = prev_total + ctc_log_probs[:, 0]  # blank extension
+    # Repeated token: can only extend from blank (not non-blank, would merge)
+    src = prev_b if last == c else prev_total
+    new_p_nb = src + ctc_log_probs[:, c]
+    return new_p_b, new_p_nb
+
+
+def _ctc_state_score(log_p_b: torch.Tensor, log_p_nb: torch.Tensor) -> float:
+    """Total log prefix probability = logaddexp(log_p_b[-1], log_p_nb[-1])."""
+    return torch.logaddexp(log_p_b[-1], log_p_nb[-1]).item()
+
+
+# =============================================================================
+# Beam search
+# =============================================================================
+
+
 def _beam_search(
     model: ClefPianoTiny,
     mel_chunk: torch.Tensor,
@@ -82,8 +142,14 @@ def _beam_search(
     max_len: int,
     num_beams: int,
     length_penalty: float = 1.0,
+    ctc_lambda: float = 0.0,
 ) -> List[int]:
-    """Beam search for ClefPianoTiny (O(n²) decoder, correct).
+    """Beam search for ClefPianoTiny with optional CTC-CE hybrid scoring.
+
+    ctc_lambda > 0 activates joint scoring:
+        score = (1 - ctc_lambda) * log_p_ce + ctc_lambda * Δlog_p_ctc
+    where Δlog_p_ctc is the incremental CTC prefix log-probability gain
+    when a rhythm token (in CTC vocab) is added to the hypothesis.
 
     Encoder outputs are constant across beams — expanded each step from
     the original single-batch tensors, so no beam-reorder needed on encoder.
@@ -91,16 +157,28 @@ def _beam_search(
     NEG_INF = float("-inf")
     device = mel_chunk.device
 
-    memory, memory_v, ss, lsi, vr, _ = model.encode(mel_chunk)  # [1, N_kv, D]
+    encode_out = model.encode(mel_chunk)
+    memory, memory_v, ss, lsi, vr = encode_out[:5]  # [1, N_kv, D]
 
-    seqs = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
+    # CTC setup
+    use_ctc = ctc_lambda > 0.0 and len(encode_out) > 5
+    if use_ctc:
+        ctc_logits    = encode_out[5]                                      # [1, T', C_ctc]
+        ctc_log_probs = F.log_softmax(ctc_logits[0], dim=-1)              # [T', C_ctc]
+        init_b, init_nb = _ctc_init_state(ctc_log_probs)
+        init_score = _ctc_state_score(init_b, init_nb)
+        # ctc_states: list of (log_p_b, log_p_nb, last_compact_id) per beam
+        ctc_states = [(init_b.clone(), init_nb.clone(), -1)]
+        ctc_scores = torch.tensor([init_score], device=device)
+
+    seqs   = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
     scores = torch.zeros(1, device=device)
 
     for _ in range(max_len - 1):
         B_cur = seqs.shape[0]
         mem_b = memory.expand(B_cur, -1, -1).contiguous()
         memv_b = memory_v.expand(B_cur, -1, -1).contiguous()
-        vr_b = vr.expand(B_cur, -1, -1).contiguous()
+        vr_b   = vr.expand(B_cur, -1, -1).contiguous()
 
         tgt = model.token_embed(seqs).contiguous()
         if tgt.shape[1] == 1:
@@ -110,19 +188,50 @@ def _beam_search(
             dec_out = dec_out[0]
 
         logits = model.output_projection(dec_out[:, -1:, :])  # [B, 1, vocab]
-        log_p = torch.log_softmax(logits[:, 0, :], dim=-1)    # [B, vocab]
+        log_p  = torch.log_softmax(logits[:, 0, :], dim=-1)   # [B, vocab]
 
         done = seqs[:, -1].eq(eos_id)
         log_p[done, :] = NEG_INF
         log_p[done, eos_id] = 0.0
 
-        cand = scores.unsqueeze(1) + log_p
+        if use_ctc:
+            # Compute CTC delta for rhythm tokens: Δ = new_ctc_score - old_ctc_score
+            ctc_delta = torch.zeros_like(log_p)  # [B, vocab]
+            for b_i, (p_b, p_nb, last) in enumerate(ctc_states):
+                cur_score = ctc_scores[b_i].item()
+                for full_id, compact_id in CTC_FULL_TO_COMPACT.items():
+                    if full_id >= log_p.shape[1]:
+                        continue
+                    new_p_b, new_p_nb = _ctc_extend_state(p_b, p_nb, ctc_log_probs, compact_id, last)
+                    new_score = _ctc_state_score(new_p_b, new_p_nb)
+                    ctc_delta[b_i, full_id] = new_score - cur_score
+
+            cand = scores.unsqueeze(1) + (1 - ctc_lambda) * log_p + ctc_lambda * ctc_delta
+        else:
+            cand = scores.unsqueeze(1) + log_p
+
         flat = cand.reshape(-1)
         top_scores, top_idx = flat.topk(num_beams)
-        beam_idx = top_idx // logits.shape[-1]
+        beam_idx  = top_idx // logits.shape[-1]
         token_idx = top_idx % logits.shape[-1]
 
-        seqs = torch.cat([seqs[beam_idx], token_idx.unsqueeze(1)], dim=1)
+        if use_ctc:
+            new_ctc_states = []
+            new_ctc_scores = []
+            for b_new in range(num_beams):
+                b_src = beam_idx[b_new].item()
+                tok   = token_idx[b_new].item()
+                p_b, p_nb, last = ctc_states[b_src]
+                if tok in CTC_FULL_TO_COMPACT:
+                    cid = CTC_FULL_TO_COMPACT[tok]
+                    p_b, p_nb = _ctc_extend_state(p_b, p_nb, ctc_log_probs, cid, last)
+                    last = cid
+                new_ctc_states.append((p_b.clone(), p_nb.clone(), last))
+                new_ctc_scores.append(_ctc_state_score(p_b, p_nb))
+            ctc_states  = new_ctc_states
+            ctc_scores  = torch.tensor(new_ctc_scores, device=device)
+
+        seqs   = torch.cat([seqs[beam_idx], token_idx.unsqueeze(1)], dim=1)
         scores = top_scores
 
         if seqs[:, -1].eq(eos_id).all():
@@ -140,9 +249,12 @@ def generate_kern_chunk(
     tokenizer: KernTokenizer,
     max_len: int = DEFAULT_MAX_LEN,
     num_beams: int = 1,
+    ctc_lambda: float = 0.0,
     device: str = "cuda",
 ) -> List[int]:
     """Run greedy (num_beams=1) or beam search generation on a single mel chunk [1, 1, 128, T].
+
+    ctc_lambda > 0 activates CTC-CE hybrid decoding (requires num_beams > 1).
 
     Returns:
         Token IDs excluding BOS/EOS/continue.
@@ -154,7 +266,8 @@ def generate_kern_chunk(
     mel_chunk = mel_chunk.to(device)
 
     if num_beams > 1:
-        ids = _beam_search(model, mel_chunk, bos_id, eos_id, max_len, num_beams)
+        ids = _beam_search(model, mel_chunk, bos_id, eos_id, max_len, num_beams,
+                           ctc_lambda=ctc_lambda)
     else:
         generated_ids = model.generate(
             mel_chunk, max_len=max_len, bos_token_id=bos_id, eos_token_id=eos_id
@@ -307,6 +420,7 @@ def generate_kern_time(
     overlap_frames: int = DEFAULT_OVERLAP_FRAMES,
     max_len: int = DEFAULT_MAX_LEN,
     num_beams: int = 1,
+    ctc_lambda: float = 0.0,
     device: str = "cuda",
 ) -> str:
     """Generate full-song **kern using overlapping time-based chunks.
@@ -344,7 +458,7 @@ def generate_kern_time(
     for i, (start_f, end_f, mel_chunk) in enumerate(chunks):
         start_sec = start_f / MEL_FPS
         end_sec = end_f / MEL_FPS
-        token_ids = generate_kern_chunk(model, mel_chunk, tokenizer, max_len, num_beams, device)
+        token_ids = generate_kern_chunk(model, mel_chunk, tokenizer, max_len, num_beams, ctc_lambda, device)
         measures = split_tokens_by_bar(token_ids, bar_id)
         logger.debug(
             f"  Chunk {i + 1}/{len(chunks)} [{start_sec:.1f} s-{end_sec:.1f} s]: "
@@ -408,6 +522,7 @@ def run_time_mode(args) -> None:
             overlap_frames=args.overlap_frames,
             max_len=args.max_len,
             num_beams=args.num_beams,
+            ctc_lambda=args.ctc_lambda,
             device=args.device,
         )
 
@@ -521,7 +636,8 @@ def run_bar5_mode(args) -> None:
             mel_input = mel_slice.unsqueeze(0)  # [1, 1, 128, chunk_frames]
 
             token_ids = generate_kern_chunk(
-                model, mel_input, tokenizer, args.max_len, args.num_beams, args.device
+                model, mel_input, tokenizer, args.max_len, args.num_beams,
+                args.ctc_lambda, args.device
             )
             bar_id = tokenizer.vocab["<bar>"]
             token_ids = truncate_token_ids_to_n_bars(token_ids, bar_id, n_bars)
@@ -614,6 +730,12 @@ def main() -> None:
         type=int,
         default=1,
         help="Beam search width (1 = greedy)",
+    )
+    parser.add_argument(
+        "--ctc-lambda",
+        type=float,
+        default=0.0,
+        help="CTC-CE hybrid decoding weight λ (0 = pure CE, requires --num-beams > 1)",
     )
     parser.add_argument(
         "--max-samples",
