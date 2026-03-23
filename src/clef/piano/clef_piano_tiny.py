@@ -337,8 +337,8 @@ class ClefPianoTiny(nn.Module):
         swin_2d = torch.cat([swin_s0, swin_s1], dim=-1)                    # [B, H, W, 384]
         swin_feat = self.freq_conv(swin_2d.permute(0, 3, 1, 2)).squeeze(2).permute(0, 2, 1)  # [B, W, 384]
 
-        # FreqPerceiver (V path): 6 pitch queries cross-attend H freq patches per time step.
-        _, memory_v = self.freq_perceiver(swin_2d)                         # [B, W, 384]
+        # FreqPerceiver disabled: decoder uses memory (K=V=freq_conv→BiMamba).
+        memory_v = None
 
         # === Step 4: BiMamba Encoder (time-oriented) ===
         # swin_feat: [B, T_swin, 384] @12.5fps → BiMamba projects to d_model
