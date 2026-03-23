@@ -182,13 +182,19 @@ class ClefPianoTiny(nn.Module):
             for p in self.swin.parameters():
                 p.requires_grad = False
 
-        # FreqPerceiver: replaces freq_conv.
-        # Swin 2D [B, H=16, W, 384] → (memory_k, memory_v) each [B, W, 384]
-        #   memory_k: Linear(H×D → D) — temporal+content grounding (K source)
-        #   memory_v: pitch queries × H freq patches — pitch content (V source)
-        # k_proj is built lazily on first forward (H known then).
         bimamba_d_model = getattr(config, 'bimamba_d_model', config.d_model)
         swin_concat_dim = self.swin.output_dim * 2  # 192 * 2 = 384
+
+        # freq_conv: K source. Hierarchical strided Conv2d collapses H=16 freq patches.
+        # H=16 → 4 → 1 with channel mixing and GELU — proven temporal grounding.
+        self.freq_conv = nn.Sequential(
+            nn.Conv2d(swin_concat_dim, bimamba_d_model, kernel_size=(4, 1), stride=(4, 1)),
+            nn.GELU(),
+            nn.Conv2d(bimamba_d_model, bimamba_d_model, kernel_size=(4, 1), stride=(4, 1)),
+        )
+
+        # FreqPerceiver: V source only. 6 learned queries cross-attend H freq patches
+        # per time step — provides structured multi-view pitch content for decoder V.
         self.freq_perceiver = FreqPerceiver(d_model=bimamba_d_model, n_heads=config.n_heads)
 
         # === BiMamba Encoder (time-oriented, after Swin) ===
@@ -326,11 +332,13 @@ class ClefPianoTiny(nn.Module):
         B_swin, H_swin, W_swin, D_swin = swin_s0.shape
         T_swin = W_swin  # time dimension
 
-        # FreqPerceiver: freq SA (Hopfield settling) + decoupled K/V aggregation.
-        # [B, H, W, 192] × 2 → [B, H, W, 384] → FreqPerceiver → memory_k, memory_v each [B, W, 384]
+        # freq_conv (K path): [B, H, W, 192] × 2 → [B, H, W, 384] → [B, 384, H, W]
+        #   → Conv2d(16→4) + GELU + Conv2d(4→1) → [B, 384, 1, W] → [B, W, 384]
         swin_2d = torch.cat([swin_s0, swin_s1], dim=-1)                    # [B, H, W, 384]
-        memory_k_raw, memory_v = self.freq_perceiver(swin_2d)               # each [B, W, 384]
-        swin_feat = memory_k_raw                                            # [B, W, 384] → BiMamba
+        swin_feat = self.freq_conv(swin_2d.permute(0, 3, 1, 2)).squeeze(2).permute(0, 2, 1)  # [B, W, 384]
+
+        # FreqPerceiver (V path): 6 pitch queries cross-attend H freq patches per time step.
+        _, memory_v = self.freq_perceiver(swin_2d)                         # [B, W, 384]
 
         # === Step 4: BiMamba Encoder (time-oriented) ===
         # swin_feat: [B, T_swin, 384] @12.5fps → BiMamba projects to d_model
